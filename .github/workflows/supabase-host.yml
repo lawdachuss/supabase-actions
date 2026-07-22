@@ -95,22 +95,38 @@ jobs:
             export PUBLIC_URL="http://localhost:8000"
           fi
           python3 << 'PYEOF'
-          import os, jwt, time, secrets
+          import os, jwt, hmac, hashlib, base64
           secret = os.environ['JWT_SECRET']
           public_url = os.environ['PUBLIC_URL']
-          iat = int(time.time())
-          exp = iat + 315360000
+
+          # ── Deterministic key derivation from JWT_SECRET ──
+          # All keys are derived via HMAC-SHA512 so they NEVER change between runs.
+          # SHA512 gives 64 bytes (88 base64 chars) — enough for SECRET_KEY_BASE's 64-char min.
+          # No new secrets needed — just the existing JWT_SECRET.
+
+          def derive_hex(name, num_bytes):
+              return hmac.new(secret.encode(), name.encode(), hashlib.sha512).hexdigest()[:num_bytes * 2]
+
+          def derive_b64(name, length):
+              return base64.urlsafe_b64encode(
+                  hmac.new(secret.encode(), name.encode(), hashlib.sha512).digest()
+              ).decode()[:length]
+
+          # Fixed timestamp → same anon/service JWTs every run (old client keys still work)
+          iat = 1700000000  # Nov 2023 (fixed, not current time)
+          exp = iat + 315360000  # +10 years
           anon_key = jwt.encode({'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret, algorithm='HS256')
           service_key = jwt.encode({'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret, algorithm='HS256')
-          skb = secrets.token_urlsafe(64)[:64]
-          rek = secrets.token_hex(8)
-          vek = secrets.token_hex(16)
-          pmk = secrets.token_urlsafe(24)
-          ptid = secrets.token_hex(8)
-          sak = secrets.token_hex(16)
-          ssk = secrets.token_hex(32)
-          lfp = secrets.token_urlsafe(32)
-          lpv = secrets.token_urlsafe(32)
+
+          skb = derive_b64('secret_key_base', 64)
+          rek = derive_hex('realtime_enc_key', 8)
+          vek = derive_hex('vault_enc_key', 16)
+          pmk = derive_b64('pg_meta_crypto_key', 32)
+          ptid = derive_hex('pooler_tenant_id', 8)
+          sak = derive_hex('s3_access_key_id', 16)
+          ssk = derive_hex('s3_access_key_secret', 32)
+          lfp = derive_b64('logflare_public', 32)
+          lpv = derive_b64('logflare_private', 32)
           with open('.env', 'r') as f:
               env_content = f.read()
           replacements = {
