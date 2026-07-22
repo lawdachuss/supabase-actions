@@ -315,7 +315,6 @@ jobs:
 
           DURATION=20400  # 5h40m — leaves ~8 min buffer for shutdown steps
           END_TIME=$(( $(date +%s) + DURATION ))
-          CHECK_INTERVAL=60
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
 
           echo ""
