@@ -32,6 +32,8 @@ concurrency:
 env:
   SUPABASE_DIR: ./supabase
   BACKUP_FILE: ./supabase/backup.dump
+  COMPOSE_FILE: docker-compose.yml:docker-compose.logs.yml
+  DOCKER_SOCKET_LOCATION: /var/run/docker.sock
 
 jobs:
   supabase:
@@ -165,12 +167,12 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
 
-      # ── Validate the modified docker-compose.yml ────────────────────────
-      - name: ✅ Validate docker-compose.yml
+      # ── Validate docker-compose configs ────────────────────────────────
+      - name: ✅ Validate docker-compose configs
         run: |
           cd ${{ env.SUPABASE_DIR }}
           docker compose config > /dev/null
-          echo "✅ docker-compose.yml validates successfully!"
+          echo "✅ All compose files validate successfully!"
 
       # ── Create required volume directories ─────────────────────────────
       - name: 📁 Create volume directories
@@ -181,7 +183,8 @@ jobs:
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/snippets
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/api
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/storage
-          echo "✅ Volume directories created (including storage)"
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/logs
+          echo "✅ Volume directories created (including storage + logs)"
 
       # ── Restore database from cache ─────────────────────────────────────
       # Uses versioned keys: restore from the most recent cache entry
