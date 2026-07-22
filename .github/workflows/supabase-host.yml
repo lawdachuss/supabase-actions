@@ -253,7 +253,7 @@ jobs:
           # Wait for Kong to be ready on port 8000 (reduced from 30 to 20 retries)
           echo "⏳ Waiting for Kong on port 8000..."
           for i in $(seq 1 20); do
-            if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
+            if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
               echo "✅ Kong is ready!"
               break
             fi
@@ -331,7 +331,7 @@ jobs:
           # Kong is already confirmed ready — start health check loop immediately
           # Keep alive loop with health checks (tick every 10s for live log visibility)
           while [ $(date +%s) -lt $END_TIME ]; do
-            if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
+            if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
               REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
               echo "✅ $(date '+%H:%M:%S') — Healthy | ${REMAINING}m remaining"
             else
