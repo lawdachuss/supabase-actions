@@ -19,9 +19,11 @@
 name: 🚀 Supabase Self-Hosted
 
 on:
-  workflow_dispatch:                     # Manual trigger
+  workflow_dispatch:                     # Manual trigger - click "Run workflow" in GitHub UI
   schedule:
     - cron: '0 */6 * * *'               # Every 6 hours — 15min gap between runs
+  push:
+    branches: [ master ]                 # Also runs on push for testing
 
 concurrency:
   group: supabase-host
