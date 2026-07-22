@@ -6,7 +6,7 @@
 # 2. Restores your database from GitHub Actions cache (so data persists)
 # 3. Exposes everything via Cloudflare Tunnel
 # 4. Runs for ~5h45m per session (maximizing the full 6-hour GitHub Actions limit)
-# 5. Scheduled every 6 hours — 15 min gap between runs for clean handoff
+# 5. Scheduled every 6 hours — 20 min gap between runs for clean handoff
 #
 # Required GitHub Secrets:
 #   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
@@ -262,7 +262,7 @@ jobs:
               echo "Tunnel connected successfully!"
               break
             fi
-            echo "  Still waiting... ($i/6)"
+            echo "  Still waiting... ($i/12)"
           done
 
           # Grab the tunnel URL from logs
