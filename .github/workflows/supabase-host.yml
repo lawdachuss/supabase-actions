@@ -105,7 +105,24 @@ jobs:
           with open(filepath, 'r') as f:
               yaml.safe_load(f)
           
-          print("✅ Removed storage and imgproxy services — YAML is valid!")
+          # Speed up Studio health check (reduce startup delay)
+          if data and 'services' in data and 'studio' in data['services']:
+              studio = data['services']['studio']
+              if isinstance(studio, dict) and 'healthcheck' in studio:
+                  hc = studio['healthcheck']
+                  if hc.get('start_period') == '20s':
+                      hc['start_period'] = '5s'
+                  if hc.get('interval') == '5s':
+                      hc['interval'] = '2s'
+          
+          with open(filepath, 'w') as f:
+              yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+          
+          # Validate the YAML is well-formed
+          with open(filepath, 'r') as f:
+              yaml.safe_load(f)
+          
+          print("✅ Removed storage and imgproxy, sped up health checks — YAML is valid!")
           PYEOF
 
       # ── Generate .env with secrets ──────────────────────────────────────
@@ -220,10 +237,13 @@ jobs:
             supabase-db-
           fail-on-cache-miss: false
 
-      # ── Start Supabase stack ────────────────────────────────────────────
-      - name: 🏁 Start Supabase services
+      # ── Pre-pull Docker images and start Supabase stack ─────────────────
+      - name: 🏁 Pre-pull images & start Supabase services
         run: |
           cd ${{ env.SUPABASE_DIR }}
+          echo "⏳ Pulling Docker images (this may take a minute on first run)..."
+          docker compose pull 2>&1 | tail -5
+          echo "✅ Images pulled. Starting services..."
           docker compose up -d
           echo "⏳ Waiting for services to become healthy..."
           # Wait for PostgreSQL to be ready
@@ -317,9 +337,7 @@ jobs:
           echo "╚══════════════════════════════════════════════════════════╝"
           echo ""
 
-          # Give services time to fully start before first health check
-          sleep 30
-
+          # Kong is already confirmed ready — start health check loop immediately
           # Keep alive loop with health checks
           while [ $(date +%s) -lt $END_TIME ]; do
             if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
