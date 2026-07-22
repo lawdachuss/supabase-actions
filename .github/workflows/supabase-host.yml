@@ -51,13 +51,6 @@ jobs:
           chmod +x /usr/local/bin/cloudflared
           cloudflared version
 
-      # ── Clone official Supabase Docker config ──────────────────────────
-      - name: 📦 Clone Supabase Docker configuration
-        run: |
-          git clone --depth 1 https://github.com/supabase/supabase.git /tmp/supabase-repo
-          cp -r /tmp/supabase-repo/docker ${{ env.SUPABASE_DIR }}
-          echo "✅ Cloned Supabase Docker config"
-
       # ── Remove Storage services from docker-compose ────────────────────
       - name: 🔪 Remove Storage services (as requested)
         run: |
@@ -70,6 +63,8 @@ jobs:
           with open(filepath, 'r') as f:
               data = yaml.safe_load(f)
           
+          # The docker-compose.yml and volumes are committed directly in the repo
+          # (no need to clone supabase repo - saves ~20s per run)
           removed_services = ['storage', 'imgproxy']
           
           # Remove the services themselves
@@ -246,28 +241,25 @@ jobs:
           echo "✅ Images pulled. Starting services..."
           docker compose up -d
           echo "⏳ Waiting for services to become healthy..."
-          # Wait for PostgreSQL to be ready
-          for i in $(seq 1 30); do
+          # Wait for PostgreSQL to be ready (reduced from 30 to 15 retries)
+          for i in $(seq 1 15); do
             if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
               echo "✅ PostgreSQL is ready!"
               break
             fi
-            echo "  Waiting... ($i/30)"
+            echo "  Waiting... ($i/15)"
             sleep 5
           done
-          # Wait for Kong to be ready on port 8000
+          # Wait for Kong to be ready on port 8000 (reduced from 30 to 20 retries)
           echo "⏳ Waiting for Kong on port 8000..."
-          for i in $(seq 1 30); do
+          for i in $(seq 1 20); do
             if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
               echo "✅ Kong is ready!"
               break
             fi
-            echo "  Waiting... ($i/30)"
+            echo "  Waiting... ($i/20)"
             sleep 5
           done
-          # Warn if Kong never became ready
-          curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1 || \
-            echo "⚠️  Kong did not become ready on port 8000"
           echo ""
           docker compose ps
 
@@ -298,7 +290,7 @@ jobs:
             > /tmp/cloudflared.log 2>&1 &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
           echo "⏳ Waiting for tunnel to establish..."
-          sleep 20
+          sleep 10
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "✅ Tunnel active at: https://$TUNNEL_DOMAIN"
           else
