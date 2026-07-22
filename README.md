@@ -242,12 +242,15 @@ Already configured for max utilization. The settings are:
 ```yaml
 timeout-minutes: 355   # 5h55m — 5 min buffer under 360 min hard limit
 # In the keep-alive step:
-DURATION=20700  # 5h45m — leaves time for setup (~5 min) + shutdown (~5 min)
+DURATION=20400  # 5h40m — leaves time for setup (~5 min) + shutdown (~5 min)
 ```
 
-### Add Storage back
+### Enable Analytics in Dashboard
 
-Remove the **"Remove Storage services"** step from the workflow.
+The logs/analytics tab in Studio is disabled by default (`ENABLED_FEATURES_LOGS_ALL: "false"`). Logflare and Vector still collect data, but the dashboard won't show it. To enable:
+
+1. Open `supabase/docker-compose.yml`
+2. Change `ENABLED_FEATURES_LOGS_ALL: "false"` to `ENABLED_FEATURES_LOGS_ALL: "true"`
 
 ### Add OAuth providers
 
