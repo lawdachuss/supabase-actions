@@ -285,38 +285,35 @@ jobs:
         if: env.TUNNEL_DOMAIN != ''
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
-          ANON_KEY: ${{ env.anon_key }}
         run: |
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
           echo "Verifying end-to-end connectivity via https://$DOMAIN..."
           echo ""
-          
-          # 1) Check Kong API gateway responds
-          echo "[1/3] Kong API gateway..."
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://$DOMAIN" 2>&1)
-          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ] || [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "404" ]; then
-            echo "  PASS (HTTP $HTTP_CODE)"
-          else
-            echo "  WARN (HTTP $HTTP_CODE) -- tunnel may not be routing yet"
-          fi
 
-          # 2) Check Supabase Studio (should redirect to /project)
-          echo "[2/3] Supabase Studio (via tunnel)..."
-          STUDIO_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 --location "https://$DOMAIN/project/default" 2>&1)
-          if [ "$STUDIO_CODE" = "200" ]; then
-            echo "  PASS (HTTP $STUDIO_CODE)"
-          else
-            echo "  INFO (HTTP $STUDIO_CODE) -- studio may be loading"
-          fi
+          healthcheck_url() {
+            local label="$1" url="$2"
+            shift 2
+            local pass_codes="$*"
+            # Retry up to 3 times with 5s gap — tunnel needs a moment to propagate
+            for attempt in 1 2 3; do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$url" 2>&1)
+              for code in $pass_codes; do
+                if [ "$HTTP_CODE" = "$code" ]; then
+                  echo "  $label -- PASS (HTTP $HTTP_CODE)"
+                  return 0
+                fi
+              done
+              if [ "$attempt" -lt 3 ]; then
+                sleep 5
+              fi
+            done
+            echo "  $label -- WARN (HTTP $HTTP_CODE)"
+            return 1
+          }
 
-          # 3) Check REST API responds
-          echo "[3/3] REST API (via tunnel)..."
-          API_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://$DOMAIN/rest/v1/" 2>&1)
-          if [ "$API_CODE" = "200" ] || [ "$API_CODE" = "401" ]; then
-            echo "  PASS (HTTP $API_CODE)"
-          else
-            echo "  INFO (HTTP $API_CODE) -- API may be loading"
-          fi
+          healthcheck_url "[1/3] Kong API gateway" "https://$DOMAIN" 200 302 401 404
+          healthcheck_url "[2/3] Supabase Studio" "https://$DOMAIN/project/default" 200 302
+          healthcheck_url "[3/3] REST API" "https://$DOMAIN/rest/v1/" 200 401
           
           echo ""
           echo "Health check complete."
