@@ -283,6 +283,7 @@ jobs:
         run: |
           # Start tunnel in background with token (much simpler than credentials file)
           nohup cloudflared tunnel --no-autoupdate run \
+            --url http://localhost:8000 \
             --token ${{ secrets.CF_TUNNEL_TOKEN }} \
             > /tmp/cloudflared.log 2>&1 &
           TUNNEL_PID=$!
