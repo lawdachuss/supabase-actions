@@ -1,8 +1,8 @@
 # =============================================================================
-# 🚀 Supabase Self-Hosted on GitHub Actions
+# 🚀 Full Supabase Self-Hosted on GitHub Actions
 # =============================================================================
 # What this does:
-# 1. Starts all Supabase services EXCEPT Storage (as requested)
+# 1. Starts ALL Supabase services (full stack with Storage, Realtime, etc.)
 # 2. Restores your database from GitHub Actions cache (so data persists)
 # 3. Exposes everything via Cloudflare Tunnel
 # 4. Runs for ~5h45m per session (maximizing the full 6-hour GitHub Actions limit)
@@ -16,7 +16,7 @@
 #   DASHBOARD_PASSWORD  - Supabase Studio admin password
 # =============================================================================
 
-name: 🚀 Supabase Self-Hosted
+name: 🚀 Full Supabase Self-Hosted
 
 on:
   workflow_dispatch:                     # Manual trigger - click "Run workflow" in GitHub UI
@@ -51,8 +51,8 @@ jobs:
           chmod +x /usr/local/bin/cloudflared
           cloudflared version
 
-      # ── Remove Storage services from docker-compose ────────────────────
-      - name: 🔪 Remove Storage services (as requested)
+      # ── Speed up Docker health checks (keep ALL services) ──────────────
+      - name: ⚡ Optimize health check delays (full stack enabled)
         run: |
           pip install pyyaml -q
           python3 << 'PYEOF'
@@ -65,40 +65,6 @@ jobs:
           
           # The docker-compose.yml and volumes are committed directly in the repo
           # (no need to clone supabase repo - saves ~20s per run)
-          removed_services = ['storage', 'imgproxy']
-          
-          # Remove the services themselves
-          if data and 'services' in data:
-              for svc in removed_services:
-                  data['services'].pop(svc, None)
-          
-          # Remove storage-related volumes
-          if data and 'volumes' in data:
-              data['volumes'].pop('storage', None)
-          
-          # Clean up depends_on references to removed services
-          if data and 'services' in data:
-              for svc_config in data['services'].values():
-                  if isinstance(svc_config, dict) and 'depends_on' in svc_config:
-                      deps = svc_config['depends_on']
-                      if isinstance(deps, list):
-                          cleaned = [d for d in deps if d not in removed_services]
-                          if cleaned:
-                              svc_config['depends_on'] = cleaned
-                          else:
-                              del svc_config['depends_on']
-                      elif isinstance(deps, dict):
-                          for removed in removed_services:
-                              deps.pop(removed, None)
-                          if not deps:
-                              del svc_config['depends_on']
-          
-          with open(filepath, 'w') as f:
-              yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-          
-          # Validate the YAML is well-formed
-          with open(filepath, 'r') as f:
-              yaml.safe_load(f)
           
           # Speed up Studio health check (reduce startup delay)
           if data and 'services' in data and 'studio' in data['services']:
@@ -113,11 +79,7 @@ jobs:
           with open(filepath, 'w') as f:
               yaml.dump(data, f, default_flow_style=False, sort_keys=False)
           
-          # Validate the YAML is well-formed
-          with open(filepath, 'r') as f:
-              yaml.safe_load(f)
-          
-          print("✅ Removed storage and imgproxy, sped up health checks — YAML is valid!")
+          print("✅ Full stack with Storage enabled, health checks optimized!")
           PYEOF
 
       # ── Generate .env with secrets ──────────────────────────────────────
@@ -218,7 +180,8 @@ jobs:
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/pooler
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/snippets
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/api
-          echo "✅ Volume directories created"
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/storage
+          echo "✅ Volume directories created (including storage)"
 
       # ── Restore database from cache ─────────────────────────────────────
       # Uses versioned keys: restore from the most recent cache entry
