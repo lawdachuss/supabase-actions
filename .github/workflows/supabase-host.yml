@@ -9,7 +9,7 @@
 # 5. Scheduled every 6 hours — 15 min gap between runs for clean handoff
 #
 # Required GitHub Secrets:
-#   TUNNEL_CREDENTIALS  - Cloudflare Tunnel credentials JSON (from cloudflared tunnel create)
+#   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
 #   CF_TUNNEL_DOMAIN    - Your domain for public access (e.g. supabase.chuglii.in)
 #   POSTGRES_PASSWORD   - Your secure PostgreSQL password
 #   JWT_SECRET          - JWT signing secret (32+ chars)
@@ -281,23 +281,15 @@ jobs:
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
         run: |
-          # Write tunnel credentials from secret (use heredoc to preserve formatting)
-          cat > /tmp/supabase-tunnel-creds.json << 'EOF'
-          ${{ secrets.TUNNEL_CREDENTIALS }}
-          EOF
-          chmod 600 /tmp/supabase-tunnel-creds.json
-
-          # Validate JSON is well-formed
-          python3 -c "import json; json.load(open('/tmp/supabase-tunnel-creds.json')); print('✅ Credentials JSON is valid')"
-
-          # Start tunnel in background (--config must be global flag before 'tunnel run')
-          nohup cloudflared --config cloudflared-config.yml tunnel run \
+          # Start tunnel in background with token (much simpler than credentials file)
+          nohup cloudflared tunnel --no-autoupdate run \
+            --token ${{ secrets.CF_TUNNEL_TOKEN }} \
             > /tmp/cloudflared.log 2>&1 &
           TUNNEL_PID=$!
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
 
-          echo "⏳ Waiting for tunnel to establish (up to 60s)..."
-          for i in $(seq 1 12); do
+          echo "⏳ Waiting for tunnel to establish (up to 30s)..."
+          for i in $(seq 1 6); do
             sleep 5
             # Check if cloudflared is still running
             if ! kill -0 $TUNNEL_PID 2>/dev/null; then
@@ -310,7 +302,7 @@ jobs:
               echo "✅ Tunnel connected successfully!"
               break
             fi
-            echo "  Still waiting... ($i/12)"
+            echo "  Still waiting... ($i/6)"
           done
 
           # Show recent logs for visibility
