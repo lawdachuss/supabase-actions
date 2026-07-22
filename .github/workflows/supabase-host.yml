@@ -290,15 +290,14 @@ jobs:
           # Validate JSON is well-formed
           python3 -c "import json; json.load(open('/tmp/supabase-tunnel-creds.json')); print('✅ Credentials JSON is valid')"
 
-          # Start tunnel in background with metrics endpoint for health checks
+          # Start tunnel in background
           nohup cloudflared tunnel run --config cloudflared-config.yml \
-            --metrics localhost:2000 \
             > /tmp/cloudflared.log 2>&1 &
           TUNNEL_PID=$!
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
 
-          echo "⏳ Waiting for tunnel to establish (up to 30s)..."
-          for i in $(seq 1 6); do
+          echo "⏳ Waiting for tunnel to establish (up to 60s)..."
+          for i in $(seq 1 12); do
             sleep 5
             # Check if cloudflared is still running
             if ! kill -0 $TUNNEL_PID 2>/dev/null; then
@@ -306,13 +305,12 @@ jobs:
               tail -20 /tmp/cloudflared.log
               exit 1
             fi
-            # Check if tunnel has active connections via management endpoint or logs
-            if curl -sf http://localhost:2000/ready > /dev/null 2>&1 || \
-               grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null; then
+            # Check logs for connection confirmation
+            if grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null; then
               echo "✅ Tunnel connected successfully!"
               break
             fi
-            echo "  Still waiting... ($i/6)"
+            echo "  Still waiting... ($i/12)"
           done
 
           # Show recent logs for visibility
