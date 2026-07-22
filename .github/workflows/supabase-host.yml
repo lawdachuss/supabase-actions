@@ -276,6 +276,8 @@ jobs:
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
         run: |
+          cd ${{ env.SUPABASE_DIR }}
+
           DURATION=20400  # 5h40m — leaves ~8 min buffer for shutdown steps
           END_TIME=$(( $(date +%s) + DURATION ))
           CHECK_INTERVAL=60
@@ -300,6 +302,9 @@ jobs:
           echo "╚══════════════════════════════════════════════════════════╝"
           echo ""
 
+          # Give services time to fully start before first health check
+          sleep 30
+
           # Keep alive loop with health checks
           while [ $(date +%s) -lt $END_TIME ]; do
             if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
@@ -307,8 +312,7 @@ jobs:
               echo "✅ $(date '+%H:%M:%S') — Healthy | ${REMAINING}m remaining"
             else
               echo "⚠️  $(date '+%H:%M:%S') — Health check failed"
-              cd ${{ env.SUPABASE_DIR }}
-              docker compose ps --no-color 2>/dev/null | head -10
+              docker compose ps --no-color 2>/dev/null | head -10 || true
             fi
             sleep $CHECK_INTERVAL
           done
