@@ -1,5 +1,7 @@
 # 🚀 Supabase Self-Hosted on GitHub Actions
 
+[![Supabase Self-Hosted](https://github.com/lawdachuss/supabase-actions/actions/workflows/supabase-host.yml/badge.svg)](https://github.com/lawdachuss/supabase-actions/actions/workflows/supabase-host.yml)
+
 **Run Supabase (all features except Storage) on free GitHub Actions runners with a permanent URL via Cloudflare Tunnel.**
 
 ```
@@ -42,6 +44,33 @@
 7. **Repeat** — next run picks up where you left off
 
 > **Downtime:** ~15 minutes between runs (scheduled every 6 hours, runs for 5h45m)
+
+## 📡 Health Check / Monitoring
+
+### Instant Status (Badge)
+
+Click the badge at the top of this README to see the latest workflow run:
+- 🟢 **Passing** = Supabase is running (or was running until recently)
+- 🔴 **Failing** = Something went wrong
+- 🟡 **No status** = First run not yet complete
+
+### External Health Check (in Workflow)
+
+Every time the tunnel starts, the workflow performs an **end-to-end health check** against `https://supabase.chuglii.in` testing:
+1. **Kong API gateway** responds
+2. **Supabase Studio** loads
+3. **REST API** responds
+
+The results are logged in the "External health check" step of each run.
+
+### What to Check When Tunnel Goes Down
+
+| Check | How |
+|-------|-----|
+| **Last workflow status** | README badge or [Actions tab](https://github.com/lawdachuss/supabase-actions/actions) |
+| **Health check logs** | Open latest run → "External health check" step |
+| **Tunnel status** | [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels |
+| **Next scheduled run** | Waiting for cron `0 */6 * * *` (every 6 hours) |
 
 ---
 
@@ -266,6 +295,7 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 | Workflow not running on schedule | GitHub may delay schedule events during high load |
 | "No space left on device" | GitHub runner has ~14GB free — clean up old Docker images |
 | Port already in use | Runner resets between runs, should be fresh |
+| Health check shows errors | Check the "External health check" step in the workflow run — it tests Kong, Studio, and API independently |
 
 ---
 

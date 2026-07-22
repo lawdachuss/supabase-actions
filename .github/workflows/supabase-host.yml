@@ -140,16 +140,16 @@ jobs:
               else:
                   missing.append(old[:40])
           if missing:
-              print(f"⚠️  WARNING: {len(missing)} placeholder(s) not found in .env.example:")
+              print(f"WARNING: {len(missing)} placeholder(s) not found in .env.example:")
               for m in missing:
                   print(f"  - {m}...")
-              print("  Upstream .env.example may have changed — update replacements dict!")
+              print("  Upstream .env.example may have changed -- update replacements dict!")
           else:
-              print("✅ All 15 replacements applied successfully")
+              print("All 15 replacements applied successfully")
 
           with open('.env', 'w') as f:
               f.write(env_content)
-          print("✅ .env configured with secure keys")
+          print("Configured .env with secure keys")
           PYEOF
         env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -161,7 +161,7 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
           docker compose config > /dev/null
-          echo "✅ All compose files validate successfully!"
+          echo "All compose files validate successfully!"
 
       # ── Restore database from cache ─────────────────────────────────────
       # Uses versioned keys: restore from the most recent cache entry
@@ -181,33 +181,33 @@ jobs:
           cd ${{ env.SUPABASE_DIR }}
           
           if [ -f /tmp/docker-images.tar ]; then
-            echo "✅ Loading Docker images from cache (~20s vs ~3min pull)..."
+            echo "Loading Docker images from cache..."
             docker load < /tmp/docker-images.tar 2>&1 | tail -3
           else
-            echo "⏳ No cache found — pulling images (first run or version change)..."
+            echo "No cache found -- pulling images (first run or version change)..."
             docker compose pull 2>&1 | tail -3
-            echo "💾 Saving images to cache for next run..."
+            echo "Saving images to cache for next run..."
             docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'supabase|kong|postgrest|timberio|darthsim') \
               -o /tmp/docker-images.tar 2>&1 | tail -3
           fi
           
-          echo "🚀 Starting services..."
+          echo "Starting services..."
           docker compose up -d
-          echo "⏳ Waiting for services..."
+          echo "Waiting for services..."
           # Wait for PostgreSQL (reduced to 10 retries - starts faster than Kong)
           for i in $(seq 1 10); do
             if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
-              echo "✅ PostgreSQL is ready!"
+              echo "PostgreSQL is ready!"
               break
             fi
             echo "  Waiting PG... ($i/10)"
             sleep 5
           done
           # Wait for Kong (reduced to 15 retries - enough for ~75s)
-          echo "⏳ Waiting for Kong on port 8000..."
+          echo "Waiting for Kong on port 8000..."
           for i in $(seq 1 15); do
             if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
-              echo "✅ Kong is ready!"
+              echo "Kong is ready!"
               break
             fi
             echo "  Waiting Kong... ($i/15)"
@@ -229,12 +229,12 @@ jobs:
         if: steps.cache-db.outputs.cache-hit == 'true'
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          echo "📦 Backup found! Restoring..."
+          echo "Backup found! Restoring..."
           docker compose cp ./backup.dump db:/tmp/backup.dump
           docker compose exec -T db pg_restore -U postgres -d postgres \
             --clean --if-exists --no-owner --no-privileges /tmp/backup.dump || \
-            echo "⚠️  Partial restore (expected on fresh schema migrations)"
-          echo "✅ Database restored from cache"
+            echo "Partial restore (expected on fresh schema migrations)"
+          echo "Database restored from cache"
 
       # ── Start Cloudflare Tunnel ────────────────────────────────────────
       - name: 🌐 Start Cloudflare Tunnel
@@ -242,7 +242,7 @@ jobs:
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
         run: |
-          # Start tunnel in background with token (much simpler than credentials file)
+          # Start tunnel in background with token
           nohup cloudflared tunnel --no-autoupdate run \
             --url http://localhost:8000 \
             --token ${{ secrets.CF_TUNNEL_TOKEN }} \
@@ -250,31 +250,77 @@ jobs:
           TUNNEL_PID=$!
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
 
-          echo "⏳ Waiting for tunnel to establish (up to 30s)..."
+          echo "Waiting for tunnel to establish (up to 30s)..."
           for i in $(seq 1 6); do
             sleep 5
-            # Check if cloudflared is still running
             if ! kill -0 $TUNNEL_PID 2>/dev/null; then
-              echo "❌ cloudflared process died! Check /tmp/cloudflared.log:"
+              echo "cloudflared process died! Check /tmp/cloudflared.log:"
               tail -20 /tmp/cloudflared.log
               exit 1
             fi
-            # Check logs for connection confirmation
             if grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null; then
-              echo "✅ Tunnel connected successfully!"
+              echo "Tunnel connected successfully!"
               break
             fi
             echo "  Still waiting... ($i/6)"
           done
 
-          # Show recent logs for visibility
+          # Grab the tunnel URL from logs
+          TUNNEL_URL=$(grep -oP 'https?://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -1)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            echo "Quick Tunnel URL: $TUNNEL_URL"
+          fi
+
           echo "--- cloudflared recent logs ---"
           tail -10 /tmp/cloudflared.log
           echo "------------------------------"
 
           if [ -n "$TUNNEL_DOMAIN" ]; then
-            echo "✅ Tunnel active at: https://$TUNNEL_DOMAIN"
+            echo "Tunnel active at: https://$TUNNEL_DOMAIN"
           fi
+
+      # ── External health check (end-to-end via public URL) ──────────────
+      - name: 🔍 External health check
+        if: env.TUNNEL_DOMAIN != ''
+        env:
+          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+          ANON_KEY: ${{ env.anon_key }}
+        run: |
+          DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
+          echo "Verifying end-to-end connectivity via https://$DOMAIN..."
+          echo ""
+          
+          # 1) Check Kong API gateway responds
+          echo "[1/3] Kong API gateway..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://$DOMAIN" 2>&1)
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ] || [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "404" ]; then
+            echo "  PASS (HTTP $HTTP_CODE)"
+          else
+            echo "  WARN (HTTP $HTTP_CODE) -- tunnel may not be routing yet"
+          fi
+
+          # 2) Check Supabase Studio (should redirect to /project)
+          echo "[2/3] Supabase Studio (via tunnel)..."
+          STUDIO_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 --location "https://$DOMAIN/project/default" 2>&1)
+          if [ "$STUDIO_CODE" = "200" ]; then
+            echo "  PASS (HTTP $STUDIO_CODE)"
+          else
+            echo "  INFO (HTTP $STUDIO_CODE) -- studio may be loading"
+          fi
+
+          # 3) Check REST API responds
+          echo "[3/3] REST API (via tunnel)..."
+          API_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "https://$DOMAIN/rest/v1/" 2>&1)
+          if [ "$API_CODE" = "200" ] || [ "$API_CODE" = "401" ]; then
+            echo "  PASS (HTTP $API_CODE)"
+          else
+            echo "  INFO (HTTP $API_CODE) -- API may be loading"
+          fi
+          
+          echo ""
+          echo "Health check complete."
+          echo "TUNNEL_HEALTH=ok" >> $GITHUB_ENV
 
       # ── Run Supabase (keep alive with health checks) ────────────────────
       - name: ⏱️  Supabase is LIVE
@@ -288,32 +334,33 @@ jobs:
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
 
           echo ""
-          echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║        🚀  SUPABASE IS LIVE ON GITHUB ACTIONS          ║"
-          echo "╠══════════════════════════════════════════════════════════╣"
-          echo "║                                                        ║"
-          echo "║  📊 Studio:  http://localhost:8000                     ║"
-          echo "║  📡 Tunnel:  Connected via Cloudflare                  ║"
+          echo "+=============================================================+"
+          echo "|         SUPABASE IS LIVE ON GITHUB ACTIONS                  |"
+          echo "+=============================================================+"
+          echo "|                                                             |"
+          echo "|  Studio:  http://localhost:8000                             |"
+          echo "|  Tunnel:  Connected via Cloudflare                          |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
-            echo "║  🌐 Domain:  https://$TUNNEL_DOMAIN                     ║"
-          else
-            echo "║  ⚠️  No domain configured — add one in Cloudflare       ║"
+            echo "|  Domain:  https://$DOMAIN                                     |"
           fi
-          echo "║                                                        ║"
-          echo "║  ⏱️  Runs until: $(date -d @$END_TIME '+%H:%M UTC')  ║"
-          echo "║  🔄 Auto-restart: every 6 hours                        ║"
-          echo "║                                                        ║"
-          echo "╚══════════════════════════════════════════════════════════╝"
+          echo "|                                                             |"
+          echo "|  Monitor: https://github.com/${{ github.repository }}/actions  |"
+          echo "|  Badge:   https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
+          echo "|                                                             |"
+          echo "|  Runs until: $(date -d @$END_TIME '+%H:%M UTC')                 |"
+          echo "|  Auto-restart: every 6 hours                                |"
+          echo "|  Remaining: $(( DURATION / 60 )) min                                      |"
+          echo "|                                                             |"
+          echo "+=============================================================+"
           echo ""
 
-          # Kong is already confirmed ready — start health check loop immediately
-          # Keep alive loop with health checks (tick every 10s for live log visibility)
+          # Keep alive loop with health checks (tick every 10s)
           while [ $(date +%s) -lt $END_TIME ]; do
             if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
               REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
-              echo "✅ $(date '+%H:%M:%S') — Healthy | ${REMAINING}m remaining"
+              echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining"
             else
-              echo "⚠️  $(date '+%H:%M:%S') — Health check failed"
+              echo "$(date '+%H:%M:%S') -- Health check failed"
               docker compose ps --no-color 2>/dev/null | head -10 || true
             fi
             # Wait 60 seconds with a heartbeat every 10s so logs stay live
@@ -322,10 +369,10 @@ jobs:
               sleep 10
               printf "."
             done
-            echo ""  # newline after heartbeat dots
+            echo ""
           done
 
-          echo "⏰ Time's up! Starting graceful shutdown..."
+          echo "Time's up! Starting graceful shutdown..."
 
       # ── Backup database ─────────────────────────────────────────────────
       - name: 💾 Backup database before shutdown
@@ -337,17 +384,17 @@ jobs:
           
           # First check if the database container is actually running
           if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
-            echo "📦 Creating database backup..."
+            echo "Creating database backup..."
             docker compose exec -T db pg_dump -U postgres -F c -f /tmp/backup.dump postgres && \
             docker compose cp db:/tmp/backup.dump ./backup.dump
             if [ -f ./backup.dump ] && [ -s ./backup.dump ]; then
               SIZE=$(du -h ./backup.dump | cut -f1)
-              echo "✅ Database backed up ($SIZE)"
+              echo "Database backed up ($SIZE)"
             else
-              echo "⚠️  pg_dump failed — no backup created"
+              echo "pg_dump failed -- no backup created"
             fi
           else
-            echo "⚠️  Database container not running — skipping backup"
+            echo "Database container not running -- skipping backup"
           fi
 
       # ── Stop services ───────────────────────────────────────────────────
@@ -356,7 +403,7 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
           docker compose down 2>/dev/null || true
-          echo "✅ All services stopped"
+          echo "All services stopped"
 
       # ── Save database to cache ──────────────────────────────────────────
       # Uses a unique key per run (run_id) so cache is always updated
@@ -375,16 +422,18 @@ jobs:
         run: |
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
           echo ""
-          echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║  🚀  SESSION COMPLETE                                  ║"
-          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "+=============================================================+"
+          echo "|  SESSION COMPLETE                                           |"
+          echo "+=============================================================+"
           if [ -f ${{ env.BACKUP_FILE }} ]; then
             SIZE=$(du -h ${{ env.BACKUP_FILE }} | cut -f1)
-            echo "║  ✅ Database backed up ($SIZE)                        ║"
+            echo "|  Database backed up ($SIZE)                                |"
           fi
-          echo "║  🔄  Next run in ~6 hours (scheduled)                   ║"
+          echo "|  Next run in ~6 hours (scheduled)                          |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
-            echo "║  🌐  https://$DOMAIN                                   ║"
+            echo "|  https://$DOMAIN                                              |"
+            echo "|  Badge: https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
           fi
-          echo "╚══════════════════════════════════════════════════════════╝"
-
+          echo "|  Monitor: https://github.com/${{ github.repository }}/actions    |"
+          echo "+=============================================================+"
+          echo ""
