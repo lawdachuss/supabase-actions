@@ -308,14 +308,12 @@ jobs:
                   col_type = col['type']
                   nullable = '' if col.get('is_nullable') else 'NOT NULL'
                   default = f"DEFAULT {col['default_value']}" if col.get('default_value') else ''
-                  is_pk = 'PRIMARY KEY' if col_name in pk_cols else ''
-                  cols.append(f'  "{col_name}" {col_type} {default} {nullable} {is_pk}'.strip())
+                  cols.append(f'  "{col_name}" {col_type} {default} {nullable}'.strip())
               
               if cols:
+                  # Add table-level PRIMARY KEY constraint
                   pk_extra = ''
-                  # If PKs are composite, add table-level constraint
-                  composite_pks = [c for c in pk_cols if c not in [col['name'] for col in meta.get('columns', [])]]
-                  if len(pk_cols) > 1:
+                  if pk_cols:
                       pk_extra = f', PRIMARY KEY ({", ".join(f"\"{c}\"" for c in pk_cols)})'
                   
                   sql = f'CREATE TABLE IF NOT EXISTS public."{name}" (\n' + ',\n'.join(cols) + f'{pk_extra}\n);'
@@ -349,7 +347,6 @@ jobs:
                   
                   # Use jsonb_populate_record for type-safe inserts
                   insert_sql = '\n'.join(
-                      f"SELECT 1 FROM pg_try_advisory_xact_lock(hashtext('migrate_{name}'));"
                       f"INSERT INTO public.\"{name}\" SELECT * FROM jsonb_populate_record(NULL::public.\"{name}\", '{json.dumps(r).replace(chr(39), chr(39)+chr(39))}'::jsonb);"
                       for r in rows
                   )
