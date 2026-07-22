@@ -1,0 +1,351 @@
+# =============================================================================
+# 🚀 Supabase Self-Hosted on GitHub Actions
+# =============================================================================
+# What this does:
+# 1. Starts all Supabase services EXCEPT Storage (as requested)
+# 2. Restores your database from GitHub Actions cache (so data persists)
+# 3. Exposes everything via Cloudflare Tunnel
+# 4. Runs for ~5h45m per session (maximizing the full 6-hour GitHub Actions limit)
+# 5. Scheduled every 6 hours — 15 min gap between runs for clean handoff
+#
+# Required GitHub Secrets:
+#   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (one-time setup)
+#   CF_TUNNEL_DOMAIN    - (Optional) Your domain for public access
+#   POSTGRES_PASSWORD   - Your secure PostgreSQL password
+#   JWT_SECRET          - JWT signing secret (32+ chars)
+#   DASHBOARD_PASSWORD  - Supabase Studio admin password
+# =============================================================================
+
+name: 🚀 Supabase Self-Hosted
+
+on:
+  workflow_dispatch:                     # Manual trigger
+  schedule:
+    - cron: '0 */6 * * *'               # Every 6 hours — 15min gap between runs
+
+concurrency:
+  group: supabase-host
+  cancel-in-progress: true               # Cancel old run when new one starts (clean handoff)
+
+env:
+  SUPABASE_DIR: ./supabase
+  BACKUP_FILE: ./supabase/backup.dump
+
+jobs:
+  supabase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355                  # 5h55m — 5 min buffer under 360 min hard limit
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      # ── Install cloudflared ────────────────────────────────────────────
+      - name: 🔧 Install cloudflared
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared version
+
+      # ── Clone official Supabase Docker config ──────────────────────────
+      - name: 📦 Clone Supabase Docker configuration
+        run: |
+          git clone --depth 1 https://github.com/supabase/supabase.git /tmp/supabase-repo
+          cp -r /tmp/supabase-repo/docker ${{ env.SUPABASE_DIR }}
+          echo "✅ Cloned Supabase Docker config"
+
+      # ── Remove Storage services from docker-compose ────────────────────
+      - name: 🔪 Remove Storage services (as requested)
+        run: |
+          python3 << 'PYEOF'
+import re
+
+with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'r') as f:
+    content = f.read()
+
+# Remove the 'storage' service block
+content = re.sub(
+    r'^\s+storage:.*?(?=\n\S)',
+    '',
+    content,
+    flags=re.DOTALL | re.MULTILINE
+)
+
+# Remove the 'imgproxy' service block (may be last service)
+content = re.sub(
+    r'^\s+imgproxy:.*?(?=\n\S|\Z)',
+    '',
+    content,
+    flags=re.DOTALL | re.MULTILINE
+)
+
+# Remove depends_on references to storage and imgproxy
+content = re.sub(r'\n\s+-\s+storage\b', '', content)
+content = re.sub(r'\n\s+-\s+imgproxy\b', '', content)
+
+# Remove storage-related volumes
+content = re.sub(r'\n\s+- ./volumes/storage:[^\n]+', '', content)
+
+with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'w') as f:
+    f.write(content)
+
+print("✅ Removed storage and imgproxy services")
+PYEOF
+
+      # ── Generate .env with secrets ──────────────────────────────────────
+      - name: 🔐 Configure .env with secrets
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          cp .env.example .env
+
+          # Use provided domain or fall back to localhost
+          PUBLIC_URL="http://localhost:8000"
+          if [ -n "${{ secrets.CF_TUNNEL_DOMAIN }}" ]; then
+            PUBLIC_URL="https://${{ secrets.CF_TUNNEL_DOMAIN }}"
+          fi
+
+          # Generate secure keys using Python
+          pip install PyJWT -q
+
+          python3 << 'PYEOF'
+import os, jwt, time, secrets
+
+secret = os.environ['JWT_SECRET']
+public_url = os.environ['PUBLIC_URL']
+iat = int(time.time())
+exp = iat + 315360000  # 10 years
+
+# Generate ANON key
+anon_key = jwt.encode(
+    {'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp},
+    secret, algorithm='HS256'
+)
+
+# Generate SERVICE_ROLE key
+service_key = jwt.encode(
+    {'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp},
+    secret, algorithm='HS256'
+)
+
+# Generate all required crypto keys
+secret_key_base = secrets.token_urlsafe(64)[:64]
+realtime_enc_key = secrets.token_hex(8)
+vault_enc_key = secrets.token_hex(16)
+pg_meta_key = secrets.token_urlsafe(24)
+pooler_tenant_id = secrets.token_hex(8)
+s3_access_key = secrets.token_hex(16)
+s3_secret_key = secrets.token_hex(32)
+logflare_public = secrets.token_urlsafe(32)
+logflare_private = secrets.token_urlsafe(32)
+
+# Read .env, replace values
+with open('.env', 'r') as f:
+    env_content = f.read()
+
+public_url_secure = public_url.replace('http://', 'https://') if not public_url.startswith('https://') else public_url
+
+replacements = {
+    'your-super-secret-and-long-postgres-password': os.environ['POSTGRES_PASSWORD'],
+    'your-super-secret-jwt-token-with-at-least-32-characters-long': os.environ['JWT_SECRET'],
+    'this_password_is_insecure_and_should_be_updated': os.environ['DASHBOARD_PASSWORD'],
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJhbm9uIiwKICAgICJpc3MiOiAic3VwYWJhc2UtZGVtbyIsCiAgICAiaWF0IjogMTY0MTc2OTIwMCwKICAgICJleHAiOiAxNzk5NTM1NjAwCn0.dc_X5iR_VP_qT0zsiyj_I_OZ2T9FtRU2BBNWN8Bu4GE': anon_key,
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJzZXJ2aWNlX3JvbGUiLAogICAgImlzcyI6ICJzdXBhYmFzZS1kZW1vIiwKICAgICJpYXQiOiAxNjQxNzY5MjAwLAogICAgImV4cCI6IDE3OTk1MzU2MDAKfQ.DaYlNEoUrrEn2Ig7tqibS-PHK5vgusbcbo7X36XVt4Q': service_key,
+    'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': secret_key_base,
+    'http://localhost:8000': public_url,
+    'SITE_URL=http://localhost:3000': f'SITE_URL={public_url}',
+    'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={realtime_enc_key}',
+    'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vault_enc_key}',
+    'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pg_meta_key}',
+    'POOLER_TENANT_ID=your-tenant-id': f'POOLER_TENANT_ID={pooler_tenant_id}',
+    'S3_PROTOCOL_ACCESS_KEY_ID=625729a08b95bf1b7ff351a663f3a23c': f'S3_PROTOCOL_ACCESS_KEY_ID={s3_access_key}',
+    'S3_PROTOCOL_ACCESS_KEY_SECRET=850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907': f'S3_PROTOCOL_ACCESS_KEY_SECRET={s3_secret_key}',
+    'your-super-secret-and-long-logflare-key-public': logflare_public,
+    'your-super-secret-and-long-logflare-key-private': logflare_private,
+}
+
+for old, new in replacements.items():
+    env_content = env_content.replace(old, new)
+
+with open('.env', 'w') as f:
+    f.write(env_content)
+
+print("✅ .env configured with secure keys")
+PYEOF
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          PUBLIC_URL: ${{ secrets.CF_TUNNEL_DOMAIN }}
+
+      # ── Create required volume directories ─────────────────────────────
+      - name: 📁 Create volume directories
+        run: |
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/db/data
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/functions
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/pooler
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/snippets
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/api
+          echo "✅ Volume directories created"
+
+      # ── Restore database from cache ─────────────────────────────────────
+      # Uses versioned keys: restore from the most recent cache entry
+      - name: 💾 Restore database from cache
+        id: cache-db
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BACKUP_FILE }}
+          key: supabase-db-${{ github.run_id }}
+          restore-keys: |
+            supabase-db-
+          fail-on-cache-miss: false
+
+      # ── Start Supabase stack ────────────────────────────────────────────
+      - name: 🏁 Start Supabase services
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          docker compose up -d
+          echo "⏳ Waiting for services to become healthy..."
+          # Wait for PostgreSQL to be ready
+          for i in $(seq 1 30); do
+            if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
+              echo "✅ PostgreSQL is ready!"
+              break
+            fi
+            echo "  Waiting... ($i/30)"
+            sleep 5
+          done
+          # Wait for remaining services
+          sleep 20
+          docker compose ps
+
+      # ── Restore data from backup (if cached) ────────────────────────────
+      - name: 🔄 Restore database from cached backup
+        if: steps.cache-db.outputs.cache-hit == 'true'
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          echo "📦 Backup found! Restoring..."
+          docker compose cp ./backup.dump db:/tmp/backup.dump
+          docker compose exec -T db pg_restore -U postgres -d postgres \
+            --clean --if-exists --no-owner --no-privileges /tmp/backup.dump || \
+            echo "⚠️  Partial restore (expected on fresh schema migrations)"
+          echo "✅ Database restored from cache"
+
+      # ── Start Cloudflare Tunnel ────────────────────────────────────────
+      - name: 🌐 Start Cloudflare Tunnel
+        id: tunnel
+        env:
+          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        run: |
+          # Start tunnel in background (token passed via env var for safety)
+          nohup cloudflared tunnel run --token "$TUNNEL_TOKEN" \
+            > /tmp/cloudflared.log 2>&1 &
+          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
+          echo "⏳ Waiting for tunnel to establish..."
+          sleep 20
+          TUNNEL_DOMAIN="${{ secrets.CF_TUNNEL_DOMAIN }}"
+          if [ -n "$TUNNEL_DOMAIN" ]; then
+            echo "✅ Tunnel active at: https://$TUNNEL_DOMAIN"
+          else
+            echo "✅ Tunnel connected! Add a public hostname in Cloudflare dashboard."
+            echo "   (You need a domain on Cloudflare to route traffic)"
+          fi
+
+      # ── Run Supabase (keep alive with health checks) ────────────────────
+      - name: ⏱️  Supabase is LIVE
+        env:
+          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+        run: |
+          DURATION=20400  # 5h40m — leaves ~8 min buffer for shutdown steps
+          END_TIME=$(( $(date +%s) + DURATION ))
+          CHECK_INTERVAL=60
+          DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║        🚀  SUPABASE IS LIVE ON GITHUB ACTIONS          ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          echo "║                                                        ║"
+          echo "║  📊 Studio:  http://localhost:8000                     ║"
+          echo "║  📡 Tunnel:  Connected via Cloudflare                  ║"
+          if [ -n "$TUNNEL_DOMAIN" ]; then
+            echo "║  🌐 Domain:  https://$TUNNEL_DOMAIN                     ║"
+          else
+            echo "║  ⚠️  No domain configured — add one in Cloudflare       ║"
+          fi
+          echo "║                                                        ║"
+          echo "║  ⏱️  Runs until: $(date -d @$END_TIME '+%H:%M UTC')  ║"
+          echo "║  🔄 Auto-restart: every 6 hours                        ║"
+          echo "║                                                        ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # Keep alive loop with health checks
+          while [ $(date +%s) -lt $END_TIME ]; do
+            if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
+              REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
+              echo "✅ $(date '+%H:%M:%S') — Healthy | ${REMAINING}m remaining"
+            else
+              echo "⚠️  $(date '+%H:%M:%S') — Health check failed"
+              cd ${{ env.SUPABASE_DIR }}
+              docker compose ps --no-color 2>/dev/null | head -10
+            fi
+            sleep $CHECK_INTERVAL
+          done
+
+          echo "⏰ Time's up! Starting graceful shutdown..."
+
+      # ── Backup database ─────────────────────────────────────────────────
+      - name: 💾 Backup database before shutdown
+        if: always()
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          echo "📦 Creating database backup..."
+          docker compose exec -T db pg_dump -U postgres -F c -f /tmp/backup.dump postgres || \
+            echo "⚠️  pg_dump failed (DB may not be running)"
+          docker compose cp db:/tmp/backup.dump ./backup.dump 2>/dev/null || \
+            echo "⚠️  Could not copy backup file"
+          if [ -f ./backup.dump ]; then
+            ls -lh ./backup.dump
+            echo "✅ Database backup complete!"
+          fi
+
+      # ── Stop services ───────────────────────────────────────────────────
+      - name: 🛑 Stop Supabase services
+        if: always()
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          docker compose down 2>/dev/null || true
+          echo "✅ All services stopped"
+
+      # ── Save database to cache ──────────────────────────────────────────
+      # Uses a unique key per run (run_id) so cache is always updated
+      - name: 💿 Save database to GitHub Actions cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.BACKUP_FILE }}
+          key: supabase-db-${{ github.run_id }}
+
+      # ── Summary ─────────────────────────────────────────────────────────
+      - name: 📋 Log session summary
+        if: always()
+        env:
+          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+        run: |
+          DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  🚀  SESSION COMPLETE                                  ║"
+          echo "╠══════════════════════════════════════════════════════════╣"
+          if [ -f ${{ env.BACKUP_FILE }} ]; then
+            SIZE=$(du -h ${{ env.BACKUP_FILE }} | cut -f1)
+            echo "║  ✅ Database backed up ($SIZE)                        ║"
+          fi
+          echo "║  🔄  Next run in ~6 hours (scheduled)                   ║"
+          if [ -n "$TUNNEL_DOMAIN" ]; then
+            echo "║  🌐  https://$DOMAIN                                   ║"
+          fi
+          echo "╚══════════════════════════════════════════════════════════╝
+
