@@ -101,9 +101,10 @@ PYEOF
           cp .env.example .env
 
           # Use provided domain or fall back to localhost
-          PUBLIC_URL="http://localhost:8000"
           if [ -n "${{ secrets.CF_TUNNEL_DOMAIN }}" ]; then
-            PUBLIC_URL="https://${{ secrets.CF_TUNNEL_DOMAIN }}"
+            export PUBLIC_URL="https://${{ secrets.CF_TUNNEL_DOMAIN }}"
+          else
+            export PUBLIC_URL="http://localhost:8000"
           fi
 
           # Generate secure keys using Python
@@ -144,8 +145,6 @@ logflare_private = secrets.token_urlsafe(32)
 with open('.env', 'r') as f:
     env_content = f.read()
 
-public_url_secure = public_url.replace('http://', 'https://') if not public_url.startswith('https://') else public_url
-
 replacements = {
     'your-super-secret-and-long-postgres-password': os.environ['POSTGRES_PASSWORD'],
     'your-super-secret-jwt-token-with-at-least-32-characters-long': os.environ['JWT_SECRET'],
@@ -177,7 +176,6 @@ PYEOF
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
-          PUBLIC_URL: ${{ secrets.CF_TUNNEL_DOMAIN }}
 
       # ── Create required volume directories ─────────────────────────────
       - name: 📁 Create volume directories
@@ -347,5 +345,5 @@ PYEOF
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "║  🌐  https://$DOMAIN                                   ║"
           fi
-          echo "╚══════════════════════════════════════════════════════════╝
+          echo "╚══════════════════════════════════════════════════════════╝"
 
