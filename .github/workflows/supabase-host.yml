@@ -245,8 +245,10 @@ jobs:
             echo "  Waiting... ($i/30)"
             sleep 5
           done
+          # Warn if Kong never became ready
+          curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1 || \
+            echo "⚠️  Kong did not become ready on port 8000 — check docker compose ps above"
           echo ""
-          docker compose ps
 
       # ── Restore data from backup (if cached) ────────────────────────────
       - name: 🔄 Restore database from cached backup
