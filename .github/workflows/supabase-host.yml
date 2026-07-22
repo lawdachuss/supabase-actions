@@ -290,8 +290,8 @@ jobs:
           # Validate JSON is well-formed
           python3 -c "import json; json.load(open('/tmp/supabase-tunnel-creds.json')); print('✅ Credentials JSON is valid')"
 
-          # Start tunnel in background
-          nohup cloudflared tunnel run --config cloudflared-config.yml \
+          # Start tunnel in background (--config must be global flag before 'tunnel run')
+          nohup cloudflared --config cloudflared-config.yml tunnel run \
             > /tmp/cloudflared.log 2>&1 &
           TUNNEL_PID=$!
           echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
