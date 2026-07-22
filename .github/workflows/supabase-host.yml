@@ -318,14 +318,22 @@ jobs:
         if: always()
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          echo "📦 Creating database backup..."
-          docker compose exec -T db pg_dump -U postgres -F c -f /tmp/backup.dump postgres || \
-            echo "⚠️  pg_dump failed (DB may not be running)"
-          docker compose cp db:/tmp/backup.dump ./backup.dump 2>/dev/null || \
-            echo "⚠️  Could not copy backup file"
-          if [ -f ./backup.dump ]; then
-            ls -lh ./backup.dump
-            echo "✅ Database backup complete!"
+          # Remove stale backup from previous run to avoid false success
+          rm -f ./backup.dump
+          
+          # First check if the database container is actually running
+          if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
+            echo "📦 Creating database backup..."
+            docker compose exec -T db pg_dump -U postgres -F c -f /tmp/backup.dump postgres && \
+            docker compose cp db:/tmp/backup.dump ./backup.dump
+            if [ -f ./backup.dump ] && [ -s ./backup.dump ]; then
+              SIZE=$(du -h ./backup.dump | cut -f1)
+              echo "✅ Database backed up ($SIZE)"
+            else
+              echo "⚠️  pg_dump failed — no backup created"
+            fi
+          else
+            echo "⚠️  Database container not running — skipping backup"
           fi
 
       # ── Stop services ───────────────────────────────────────────────────
