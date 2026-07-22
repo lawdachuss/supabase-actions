@@ -61,33 +61,51 @@ jobs:
       # ── Remove Storage services from docker-compose ────────────────────
       - name: 🔪 Remove Storage services (as requested)
         run: |
+          pip install pyyaml -q
           python3 << 'PYEOF'
-          import re
+          import yaml
           
-          with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'r') as f:
-              content = f.read()
+          filepath = '${{ env.SUPABASE_DIR }}/docker-compose.yml'
           
-          # Remove the 'storage' service block and all its sub-properties
-          content = re.sub(
-              r'(?m)^(\s+)storage:.*(?:\n\1\s.*)*',
-              '',
-              content
-          )
+          with open(filepath, 'r') as f:
+              data = yaml.safe_load(f)
           
-          # Remove the 'imgproxy' service block and all its sub-properties
-          content = re.sub(
-              r'(?m)^(\s+)imgproxy:.*(?:\n\1\s.*)*',
-              '',
-              content
-          )
+          removed_services = ['storage', 'imgproxy']
           
-          # Remove storage-related volume mounts
-          content = re.sub(r'\n\s+- ./volumes/storage:[^\n]+', '', content)
+          # Remove the services themselves
+          if data and 'services' in data:
+              for svc in removed_services:
+                  data['services'].pop(svc, None)
           
-          with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'w') as f:
-              f.write(content)
+          # Remove storage-related volumes
+          if data and 'volumes' in data:
+              data['volumes'].pop('storage', None)
           
-          print("✅ Removed storage and imgproxy services")
+          # Clean up depends_on references to removed services
+          if data and 'services' in data:
+              for svc_config in data['services'].values():
+                  if isinstance(svc_config, dict) and 'depends_on' in svc_config:
+                      deps = svc_config['depends_on']
+                      if isinstance(deps, list):
+                          cleaned = [d for d in deps if d not in removed_services]
+                          if cleaned:
+                              svc_config['depends_on'] = cleaned
+                          else:
+                              del svc_config['depends_on']
+                      elif isinstance(deps, dict):
+                          for removed in removed_services:
+                              deps.pop(removed, None)
+                          if not deps:
+                              del svc_config['depends_on']
+          
+          with open(filepath, 'w') as f:
+              yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+          
+          # Validate the YAML is well-formed
+          with open(filepath, 'r') as f:
+              yaml.safe_load(f)
+          
+          print("✅ Removed storage and imgproxy services — YAML is valid!")
           PYEOF
 
       # ── Generate .env with secrets ──────────────────────────────────────
@@ -172,6 +190,13 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+
+      # ── Validate the modified docker-compose.yml ────────────────────────
+      - name: ✅ Validate docker-compose.yml
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          docker compose config > /dev/null
+          echo "✅ docker-compose.yml validates successfully!"
 
       # ── Create required volume directories ─────────────────────────────
       - name: 📁 Create volume directories
