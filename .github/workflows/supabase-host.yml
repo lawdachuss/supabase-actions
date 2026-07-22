@@ -62,39 +62,39 @@ jobs:
       - name: 🔪 Remove Storage services (as requested)
         run: |
           python3 << 'PYEOF'
-import re
-
-with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'r') as f:
-    content = f.read()
-
-# Remove the 'storage' service block
-content = re.sub(
-    r'^\s+storage:.*?(?=\n\S)',
-    '',
-    content,
-    flags=re.DOTALL | re.MULTILINE
-)
-
-# Remove the 'imgproxy' service block (may be last service)
-content = re.sub(
-    r'^\s+imgproxy:.*?(?=\n\S|\Z)',
-    '',
-    content,
-    flags=re.DOTALL | re.MULTILINE
-)
-
-# Remove depends_on references to storage and imgproxy
-content = re.sub(r'\n\s+-\s+storage\b', '', content)
-content = re.sub(r'\n\s+-\s+imgproxy\b', '', content)
-
-# Remove storage-related volumes
-content = re.sub(r'\n\s+- ./volumes/storage:[^\n]+', '', content)
-
-with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'w') as f:
-    f.write(content)
-
-print("✅ Removed storage and imgproxy services")
-PYEOF
+          import re
+          
+          with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'r') as f:
+              content = f.read()
+          
+          # Remove the 'storage' service block
+          content = re.sub(
+              r'^\s+storage:.*?(?=\n\S)',
+              '',
+              content,
+              flags=re.DOTALL | re.MULTILINE
+          )
+          
+          # Remove the 'imgproxy' service block (may be last service)
+          content = re.sub(
+              r'^\s+imgproxy:.*?(?=\n\S|\Z)',
+              '',
+              content,
+              flags=re.DOTALL | re.MULTILINE
+          )
+          
+          # Remove depends_on references to storage and imgproxy
+          content = re.sub(r'\n\s+-\s+storage\b', '', content)
+          content = re.sub(r'\n\s+-\s+imgproxy\b', '', content)
+          
+          # Remove storage-related volumes
+          content = re.sub(r'\n\s+- ./volumes/storage:[^\n]+', '', content)
+          
+          with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'w') as f:
+              f.write(content)
+          
+          print("✅ Removed storage and imgproxy services")
+          PYEOF
 
       # ── Generate .env with secrets ──────────────────────────────────────
       - name: 🔐 Configure .env with secrets
@@ -113,67 +113,67 @@ PYEOF
           pip install PyJWT -q
 
           python3 << 'PYEOF'
-import os, jwt, time, secrets
-
-secret = os.environ['JWT_SECRET']
-public_url = os.environ['PUBLIC_URL']
-iat = int(time.time())
-exp = iat + 315360000  # 10 years
-
-# Generate ANON key
-anon_key = jwt.encode(
-    {'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp},
-    secret, algorithm='HS256'
-)
-
-# Generate SERVICE_ROLE key
-service_key = jwt.encode(
-    {'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp},
-    secret, algorithm='HS256'
-)
-
-# Generate all required crypto keys
-secret_key_base = secrets.token_urlsafe(64)[:64]
-realtime_enc_key = secrets.token_hex(8)
-vault_enc_key = secrets.token_hex(16)
-pg_meta_key = secrets.token_urlsafe(24)
-pooler_tenant_id = secrets.token_hex(8)
-s3_access_key = secrets.token_hex(16)
-s3_secret_key = secrets.token_hex(32)
-logflare_public = secrets.token_urlsafe(32)
-logflare_private = secrets.token_urlsafe(32)
-
-# Read .env, replace values
-with open('.env', 'r') as f:
-    env_content = f.read()
-
-replacements = {
-    'your-super-secret-and-long-postgres-password': os.environ['POSTGRES_PASSWORD'],
-    'your-super-secret-jwt-token-with-at-least-32-characters-long': os.environ['JWT_SECRET'],
-    'this_password_is_insecure_and_should_be_updated': os.environ['DASHBOARD_PASSWORD'],
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJhbm9uIiwKICAgICJpc3MiOiAic3VwYWJhc2UtZGVtbyIsCiAgICAiaWF0IjogMTY0MTc2OTIwMCwKICAgICJleHAiOiAxNzk5NTM1NjAwCn0.dc_X5iR_VP_qT0zsiyj_I_OZ2T9FtRU2BBNWN8Bu4GE': anon_key,
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJzZXJ2aWNlX3JvbGUiLAogICAgImlzcyI6ICJzdXBhYmFzZS1kZW1vIiwKICAgICJpYXQiOiAxNjQxNzY5MjAwLAogICAgImV4cCI6IDE3OTk1MzU2MDAKfQ.DaYlNEoUrrEn2Ig7tqibS-PHK5vgusbcbo7X36XVt4Q': service_key,
-    'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': secret_key_base,
-    'http://localhost:8000': public_url,
-    'SITE_URL=http://localhost:3000': f'SITE_URL={public_url}',
-    'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={realtime_enc_key}',
-    'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vault_enc_key}',
-    'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pg_meta_key}',
-    'POOLER_TENANT_ID=your-tenant-id': f'POOLER_TENANT_ID={pooler_tenant_id}',
-    'S3_PROTOCOL_ACCESS_KEY_ID=625729a08b95bf1b7ff351a663f3a23c': f'S3_PROTOCOL_ACCESS_KEY_ID={s3_access_key}',
-    'S3_PROTOCOL_ACCESS_KEY_SECRET=850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907': f'S3_PROTOCOL_ACCESS_KEY_SECRET={s3_secret_key}',
-    'your-super-secret-and-long-logflare-key-public': logflare_public,
-    'your-super-secret-and-long-logflare-key-private': logflare_private,
-}
-
-for old, new in replacements.items():
-    env_content = env_content.replace(old, new)
-
-with open('.env', 'w') as f:
-    f.write(env_content)
-
-print("✅ .env configured with secure keys")
-PYEOF
+          import os, jwt, time, secrets
+          
+          secret = os.environ['JWT_SECRET']
+          public_url = os.environ['PUBLIC_URL']
+          iat = int(time.time())
+          exp = iat + 315360000  # 10 years
+          
+          # Generate ANON key
+          anon_key = jwt.encode(
+              {'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp},
+              secret, algorithm='HS256'
+          )
+          
+          # Generate SERVICE_ROLE key
+          service_key = jwt.encode(
+              {'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp},
+              secret, algorithm='HS256'
+          )
+          
+          # Generate all required crypto keys
+          secret_key_base = secrets.token_urlsafe(64)[:64]
+          realtime_enc_key = secrets.token_hex(8)
+          vault_enc_key = secrets.token_hex(16)
+          pg_meta_key = secrets.token_urlsafe(24)
+          pooler_tenant_id = secrets.token_hex(8)
+          s3_access_key = secrets.token_hex(16)
+          s3_secret_key = secrets.token_hex(32)
+          logflare_public = secrets.token_urlsafe(32)
+          logflare_private = secrets.token_urlsafe(32)
+          
+          # Read .env, replace values
+          with open('.env', 'r') as f:
+              env_content = f.read()
+          
+          replacements = {
+              'your-super-secret-and-long-postgres-password': os.environ['POSTGRES_PASSWORD'],
+              'your-super-secret-jwt-token-with-at-least-32-characters-long': os.environ['JWT_SECRET'],
+              'this_password_is_insecure_and_should_be_updated': os.environ['DASHBOARD_PASSWORD'],
+              'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJhbm9uIiwKICAgICJpc3MiOiAic3VwYWJhc2UtZGVtbyIsCiAgICAiaWF0IjogMTY0MTc2OTIwMCwKICAgICJleHAiOiAxNzk5NTM1NjAwCn0.dc_X5iR_VP_qT0zsiyj_I_OZ2T9FtRU2BBNWN8Bu4GE': anon_key,
+              'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJzZXJ2aWNlX3JvbGUiLAogICAgImlzcyI6ICJzdXBhYmFzZS1kZW1vIiwKICAgICJpYXQiOiAxNjQxNzY5MjAwLAogICAgImV4cCI6IDE3OTk1MzU2MDAKfQ.DaYlNEoUrrEn2Ig7tqibS-PHK5vgusbcbo7X36XVt4Q': service_key,
+              'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': secret_key_base,
+              'http://localhost:8000': public_url,
+              'SITE_URL=http://localhost:3000': f'SITE_URL={public_url}',
+              'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={realtime_enc_key}',
+              'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vault_enc_key}',
+              'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pg_meta_key}',
+              'POOLER_TENANT_ID=your-tenant-id': f'POOLER_TENANT_ID={pooler_tenant_id}',
+              'S3_PROTOCOL_ACCESS_KEY_ID=625729a08b95bf1b7ff351a663f3a23c': f'S3_PROTOCOL_ACCESS_KEY_ID={s3_access_key}',
+              'S3_PROTOCOL_ACCESS_KEY_SECRET=850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907': f'S3_PROTOCOL_ACCESS_KEY_SECRET={s3_secret_key}',
+              'your-super-secret-and-long-logflare-key-public': logflare_public,
+              'your-super-secret-and-long-logflare-key-private': logflare_private,
+          }
+          
+          for old, new in replacements.items():
+              env_content = env_content.replace(old, new)
+          
+          with open('.env', 'w') as f:
+              f.write(env_content)
+          
+          print("✅ .env configured with secure keys")
+          PYEOF
         env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}

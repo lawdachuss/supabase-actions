@@ -77,32 +77,99 @@ Your permanent URL will be: **`https://supabase.yourdomain.com`**
 
 ### Step 4: Generate Secrets
 
-Run these commands locally to generate secure values:
+Run these commands locally to generate secure values for your GitHub Secrets:
 
 ```bash
-# Postgres password
+# PostgreSQL password (64 hex chars = 256 bits)
 openssl rand -hex 32
 # → Copy this for POSTGRES_PASSWORD
 
-# JWT secret (32+ chars)
+# JWT secret (32+ chars, base64)
 openssl rand -base64 32
 # → Copy this for JWT_SECRET
 
 # Dashboard password
-# → Pick something secure for DASHBOARD_PASSWORD
+openssl rand -base64 16
+# → Copy this for DASHBOARD_PASSWORD
 ```
+
+> 🔐 Save these values somewhere safe — you'll need them in Step 5. If you lose them, just generate new ones (existing cached database backups will be unrecoverable with a new `POSTGRES_PASSWORD`).
 
 ### Step 5: Add GitHub Secrets
 
-Go to **Settings → Secrets and variables → Actions → New repository secret**:
+This workflow requires **4 secrets** (1 optional). You can set them via the GitHub UI or the `gh` CLI (recommended if you have it installed).
 
-| Secret | Value |
-|---|---|
-| `CF_TUNNEL_TOKEN` | The tunnel token from Step 3 |
-| `CF_TUNNEL_DOMAIN` | Your URL: `supabase.yourdomain.com` (no https://) |
-| `POSTGRES_PASSWORD` | Output from `openssl rand -hex 32` |
-| `JWT_SECRET` | Output from `openssl rand -base64 32` |
-| `DASHBOARD_PASSWORD` | Your secure dashboard password |
+#### Option A: Using `gh` CLI (fastest)
+
+```bash
+# Navigate to your repo directory first
+cd supabase-selfhosted
+
+# 1. Cloudflare Tunnel token (REQUIRED) — from Step 3
+gh secret set CF_TUNNEL_TOKEN
+# Paste your tunnel token and press Ctrl+D
+
+# 2. Your domain on Cloudflare (OPTIONAL — leave out if no domain yet)
+gh secret set CF_TUNNEL_DOMAIN
+# Example: supabase.yourdomain.com (no https://)
+
+# 3. PostgreSQL password (REQUIRED) — generate a secure one
+openssl rand -hex 32 | gh secret set POSTGRES_PASSWORD
+
+# 4. JWT signing secret (REQUIRED) — 32+ characters
+openssl rand -base64 32 | gh secret set JWT_SECRET
+
+# 5. Supabase Studio password (REQUIRED) — your admin login
+gh secret set DASHBOARD_PASSWORD
+# Type a strong password and press Ctrl+D
+```
+
+> **One-liner for all 4 required secrets:**
+> ```bash
+> gh secret set CF_TUNNEL_TOKEN -b"$(echo -n 'paste-your-token-here')" && \
+> openssl rand -hex 32 | gh secret set POSTGRES_PASSWORD && \
+> openssl rand -base64 32 | gh secret set JWT_SECRET && \
+> gh secret set DASHBOARD_PASSWORD -b"your-strong-password"
+> ```
+
+#### Option B: GitHub UI
+
+Go to **Settings → Secrets and variables → Actions → New repository secret** and add each one:
+
+| Secret | Required | Value |
+|---|---|---|
+| `CF_TUNNEL_TOKEN` | ✅ Required | The tunnel token from Step 3 (`eyJh...`) |
+| `CF_TUNNEL_DOMAIN` | ⬜ Optional | Your URL: `supabase.yourdomain.com` (no `https://`) |
+| `POSTGRES_PASSWORD` | ✅ Required | Output from `openssl rand -hex 32` |
+| `JWT_SECRET` | ✅ Required | Output from `openssl rand -base64 32` |
+| `DASHBOARD_PASSWORD` | ✅ Required | Your secure Supabase Studio password |
+
+#### Secrets Reference
+
+| Secret | Where It's Used | What It Does |
+|---|---|---|
+| `CF_TUNNEL_TOKEN` | Cloudflare Tunnel step | Authenticates the tunnel to Cloudflare's edge. Created once in the Cloudflare dashboard. |
+| `CF_TUNNEL_DOMAIN` | `.env` generation + Tunnel display | Sets the public URL so Supabase generates correct redirect URIs. Omit this to use `localhost:8000` (tunnel still connects, but no public routing). |
+| `POSTGRES_PASSWORD` | `.env` → PostgreSQL container | Superuser password for the database. Used internally by all Supabase services. |
+| `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates `ANON_KEY` and `SERVICE_ROLE_KEY` from this secret using HS256. |
+| `DASHBOARD_PASSWORD` | `.env` → Supabase Studio | Login password for Studio at port 8000 (username: `supabase`). |
+
+#### Auto-Generated Keys (no setup needed)
+
+The workflow automatically generates these keys from `JWT_SECRET` and random secrets — no manual setup required:
+
+| Key / Secret | Generated From | Purpose |
+|---|---|---|
+| `ANON_KEY` | `JWT_SECRET` (HS256 JWT) | Public API key (safe to expose) |
+| `SERVICE_ROLE_KEY` | `JWT_SECRET` (HS256 JWT) | Admin API key (keep secret!) |
+| `SECRET_KEY_BASE` | Python `secrets` module | Cookie & session signing |
+| `REALTIME_DB_ENC_KEY` | Python `secrets` module | Realtime broadcast encryption |
+| `VAULT_ENC_KEY` | Python `secrets` module | Vault encryption |
+| `PG_META_CRYPTO_KEY` | Python `secrets` module | PostgREST metadata encryption |
+| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Python `secrets` module | Internal S3 protocol (Storage disabled, but keys still generated) |
+| `LOGFARE_PUBLIC_KEY` / `LOGFARE_PRIVATE_KEY` | Python `secrets` module | Logflare logging |
+
+> **💡 Tip:** You can find these generated values in the workflow run logs under the "Configure .env with secrets" step.
 
 ### Step 6: Push & Run
 
