@@ -350,8 +350,9 @@ jobs:
             for tick in $(seq 1 6); do
               if [ $(date +%s) -ge $END_TIME ]; then break; fi
               sleep 10
-              echo "."
+              printf "."
             done
+            echo ""  # newline after heartbeat dots
           done
 
           echo "⏰ Time's up! Starting graceful shutdown..."
