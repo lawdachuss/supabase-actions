@@ -53,38 +53,21 @@ jobs:
           path: /tmp/docker-images.tar
           key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
-      # ── Parallel setup: cloudflared + dirs + yaml + .env ────────────────
-      - name: ⚡ Parallel setup (cloudflared, dirs, YAML, .env)
+      # ── Parallel setup: cloudflared + pip + dirs + .env ─────────────────
+      # NOTE: No YAML modification here — that would change hashFiles() cache key,
+      # causing Docker image cache to miss every run (cache key mismatch bug).
+      - name: ⚡ Parallel setup (cloudflared, pip, dirs, .env)
         run: |
           # ── Run independent tasks in parallel ──
           (
-            curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-              -o /usr/local/bin/cloudflared
-            chmod +x /usr/local/bin/cloudflared
+            curl -sL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o /usr/local/bin/cloudflared &&
+            chmod +x /usr/local/bin/cloudflared &&
             cloudflared version
           ) &
-          pip install pyyaml PyJWT -q &
+          pip install 'pyyaml==6.0.2' 'PyJWT==2.10.1' -q &
           mkdir -p ${{ env.SUPABASE_DIR }}/volumes/{db/data,functions,pooler,snippets,api,storage,logs} &
           wait
-          
-          # ── Optimize health checks ──
-          python3 << 'PYEOF'
-          import yaml
-          filepath = '${{ env.SUPABASE_DIR }}/docker-compose.yml'
-          with open(filepath, 'r') as f:
-              data = yaml.safe_load(f)
-          if data and 'services' in data and 'studio' in data['services']:
-              studio = data['services']['studio']
-              if isinstance(studio, dict) and 'healthcheck' in studio:
-                  hc = studio['healthcheck']
-                  if hc.get('start_period') == '20s':
-                      hc['start_period'] = '5s'
-                  if hc.get('interval') == '5s':
-                      hc['interval'] = '2s'
-          with open(filepath, 'w') as f:
-              yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-          print("✅ Health checks optimized")
-          PYEOF
           
           # ── Configure .env ──
           cd ${{ env.SUPABASE_DIR }}
@@ -127,6 +110,7 @@ jobs:
           ssk = derive_hex('s3_access_key_secret', 32)
           lfp = derive_b64('logflare_public', 32)
           lpv = derive_b64('logflare_private', 32)
+
           with open('.env', 'r') as f:
               env_content = f.read()
           replacements = {
@@ -147,8 +131,22 @@ jobs:
               'your-super-secret-and-long-logflare-key-public': lfp,
               'your-super-secret-and-long-logflare-key-private': lpv,
           }
+
+          # Validate .env after replacements — catch placeholder drift early
+          missing = []
           for old, new in replacements.items():
-              env_content = env_content.replace(old, new)
+              if old in env_content:
+                  env_content = env_content.replace(old, new)
+              else:
+                  missing.append(old[:40])
+          if missing:
+              print(f"⚠️  WARNING: {len(missing)} placeholder(s) not found in .env.example:")
+              for m in missing:
+                  print(f"  - {m}...")
+              print("  Upstream .env.example may have changed — update replacements dict!")
+          else:
+              print("✅ All 15 replacements applied successfully")
+
           with open('.env', 'w') as f:
               f.write(env_content)
           print("✅ .env configured with secure keys")
