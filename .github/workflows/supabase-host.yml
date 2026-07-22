@@ -281,21 +281,47 @@ jobs:
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
         run: |
-          # Write tunnel credentials from secret
-          echo '${{ secrets.TUNNEL_CREDENTIALS }}' > /tmp/supabase-tunnel-creds.json
+          # Write tunnel credentials from secret (use heredoc to preserve formatting)
+          cat > /tmp/supabase-tunnel-creds.json << 'EOF'
+          ${{ secrets.TUNNEL_CREDENTIALS }}
+          EOF
           chmod 600 /tmp/supabase-tunnel-creds.json
 
-          # Start tunnel in background using config file
+          # Validate JSON is well-formed
+          python3 -c "import json; json.load(open('/tmp/supabase-tunnel-creds.json')); print('✅ Credentials JSON is valid')"
+
+          # Start tunnel in background with metrics endpoint for health checks
           nohup cloudflared tunnel run --config cloudflared-config.yml \
+            --metrics localhost:2000 \
             > /tmp/cloudflared.log 2>&1 &
-          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-          echo "⏳ Waiting for tunnel to establish..."
-          sleep 10
+          TUNNEL_PID=$!
+          echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
+
+          echo "⏳ Waiting for tunnel to establish (up to 30s)..."
+          for i in $(seq 1 6); do
+            sleep 5
+            # Check if cloudflared is still running
+            if ! kill -0 $TUNNEL_PID 2>/dev/null; then
+              echo "❌ cloudflared process died! Check /tmp/cloudflared.log:"
+              tail -20 /tmp/cloudflared.log
+              exit 1
+            fi
+            # Check if tunnel has active connections via management endpoint or logs
+            if curl -sf http://localhost:2000/ready > /dev/null 2>&1 || \
+               grep -q "Registered tunnel connection" /tmp/cloudflared.log 2>/dev/null; then
+              echo "✅ Tunnel connected successfully!"
+              break
+            fi
+            echo "  Still waiting... ($i/6)"
+          done
+
+          # Show recent logs for visibility
+          echo "--- cloudflared recent logs ---"
+          tail -10 /tmp/cloudflared.log
+          echo "------------------------------"
+
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "✅ Tunnel active at: https://$TUNNEL_DOMAIN"
-          else
-            echo "⚠️  No domain configured — add one in Cloudflare dashboard."
-            echo "   (You need a domain on Cloudflare to route traffic)"
           fi
 
       # ── Run Supabase (keep alive with health checks) ────────────────────
