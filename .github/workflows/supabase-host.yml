@@ -338,7 +338,7 @@ jobs:
           echo ""
 
           # Kong is already confirmed ready — start health check loop immediately
-          # Keep alive loop with health checks
+          # Keep alive loop with health checks (tick every 10s for live log visibility)
           while [ $(date +%s) -lt $END_TIME ]; do
             if curl -sf -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
               REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
@@ -347,7 +347,12 @@ jobs:
               echo "⚠️  $(date '+%H:%M:%S') — Health check failed"
               docker compose ps --no-color 2>/dev/null | head -10 || true
             fi
-            sleep $CHECK_INTERVAL
+            # Wait 60 seconds with a heartbeat every 10s so logs stay live
+            for tick in $(seq 1 6); do
+              if [ $(date +%s) -ge $END_TIME ]; then break; fi
+              sleep 10
+              echo "."
+            done
           done
 
           echo "⏰ Time's up! Starting graceful shutdown..."
