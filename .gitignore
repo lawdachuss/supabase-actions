@@ -1,0 +1,9 @@
+# Supabase local environment (contains secrets!)
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker volumes (large, generated at runtime)
+/volumes/

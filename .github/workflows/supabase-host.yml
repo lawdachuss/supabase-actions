@@ -67,27 +67,21 @@ jobs:
           with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'r') as f:
               content = f.read()
           
-          # Remove the 'storage' service block
+          # Remove the 'storage' service block and all its sub-properties
           content = re.sub(
-              r'^\s+storage:.*?(?=\n\S)',
+              r'(?m)^(\s+)storage:.*(?:\n\1\s.*)*',
               '',
-              content,
-              flags=re.DOTALL | re.MULTILINE
+              content
           )
           
-          # Remove the 'imgproxy' service block (may be last service)
+          # Remove the 'imgproxy' service block and all its sub-properties
           content = re.sub(
-              r'^\s+imgproxy:.*?(?=\n\S|\Z)',
+              r'(?m)^(\s+)imgproxy:.*(?:\n\1\s.*)*',
               '',
-              content,
-              flags=re.DOTALL | re.MULTILINE
+              content
           )
           
-          # Remove depends_on references to storage and imgproxy
-          content = re.sub(r'\n\s+-\s+storage\b', '', content)
-          content = re.sub(r'\n\s+-\s+imgproxy\b', '', content)
-          
-          # Remove storage-related volumes
+          # Remove storage-related volume mounts
           content = re.sub(r'\n\s+- ./volumes/storage:[^\n]+', '', content)
           
           with open('${{ env.SUPABASE_DIR }}/docker-compose.yml', 'w') as f:
