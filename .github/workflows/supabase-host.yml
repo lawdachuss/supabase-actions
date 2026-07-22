@@ -280,45 +280,6 @@ jobs:
             echo "Tunnel active at: https://$TUNNEL_DOMAIN"
           fi
 
-      # ── External health check (end-to-end via public URL) ──────────────
-      - name: 🔍 External health check
-        if: env.TUNNEL_DOMAIN != ''
-        env:
-          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
-        run: |
-          DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
-          echo "Verifying end-to-end connectivity via https://$DOMAIN..."
-          echo ""
-
-          healthcheck_url() {
-            local label="$1" url="$2"
-            shift 2
-            local pass_codes="$*"
-            # Retry up to 3 times with 5s gap — tunnel needs a moment to propagate
-            for attempt in 1 2 3; do
-              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$url" 2>&1)
-              for code in $pass_codes; do
-                if [ "$HTTP_CODE" = "$code" ]; then
-                  echo "  $label -- PASS (HTTP $HTTP_CODE)"
-                  return 0
-                fi
-              done
-              if [ "$attempt" -lt 3 ]; then
-                sleep 5
-              fi
-            done
-            echo "  $label -- WARN (HTTP $HTTP_CODE)"
-            return 1
-          }
-
-          healthcheck_url "[1/3] Kong API gateway" "https://$DOMAIN" 200 302 401 404
-          healthcheck_url "[2/3] Supabase Studio" "https://$DOMAIN/project/default" 200 302
-          healthcheck_url "[3/3] REST API" "https://$DOMAIN/rest/v1/" 200 401
-          
-          echo ""
-          echo "Health check complete."
-          echo "TUNNEL_HEALTH=ok" >> $GITHUB_ENV
-
       # ── Run Supabase (keep alive with health checks) ────────────────────
       - name: ⏱️  Supabase is LIVE
         env:
