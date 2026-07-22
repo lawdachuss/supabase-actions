@@ -253,160 +253,128 @@ jobs:
           SUPABASE_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          pip install requests -q
           python3 << 'PYEOF'
-          import os, json, sys, urllib.request, urllib.error
+          import os, json, subprocess, urllib.request, urllib.error
+          import shlex
           
           REF = os.environ['SUPABASE_REF']
           KEY = os.environ['SUPABASE_KEY']
-          BASE = f"https://{REF}.supabase.co/rest/v1"
-          HEADERS = {
-              "apikey": KEY,
-              "Authorization": f"Bearer {KEY}",
-              "Accept": "application/json",
-              "Content-Type": "application/json",
-          }
           
-          def api_get(path):
-              req = urllib.request.Request(f"{BASE}{path}", headers=HEADERS)
+          def api_get(url):
+              req = urllib.request.Request(url, headers={
+                  "apikey": KEY, "Authorization": f"Bearer {KEY}",
+                  "Accept": "application/json"
+              })
               with urllib.request.urlopen(req) as r:
                   return json.loads(r.read().decode())
           
-          def api_post(path, data):
-              req = urllib.request.Request(f"{BASE}{path}", 
-                  data=json.dumps(data).encode(),
-                  headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
-                  method="POST")
-              try:
-                  with urllib.request.urlopen(req) as r:
-                      return r.read().decode()
-              except urllib.error.HTTPError as e:
-                  return f"HTTP {e.code}: {e.read().decode()[:200]}"
-          
           def exec_sql(sql):
-              """Run SQL on local database via docker compose exec"""
-              cmd = f"""docker compose exec -T db psql -U postgres -d postgres -c {shlex.quote(sql)}"""
-              return os.popen(cmd).read()
+              """Run SQL on local database, capture stdout+stderr"""
+              r = subprocess.run(
+                  ["docker", "compose", "exec", "-T", "db", "psql",
+                   "-U", "postgres", "-d", "postgres", "-c", sql],
+                  capture_output=True, text=True, timeout=30
+              )
+              return r.stdout + r.stderr
           
-          import shlex
+          def exec_sql_stdin(sql):
+              """Run multi-line SQL via stdin"""
+              r = subprocess.run(
+                  ["docker", "compose", "exec", "-T", "db", "psql",
+                   "-U", "postgres", "-d", "postgres"],
+                  input=sql, capture_output=True, text=True, timeout=120
+              )
+              return r.stdout + r.stderr
           
-          # Step 1: Get ALL tables from remote
-          print("📡 Discovering remote schema...")
-          openapi = api_get("/")
-          tables = sorted(openapi.get('definitions', {}).keys())
-          print(f"✅ Found {len(tables)} tables: {', '.join(tables)}")
+          print("📡 Fetching full schema from pg-meta API...")
+          tables_meta = api_get(f"https://{REF}.supabase.co/pg-meta/default/tables")
+          public_tables = [t for t in tables_meta if t['schema'] == 'public' and not t['name'].startswith('_')]
+          table_names = sorted([t['name'] for t in public_tables])
+          print(f"✅ Found {len(table_names)} public tables: {', '.join(table_names)}")
           
-          # Step 2: Get column definitions from OpenAPI spec
-          defs = openapi.get('definitions', {})
+          # Build table-by-name index
+          table_index = {t['name']: t for t in public_tables}
           
-          # Step 3: Build and execute CREATE TABLE statements
-          print("\n🏗️  Creating tables in local database...")
+          # ── Step 1: Create tables ────────────────────────────────────────
+          print("\n🏗️  Creating tables from pg-meta metadata...")
           created = 0
-          for table in tables:
-              props = defs[table].get('properties', {})
-              required = defs[table].get('required', [])
-              
-              # Map OpenAPI types to PostgreSQL types
-              type_map = {
-                  'integer': 'integer', 'int4': 'integer', 'int8': 'bigint',
-                  'string': 'text', 'boolean': 'boolean',
-                  'number': 'numeric', 'double': 'double precision',
-                  'bigint': 'bigint', 'smallint': 'smallint',
-                  'timestamp with time zone': 'timestamp with time zone',
-                  'uuid': 'uuid', 'json': 'jsonb', 'jsonb': 'jsonb',
-                  'character varying': 'text', 'text': 'text',
-                  'date': 'date', 'time': 'time',
-              }
-              
+          for name in table_names:
+              meta = table_index[name]
               cols = []
-              for col_name, col_info in props.items():
-                  fmt = col_info.get('format', '')
-                  raw_type = col_info.get('type', 'text')
+              pk_cols = [pk['name'] for pk in meta.get('primary_keys', [])]
+              
+              for col in meta.get('columns', []):
+                  col_name = col['name']
+                  col_type = col['type']
+                  nullable = '' if col.get('is_nullable') else 'NOT NULL'
+                  default = f"DEFAULT {col['default_value']}" if col.get('default_value') else ''
+                  is_pk = 'PRIMARY KEY' if col_name in pk_cols else ''
+                  cols.append(f'  "{col_name}" {col_type} {default} {nullable} {is_pk}'.strip())
+              
+              if cols:
+                  pk_extra = ''
+                  # If PKs are composite, add table-level constraint
+                  composite_pks = [c for c in pk_cols if c not in [col['name'] for col in meta.get('columns', [])]]
+                  if len(pk_cols) > 1:
+                      pk_extra = f', PRIMARY KEY ({", ".join(f"\"{c}\"" for c in pk_cols)})'
                   
-                  # Fix common types
-                  if raw_type == 'array' and col_info.get('items', {}).get('type') == 'string':
-                      pg_type = 'text[]'
-                  elif raw_type == 'array':
-                      pg_type = 'jsonb'
+                  sql = f'CREATE TABLE IF NOT EXISTS public."{name}" (\n' + ',\n'.join(cols) + f'{pk_extra}\n);'
+                  result = exec_sql_stdin(sql)
+                  if 'ERROR' in result.upper():
+                      print(f"  ⚠️  {name}: {result[:200]}")
                   else:
-                      pg_type = type_map.get(fmt, type_map.get(raw_type, 'text'))
-                  
-                  not_null = 'NOT NULL' if col_name in required else ''
-                  cols.append(f'  "{col_name}" {pg_type} {not_null}'.strip())
-              
-              if not cols:
-                  continue
-              
-              create_sql = f'CREATE TABLE IF NOT EXISTS public."{table}" (\n' + ',\n'.join(cols) + '\n);'
-              result = exec_sql(create_sql)
-              if 'ERROR' in result or 'error' in result.lower():
-                  print(f"  ⚠️  {table}: {result[:100]}...")
-              else:
-                  created += 1
-                  print(f"  ✅ {table}")
+                      created += 1
+                      print(f"  ✅ {name} (PK: {', '.join(pk_cols) if pk_cols else 'none'})")
           
-          print(f"\n✅ Created {created}/{len(tables)} tables")
+          print(f"\n✅ Created {created}/{len(table_names)} tables")
           
-          # Step 4: Migrate data for each table
+          # ── Step 2: Migrate data ─────────────────────────────────────────
           print("\n📦 Migrating data...")
           total_rows = 0
-          for table in tables:
-              print(f"\n  📤 Exporting {table}...")
-              # Fetch with pagination (1000 rows at a time)
+          for name in table_names:
+              print(f"\n  📤 {name}: fetching...", end=' ', flush=True)
               offset = 0
               limit = 1000
               rows_imported = 0
               
               while True:
-                  path = f"/{table}?select=*&limit={limit}&offset={offset}"
+                  url = f"https://{REF}.supabase.co/rest/v1/{name}?select=*&limit={limit}&offset={offset}"
                   try:
-                      data = api_get(path)
+                      rows = api_get(url)
                   except Exception as e:
-                      print(f"    ⚠️  Error fetching {table}: {e}")
+                      print(f"\n    ⚠️  Fetch error: {e}")
+                      break
+                  if not rows:
                       break
                   
-                  if not data:
-                      break
-                  
-                  # Insert into local database
-                  for row in data:
-                      cols = ', '.join(f'"{k}"' for k in row.keys())
-                      vals = ', '.join(
-                          'NULL' if v is None else 
-                          f"'{str(v).replace(chr(39), chr(39)+chr(39))}'" if isinstance(v, (str,)) else
-                          f"'{v.isoformat()}'" if hasattr(v, 'isoformat') else
-                          str(v).lower() if isinstance(v, bool) else
-                          str(v)
-                          for v in row.values()
-                      )
-                      # Handle special types via JSON
-                      insert_sql = f'INSERT INTO public."{table}" ({cols}) SELECT * FROM jsonb_populate_record(NULL::public."{table}", \'{json.dumps(row)}\'::jsonb) ON CONFLICT DO NOTHING;'
-                      result = exec_sql(insert_sql)
-                      if 'ERROR' not in result and 'error' not in result.lower():
-                          rows_imported += 1
-                      else:
-                          # Fallback: try text-based insert
-                          safe_vals = ', '.join(
-                              'NULL' if v is None else
-                              f"'" + str(v).replace("'", "''") + "'"
-                              for v in row.values()
-                          )
-                          insert_sql2 = f'INSERT INTO public."{table}" ({cols}) VALUES ({safe_vals}) ON CONFLICT DO NOTHING;'
-                          result2 = exec_sql(insert_sql2)
-                          if 'ERROR' not in result2 and 'error' not in result2.lower():
+                  # Use jsonb_populate_record for type-safe inserts
+                  insert_sql = '\n'.join(
+                      f"SELECT 1 FROM pg_try_advisory_xact_lock(hashtext('migrate_{name}'));"
+                      f"INSERT INTO public.\"{name}\" SELECT * FROM jsonb_populate_record(NULL::public.\"{name}\", '{json.dumps(r).replace(chr(39), chr(39)+chr(39))}'::jsonb);"
+                      for r in rows
+                  )
+                  result = exec_sql_stdin(insert_sql)
+                  if 'ERROR' in result.upper():
+                      # Fallback: insert row by row to isolate failures
+                      for r in rows:
+                          single_sql = f"INSERT INTO public.\"{name}\" SELECT * FROM jsonb_populate_record(NULL::public.\"{name}\", '{json.dumps(r).replace(chr(39), chr(39)+chr(39))}'::jsonb);"
+                          r2 = exec_sql_stdin(single_sql)
+                          if 'ERROR' not in r2.upper():
                               rows_imported += 1
+                  else:
+                      rows_imported += len(rows)
                   
                   offset += limit
-                  if len(data) < limit:
+                  if len(rows) < limit:
                       break
               
               total_rows += rows_imported
-              print(f"  ✅ Imported {rows_imported} rows")
+              print(f"✅ {rows_imported} rows imported")
           
           print(f"\n{'='*50}")
           print(f"✅ MIGRATION COMPLETE!")
-          print(f"   Tables created: {created}/{len(tables)}")
-          print(f"   Rows imported: {total_rows}")
+          print(f"   Tables: {created}/{len(table_names)}")
+          print(f"   Rows:   {total_rows}")
           print(f"{'='*50}")
           PYEOF
 
