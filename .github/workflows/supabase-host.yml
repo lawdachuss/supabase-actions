@@ -64,7 +64,7 @@ jobs:
           # ── Run independent tasks in parallel ──
           (
             curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-              -o /usr/local/bin/cloudflared &
+              -o /usr/local/bin/cloudflared
             chmod +x /usr/local/bin/cloudflared
             cloudflared version
           ) &
