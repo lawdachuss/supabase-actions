@@ -173,7 +173,7 @@ jobs:
             echo "⏳ No cache found — pulling images (first run or version change)..."
             docker compose pull 2>&1 | tail -3
             echo "💾 Saving images to cache for next run..."
-            docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'supabase|kong|postgrest|timberio') \
+            docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'supabase|kong|postgrest|timberio|darthsim') \
               -o /tmp/docker-images.tar 2>&1 | tail -3
           fi
           
@@ -221,8 +221,6 @@ jobs:
             --clean --if-exists --no-owner --no-privileges /tmp/backup.dump || \
             echo "⚠️  Partial restore (expected on fresh schema migrations)"
           echo "✅ Database restored from cache"
-
-
 
       # ── Start Cloudflare Tunnel ────────────────────────────────────────
       - name: 🌐 Start Cloudflare Tunnel
