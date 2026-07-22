@@ -50,30 +50,34 @@ jobs:
       - name: 📥 Checkout repo
         uses: actions/checkout@v4
 
-      # ── Install cloudflared ────────────────────────────────────────────
-      - name: 🔧 Install cloudflared
-        run: |
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /usr/local/bin/cloudflared
-          chmod +x /usr/local/bin/cloudflared
-          cloudflared version
+      # ── Docker image cache ─────────────────────────────────────────────
+      - name: 🐳 Restore Docker image cache
+        id: cache-docker
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/docker-images.tar
+          key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
-      # ── Speed up Docker health checks (keep ALL services) ──────────────
-      - name: ⚡ Optimize health check delays (full stack enabled)
+      # ── Parallel setup: cloudflared + dirs + yaml + .env ────────────────
+      - name: ⚡ Parallel setup (cloudflared, dirs, YAML, .env)
         run: |
-          pip install pyyaml -q
+          # ── Run independent tasks in parallel ──
+          (
+            curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+              -o /usr/local/bin/cloudflared &
+            chmod +x /usr/local/bin/cloudflared
+            cloudflared version
+          ) &
+          pip install pyyaml PyJWT -q &
+          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/{db/data,functions,pooler,snippets,api,storage,logs} &
+          wait
+          
+          # ── Optimize health checks ──
           python3 << 'PYEOF'
           import yaml
-          
           filepath = '${{ env.SUPABASE_DIR }}/docker-compose.yml'
-          
           with open(filepath, 'r') as f:
               data = yaml.safe_load(f)
-          
-          # The docker-compose.yml and volumes are committed directly in the repo
-          # (no need to clone supabase repo - saves ~20s per run)
-          
-          # Speed up Studio health check (reduce startup delay)
           if data and 'services' in data and 'studio' in data['services']:
               studio = data['services']['studio']
               if isinstance(studio, dict) and 'healthcheck' in studio:
@@ -82,89 +86,60 @@ jobs:
                       hc['start_period'] = '5s'
                   if hc.get('interval') == '5s':
                       hc['interval'] = '2s'
-          
           with open(filepath, 'w') as f:
               yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-          
-          print("✅ Full stack with Storage enabled, health checks optimized!")
+          print("✅ Health checks optimized")
           PYEOF
-
-      # ── Generate .env with secrets ──────────────────────────────────────
-      - name: 🔐 Configure .env with secrets
-        run: |
+          
+          # ── Configure .env ──
           cd ${{ env.SUPABASE_DIR }}
           cp .env.example .env
-
-          # Use provided domain or fall back to localhost
           if [ -n "${{ secrets.CF_TUNNEL_DOMAIN }}" ]; then
             export PUBLIC_URL="https://${{ secrets.CF_TUNNEL_DOMAIN }}"
           else
             export PUBLIC_URL="http://localhost:8000"
           fi
-
-          # Generate secure keys using Python
-          pip install PyJWT -q
-
           python3 << 'PYEOF'
           import os, jwt, time, secrets
-          
           secret = os.environ['JWT_SECRET']
           public_url = os.environ['PUBLIC_URL']
           iat = int(time.time())
-          exp = iat + 315360000  # 10 years
-          
-          # Generate ANON key
-          anon_key = jwt.encode(
-              {'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp},
-              secret, algorithm='HS256'
-          )
-          
-          # Generate SERVICE_ROLE key
-          service_key = jwt.encode(
-              {'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp},
-              secret, algorithm='HS256'
-          )
-          
-          # Generate all required crypto keys
-          secret_key_base = secrets.token_urlsafe(64)[:64]
-          realtime_enc_key = secrets.token_hex(8)
-          vault_enc_key = secrets.token_hex(16)
-          pg_meta_key = secrets.token_urlsafe(24)
-          pooler_tenant_id = secrets.token_hex(8)
-          s3_access_key = secrets.token_hex(16)
-          s3_secret_key = secrets.token_hex(32)
-          logflare_public = secrets.token_urlsafe(32)
-          logflare_private = secrets.token_urlsafe(32)
-          
-          # Read .env, replace values
+          exp = iat + 315360000
+          anon_key = jwt.encode({'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret, algorithm='HS256')
+          service_key = jwt.encode({'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret, algorithm='HS256')
+          skb = secrets.token_urlsafe(64)[:64]
+          rek = secrets.token_hex(8)
+          vek = secrets.token_hex(16)
+          pmk = secrets.token_urlsafe(24)
+          ptid = secrets.token_hex(8)
+          sak = secrets.token_hex(16)
+          ssk = secrets.token_hex(32)
+          lfp = secrets.token_urlsafe(32)
+          lpv = secrets.token_urlsafe(32)
           with open('.env', 'r') as f:
               env_content = f.read()
-          
           replacements = {
               'your-super-secret-and-long-postgres-password': os.environ['POSTGRES_PASSWORD'],
               'your-super-secret-jwt-token-with-at-least-32-characters-long': os.environ['JWT_SECRET'],
               'this_password_is_insecure_and_should_be_updated': os.environ['DASHBOARD_PASSWORD'],
               'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJhbm9uIiwKICAgICJpc3MiOiAic3VwYWJhc2UtZGVtbyIsCiAgICAiaWF0IjogMTY0MTc2OTIwMCwKICAgICJleHAiOiAxNzk5NTM1NjAwCn0.dc_X5iR_VP_qT0zsiyj_I_OZ2T9FtRU2BBNWN8Bu4GE': anon_key,
               'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyAgCiAgICAicm9sZSI6ICJzZXJ2aWNlX3JvbGUiLAogICAgImlzcyI6ICJzdXBhYmFzZS1kZW1vIiwKICAgICJpYXQiOiAxNjQxNzY5MjAwLAogICAgImV4cCI6IDE3OTk1MzU2MDAKfQ.DaYlNEoUrrEn2Ig7tqibS-PHK5vgusbcbo7X36XVt4Q': service_key,
-              'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': secret_key_base,
+              'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': skb,
               'http://localhost:8000': public_url,
               'SITE_URL=http://localhost:3000': f'SITE_URL={public_url}',
-              'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={realtime_enc_key}',
-              'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vault_enc_key}',
-              'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pg_meta_key}',
-              'POOLER_TENANT_ID=your-tenant-id': f'POOLER_TENANT_ID={pooler_tenant_id}',
-              'S3_PROTOCOL_ACCESS_KEY_ID=625729a08b95bf1b7ff351a663f3a23c': f'S3_PROTOCOL_ACCESS_KEY_ID={s3_access_key}',
-              'S3_PROTOCOL_ACCESS_KEY_SECRET=850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907': f'S3_PROTOCOL_ACCESS_KEY_SECRET={s3_secret_key}',
-              'your-super-secret-and-long-logflare-key-public': logflare_public,
-              'your-super-secret-and-long-logflare-key-private': logflare_private,
+              'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={rek}',
+              'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vek}',
+              'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pmk}',
+              'POOLER_TENANT_ID=your-tenant-id': f'POOLER_TENANT_ID={ptid}',
+              'S3_PROTOCOL_ACCESS_KEY_ID=625729a08b95bf1b7ff351a663f3a23c': f'S3_PROTOCOL_ACCESS_KEY_ID={sak}',
+              'S3_PROTOCOL_ACCESS_KEY_SECRET=850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907': f'S3_PROTOCOL_ACCESS_KEY_SECRET={ssk}',
+              'your-super-secret-and-long-logflare-key-public': lfp,
+              'your-super-secret-and-long-logflare-key-private': lpv,
           }
-          
           for old, new in replacements.items():
               env_content = env_content.replace(old, new)
-          
           with open('.env', 'w') as f:
               f.write(env_content)
-          
           print("✅ .env configured with secure keys")
           PYEOF
         env:
@@ -179,18 +154,6 @@ jobs:
           docker compose config > /dev/null
           echo "✅ All compose files validate successfully!"
 
-      # ── Create required volume directories ─────────────────────────────
-      - name: 📁 Create volume directories
-        run: |
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/db/data
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/functions
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/pooler
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/snippets
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/api
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/storage
-          mkdir -p ${{ env.SUPABASE_DIR }}/volumes/logs
-          echo "✅ Volume directories created (including storage + logs)"
-
       # ── Restore database from cache ─────────────────────────────────────
       # Uses versioned keys: restore from the most recent cache entry
       - name: 💾 Restore database from cache
@@ -203,36 +166,54 @@ jobs:
             supabase-db-
           fail-on-cache-miss: false
 
-      # ── Pre-pull Docker images and start Supabase stack ─────────────────
-      - name: 🏁 Pre-pull images & start Supabase services
+      # ── Start Supabase stack (load cached images or pull fresh) ────────
+      - name: 🏁 Load/pull images & start services
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          echo "⏳ Pulling Docker images (this may take a minute on first run)..."
-          docker compose pull 2>&1 | tail -5
-          echo "✅ Images pulled. Starting services..."
+          
+          if [ -f /tmp/docker-images.tar ]; then
+            echo "✅ Loading Docker images from cache (~20s vs ~3min pull)..."
+            docker load < /tmp/docker-images.tar 2>&1 | tail -3
+          else
+            echo "⏳ No cache found — pulling images (first run or version change)..."
+            docker compose pull 2>&1 | tail -3
+            echo "💾 Saving images to cache for next run..."
+            docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'supabase|kong|postgrest|timberio') \
+              -o /tmp/docker-images.tar 2>&1 | tail -3
+          fi
+          
+          echo "🚀 Starting services..."
           docker compose up -d
-          echo "⏳ Waiting for services to become healthy..."
-          # Wait for PostgreSQL to be ready (reduced from 30 to 15 retries)
-          for i in $(seq 1 15); do
+          echo "⏳ Waiting for services..."
+          # Wait for PostgreSQL (reduced to 10 retries - starts faster than Kong)
+          for i in $(seq 1 10); do
             if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
               echo "✅ PostgreSQL is ready!"
               break
             fi
-            echo "  Waiting... ($i/15)"
+            echo "  Waiting PG... ($i/10)"
             sleep 5
           done
-          # Wait for Kong to be ready on port 8000 (reduced from 30 to 20 retries)
+          # Wait for Kong (reduced to 15 retries - enough for ~75s)
           echo "⏳ Waiting for Kong on port 8000..."
-          for i in $(seq 1 20); do
+          for i in $(seq 1 15); do
             if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
               echo "✅ Kong is ready!"
               break
             fi
-            echo "  Waiting... ($i/20)"
+            echo "  Waiting Kong... ($i/15)"
             sleep 5
           done
           echo ""
           docker compose ps
+
+      # ── Save Docker image cache for next run (if newly pulled) ─────────
+      - name: 💿 Save Docker image cache
+        if: steps.cache-docker.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/docker-images.tar
+          key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
       # ── Restore data from backup (if cached) ────────────────────────────
       - name: 🔄 Restore database from cached backup
