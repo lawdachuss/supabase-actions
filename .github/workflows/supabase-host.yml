@@ -9,8 +9,8 @@
 # 5. Scheduled every 6 hours — 15 min gap between runs for clean handoff
 #
 # Required GitHub Secrets:
-#   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (one-time setup)
-#   CF_TUNNEL_DOMAIN    - (Optional) Your domain for public access
+#   TUNNEL_CREDENTIALS  - Cloudflare Tunnel credentials JSON (from cloudflared tunnel create)
+#   CF_TUNNEL_DOMAIN    - Your domain for public access (e.g. supabase.chuglii.in)
 #   POSTGRES_PASSWORD   - Your secure PostgreSQL password
 #   JWT_SECRET          - JWT signing secret (32+ chars)
 #   DASHBOARD_PASSWORD  - Supabase Studio admin password
@@ -255,19 +255,22 @@ jobs:
       - name: 🌐 Start Cloudflare Tunnel
         id: tunnel
         env:
-          TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
         run: |
-          # Start tunnel in background (token passed via env var for safety)
-          nohup cloudflared tunnel run --token "$TUNNEL_TOKEN" \
+          # Write tunnel credentials from secret
+          echo '${{ secrets.TUNNEL_CREDENTIALS }}' > /tmp/supabase-tunnel-creds.json
+          chmod 600 /tmp/supabase-tunnel-creds.json
+
+          # Start tunnel in background using config file
+          nohup cloudflared tunnel run --config cloudflared-config.yml \
             > /tmp/cloudflared.log 2>&1 &
           echo "TUNNEL_PID=$!" >> $GITHUB_ENV
           echo "⏳ Waiting for tunnel to establish..."
           sleep 20
-          TUNNEL_DOMAIN="${{ secrets.CF_TUNNEL_DOMAIN }}"
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "✅ Tunnel active at: https://$TUNNEL_DOMAIN"
           else
-            echo "✅ Tunnel connected! Add a public hostname in Cloudflare dashboard."
+            echo "⚠️  No domain configured — add one in Cloudflare dashboard."
             echo "   (You need a domain on Cloudflare to route traffic)"
           fi
 
