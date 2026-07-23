@@ -7,6 +7,10 @@ Thumbs.db
 
 # Docker volumes (large, generated at runtime)
 /volumes/
+/supabase/volumes/db/data/
+/supabase/volumes/storage/
+/supabase/volumes/snippets/
+/supabase/volumes/functions/
 
 # Cloned/test directories (old troubleshooting copies)
 /tmp-supabase/
