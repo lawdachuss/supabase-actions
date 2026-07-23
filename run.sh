@@ -31,7 +31,9 @@ Commands:
   backup [dir]       Backup database + storage to timestamped archive
   restore <file>     Restore from a backup archive
   reset              WARNING: Deletes ALL data and resets from scratch
-  config               Show available compose overrides
+  config             Show available compose overrides
+  gen-keys           Generate fresh secrets and API keys (interactive)
+  gen-auth-keys      Generate asymmetric ES256 + opaque API keys
 
 EOF
 }
@@ -207,6 +209,8 @@ case "${1:-help}" in
   restore)  shift; cmd_restore "$@" ;;
   reset)    cmd_reset ;;
   config)   shift; cmd_config "$@" ;;
+  gen-keys) shift; sh utils/generate-keys.sh "$@" ;;
+  gen-auth-keys) shift; sh utils/add-new-auth-keys.sh "$@" ;;
   help|--help|-h) usage ;;
   *)        echo "Unknown command: ${1}"; usage; exit 1 ;;
 esac
