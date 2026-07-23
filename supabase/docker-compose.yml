@@ -96,7 +96,8 @@ services:
       # https://github.com/supabase/cli/issues/14
       KONG_DNS_ORDER: LAST,A,CNAME
       KONG_DNS_NOT_FOUND_TTL: 1
-      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function,rate-limiting
+      KONG_PROXY_ERROR_LOG: /dev/stdout
       KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
       KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
       KONG_PROXY_ACCESS_LOG: /dev/stdout combined
@@ -332,92 +333,6 @@ services:
       RUN_JANITOR: "true"
       DISABLE_HEALTHCHECK_LOGGING: "true"
 
-  # To use S3 backed storage: docker compose -f docker-compose.yml -f docker-compose.s3.yml up
-  storage:
-    container_name: supabase-storage
-    image: supabase/storage-api:v1.60.4
-    restart: unless-stopped
-    depends_on:
-      db:
-        # Disable this if you are using an external Postgres database
-        condition: service_healthy
-      rest:
-        condition: service_started
-      imgproxy:
-        condition: service_started
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--no-verbose",
-          "--tries=1",
-          "--spider",
-          "http://storage:5000/status"
-        ]
-      timeout: 5s
-      interval: 5s
-      retries: 3
-      start_period: 10s
-    environment:
-      ANON_KEY: ${ANON_KEY}
-      SERVICE_KEY: ${SERVICE_ROLE_KEY}
-      POSTGREST_URL: http://rest:3000
-
-      # Legacy symmetric HS256 key
-      AUTH_JWT_SECRET: ${JWT_SECRET}
-
-      # JWKS for token verification (EC public + legacy symmetric).
-      JWT_JWKS: ${JWT_JWKS:-{"keys":[]}}
-
-      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}
-      STORAGE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL}
-      REQUEST_ALLOW_X_FORWARDED_PATH: "true"
-      FILE_SIZE_LIMIT: 52428800
-      STORAGE_BACKEND: file
-      # S3 bucket when using S3 backend, directory name when using 'file'
-      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET}
-      # S3 Backend configuration
-      #GLOBAL_S3_ENDPOINT: https://your-s3-endpoint
-      #GLOBAL_S3_PROTOCOL: https
-      #GLOBAL_S3_FORCE_PATH_STYLE: "true"
-      #AWS_ACCESS_KEY_ID: your-access-key-id
-      #AWS_SECRET_ACCESS_KEY: your-secret-access-key
-      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
-      TENANT_ID: ${STORAGE_TENANT_ID}
-      # TODO: https://github.com/supabase/storage-api/issues/55
-      REGION: ${REGION}
-      ENABLE_IMAGE_TRANSFORMATION: "true"
-      IMGPROXY_URL: http://imgproxy:5001
-      # S3 protocol endpoint configuration
-      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID}
-      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET}
-    volumes:
-      - ./volumes/storage:/var/lib/storage:z
-
-  imgproxy:
-    container_name: supabase-imgproxy
-    image: darthsim/imgproxy:v3.30.1
-    restart: unless-stopped
-    volumes:
-      - ./volumes/storage:/var/lib/storage:z
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "imgproxy",
-          "health"
-        ]
-      timeout: 5s
-      interval: 5s
-      retries: 3
-    environment:
-      IMGPROXY_BIND: ":5001"
-      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /
-      IMGPROXY_USE_ETAG: "true"
-      IMGPROXY_AUTO_WEBP: ${IMGPROXY_AUTO_WEBP}
-      IMGPROXY_MAX_SRC_RESOLUTION: 16.8
-
   meta:
     container_name: supabase-meta
     image: supabase/postgres-meta:v0.96.6
@@ -488,6 +403,11 @@ services:
       - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:Z
       # Initialize the database settings with JWT_SECRET and JWT_EXP
       - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:Z
+      # Personal access tokens (sbp_) table and management functions
+      - ./volumes/db/access-tokens.sql:/docker-entrypoint-initdb.d/init-scripts/97-access-tokens.sql:Z
+      # Custom seed data (empty by default — user can add SQL here)
+      # NOTE: "zz-" prefix ensures seed data runs LAST after all other init scripts
+      - ./volumes/db/init/data.sql:/docker-entrypoint-initdb.d/init-scripts/zz-init-data.sql:Z
       # PGDATA directory is persisted between restarts
       - ./volumes/db/data:/var/lib/postgresql/data:Z
       # Changes required for internal supabase data such as _analytics
@@ -529,6 +449,22 @@ services:
         "-c",
         "log_min_messages=fatal" # prevents Realtime polling queries from appearing in logs
       ]
+
+  # Development SMTP server for testing email auth (signup, password reset, invitations)
+  # Web UI: http://localhost:9000 — view captured emails here
+  # In production, replace SMTP_HOST/SMTP_PORT with a real provider.
+  supabase-mail:
+    container_name: supabase-mail
+    image: inbucket/inbucket:3.1.1
+    restart: unless-stopped
+    ports:
+      - ${INBUCKET_WEB_PORT:-9000}:9000   # Web UI
+      - ${INBUCKET_SMTP_PORT:-2500}:2500  # SMTP
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # Update the DATABASE_URL if you are using an external Postgres database
   supavisor:

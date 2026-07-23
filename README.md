@@ -2,7 +2,7 @@
 
 [![Supabase Self-Hosted](https://github.com/lawdachuss/supabase-actions/actions/workflows/supabase-host.yml/badge.svg)](https://github.com/lawdachuss/supabase-actions/actions/workflows/supabase-host.yml)
 
-**Run Supabase (all features except Storage) on free GitHub Actions runners with a permanent URL via Cloudflare Tunnel.**
+**Run Supabase (no object storage) on free GitHub Actions runners with a permanent URL via Cloudflare Tunnel.**
 
 ```
 ┌──────────────────────┐     ┌──────────────────────┐     ┌──────────────────┐
@@ -21,7 +21,7 @@
 
 ## ✨ Features
 
-| Feature | Status |
+| Feature | Included |
 |---|---|
 | **PostgreSQL database** | ✅ Full Supabase Postgres |
 | **PostgREST API** | ✅ Auto-generated REST API |
@@ -29,15 +29,15 @@
 | **Realtime subscriptions** | ✅ WebSocket-based live queries |
 | **Supabase Studio** | ✅ Dashboard UI (port 8000) |
 | **Edge Functions** | ✅ Deno-based edge functions |
-| **Object Storage** | ❌ Removed (as requested) |
 | **Permanent URL** | ✅ Cloudflare Tunnel (static domain) |
 | **Data persistence** | ✅ Cached between GitHub Actions runs |
+| **Object Storage** | ❌ Not included |
 
 ## ⏱️ How It Works
 
 1. **Workflow triggers** — manually or every 6 hours via cron
 2. **Restores database** from GitHub Actions cache (your data survives)
-3. **Starts Supabase** Docker Compose (without Storage)
+3. **Starts all Supabase services** via Docker Compose (Postgres, Kong, Auth, PostgREST, Realtime, Studio, Edge Functions, Supavisor, Logflare, Vector)
 4. **Connects Cloudflare Tunnel** — your permanent URL goes live
 5. **Runs for ~5h45m** — access Studio, API, Auth, Realtime (maximizes the full 6-hour GitHub limit)
 6. **Graceful shutdown** — backs up database, saves to cache
@@ -54,23 +54,14 @@ Click the badge at the top of this README to see the latest workflow run:
 - 🔴 **Failing** = Something went wrong
 - 🟡 **No status** = First run not yet complete
 
-### External Health Check (in Workflow)
-
-Every time the tunnel starts, the workflow performs an **end-to-end health check** against `https://supabase.chuglii.in` testing:
-1. **Kong API gateway** responds
-2. **Supabase Studio** loads
-3. **REST API** responds
-
-The results are logged in the "External health check" step of each run.
-
 ### What to Check When Tunnel Goes Down
 
 | Check | How |
 |-------|-----|
-| **Last workflow status** | README badge or [Actions tab](https://github.com/lawdachuss/supabase-actions/actions) |
-| **Health check logs** | Open latest run → "External health check" step |
+| **Last workflow status** | README badge or Actions tab in your repo |
 | **Tunnel status** | [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels |
 | **Next scheduled run** | Waiting for cron `0 */6 * * *` (every 6 hours) |
+| **Container health** | Workflow logs show docker compose ps output |
 
 ---
 
@@ -180,25 +171,51 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | `CF_TUNNEL_TOKEN` | Cloudflare Tunnel step | Authenticates the tunnel to Cloudflare's edge. Created once in the Cloudflare dashboard. |
 | `CF_TUNNEL_DOMAIN` | `.env` generation + Tunnel display | Sets the public URL so Supabase generates correct redirect URIs. Omit this to use `localhost:8000` (tunnel still connects, but no public routing). |
 | `POSTGRES_PASSWORD` | `.env` → PostgreSQL container | Superuser password for the database. Used internally by all Supabase services. |
-| `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates `ANON_KEY` and `SERVICE_ROLE_KEY` from this secret using HS256. |
+| `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates all API keys from this secret. |
 | `DASHBOARD_PASSWORD` | `.env` → Supabase Studio | Login password for Studio at port 8000 (username: `supabase`). |
 
 #### Auto-Generated Keys (no setup needed)
 
-The workflow automatically generates these keys from `JWT_SECRET` and random secrets — no manual setup required:
+The workflow automatically generates all these keys from `JWT_SECRET` — no manual setup required:
 
 | Key / Secret | Generated From | Purpose |
 |---|---|---|
-| `ANON_KEY` | `JWT_SECRET` (HS256 JWT) | Public API key (safe to expose) |
-| `SERVICE_ROLE_KEY` | `JWT_SECRET` (HS256 JWT) | Admin API key (keep secret!) |
-| `SECRET_KEY_BASE` | Python `secrets` module | Cookie & session signing |
-| `REALTIME_DB_ENC_KEY` | Python `secrets` module | Realtime broadcast encryption |
-| `VAULT_ENC_KEY` | Python `secrets` module | Vault encryption |
-| `PG_META_CRYPTO_KEY` | Python `secrets` module | PostgREST metadata encryption |
-| `S3_ACCESS_KEY` / `S3_SECRET_KEY` | Python `secrets` module | Internal S3 protocol (Storage disabled, but keys still generated) |
-| `LOGFARE_PUBLIC_KEY` / `LOGFARE_PRIVATE_KEY` | Python `secrets` module | Logflare logging |
+| `ANON_KEY` | `JWT_SECRET` (HS256 JWT) | Legacy public API key |
+| `SERVICE_ROLE_KEY` | `JWT_SECRET` (HS256 JWT) | Legacy admin API key |
+| `SUPABASE_PUBLISHABLE_KEY` | `JWT_SECRET` (opaque `sb_publishable_...`) | New opaque public API key |
+| `SUPABASE_SECRET_KEY` | `JWT_SECRET` (opaque `sb_secret_...`) | New opaque admin API key |
+| `JWT_KEYS` | `JWT_SECRET` (ES256 EC P-256 + HS256) | Private JWKs for Auth signing |
+| `JWT_JWKS` | `JWT_SECRET` (ES256 EC P-256 + HS256) | Public JWKS for all services |
+| `ANON_KEY_ASYMMETRIC` | `JWT_SECRET` (ES256 JWT) | Asymmetric anon JWT for Kong |
+| `SERVICE_ROLE_KEY_ASYMMETRIC` | `JWT_SECRET` (ES256 JWT) | Asymmetric service JWT for Kong |
+| `SECRET_KEY_BASE` | `JWT_SECRET` (HMAC-SHA512) | Cookie & session signing |
+| `REALTIME_DB_ENC_KEY` | `JWT_SECRET` (HMAC-SHA512) | Realtime broadcast encryption |
+| `VAULT_ENC_KEY` | `JWT_SECRET` (HMAC-SHA512) | Vault encryption |
+| `PG_META_CRYPTO_KEY` | `JWT_SECRET` (HMAC-SHA512) | Studio metadata encryption |
+| `LOGFLARE_PUBLIC_TOKEN` / `LOGFLARE_PRIVATE_TOKEN` | `JWT_SECRET` (HMAC-SHA512) | Logflare logging |
 
-> **💡 Tip:** You can find these generated values in the workflow run logs under the "Configure .env with secrets" step.
+> **💡 All keys are deterministic** — same `JWT_SECRET` always produces the same keys. Find them in workflow logs under the "Super-fast startup" step.
+
+## 🔑 Personal Access Tokens
+
+Generate `sbp_` personal access tokens just like Supabase Cloud:
+
+```bash
+# Create a token
+./run.sh gen-token "My CI Token" "For GitHub Actions deployments"
+
+# List all tokens
+./run.sh list-tokens
+
+# Revoke a token
+./run.sh revoke-token <token-uuid>
+```
+
+Tokens are HS256 JWTs with service_role privileges, tracked in the database for listing and revocation. Use with any Supabase API:
+
+```bash
+curl -H "Authorization: Bearer <token>" https://your-domain.com/rest/v1/your_table
+```
 
 ### Step 6: Push & Run
 
@@ -260,6 +277,8 @@ Set environment variables in the workflow (e.g., `GOTRUE_EXTERNAL_GOOGLE_ENABLED
 
 ## 🧠 Architecture Notes
 
+Object storage is intentionally excluded but can be re-added (see Troubleshooting).
+
 ### Why not use VPS?
 
 This setup is **free** (GitHub Actions + Cloudflare free tier). The trade-off:
@@ -298,7 +317,9 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 | Workflow not running on schedule | GitHub may delay schedule events during high load |
 | "No space left on device" | GitHub runner has ~14GB free — clean up old Docker images |
 | Port already in use | Runner resets between runs, should be fresh |
-| Health check shows errors | Check the "External health check" step in the workflow run — it tests Kong, Studio, and API independently |
+| Rate limited (429) | Open auth routes limited to 30 req/min; SSO ACS to 10 req/min |
+| Kong returning errors | Check workflow logs; `KONG_PROXY_ERROR_LOG` is output to stdout |
+| Want object storage? | Add `storage` and `imgproxy` services back to `docker-compose.yml` and mount `storage` SQL init |
 
 ---
 

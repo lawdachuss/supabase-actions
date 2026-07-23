@@ -28,12 +28,15 @@ Commands:
   status             Show container status
   logs [service]     Show logs (optional: filter by service name)
   psql               Open interactive PostgreSQL shell
-  backup [dir]       Backup database + storage to timestamped archive
+  backup [dir]       Backup database to timestamped archive
   restore <file>     Restore from a backup archive
   reset              WARNING: Deletes ALL data and resets from scratch
   config             Show available compose overrides
   gen-keys           Generate fresh secrets and API keys (interactive)
   gen-auth-keys      Generate asymmetric ES256 + opaque API keys
+  gen-token          Generate a new personal access token (sbp_)
+  list-tokens        List all personal access tokens
+  revoke-token       Revoke a personal access token by UUID
 
 EOF
 }
@@ -118,12 +121,6 @@ cmd_backup() {
     echo "  WARNING: Database dump failed (db may not be running). Skipping."
   }
 
-  # Copy storage files
-  if [ -d volumes/storage ] && [ "$(ls -A volumes/storage 2>/dev/null)" ]; then
-    echo "  -> Copying storage files..."
-    cp -a volumes/storage "${tmpdir}/storage"
-  fi
-
   # Archive everything
   tar czf "$archive" -C "$tmpdir" .
   echo "Backup saved: ${archive}"
@@ -157,13 +154,6 @@ cmd_restore() {
     }
   fi
 
-  # Restore storage
-  if [ -d "${tmpdir}/storage" ]; then
-    echo "  -> Restoring storage files..."
-    rm -rf volumes/storage
-    cp -a "${tmpdir}/storage" volumes/storage
-  fi
-
   echo "Restore complete. Run './run.sh restart' to apply."
 }
 
@@ -182,7 +172,6 @@ cmd_reset() {
 
   echo "Removing all data..."
   rm -rf volumes/db/data/*
-  rm -rf volumes/storage/*
   rm -rf volumes/snippets/*
   rm -rf volumes/functions/*
 
@@ -211,6 +200,33 @@ case "${1:-help}" in
   config)   shift; cmd_config "$@" ;;
   gen-keys) shift; sh utils/generate-keys.sh "$@" ;;
   gen-auth-keys) shift; sh utils/add-new-auth-keys.sh "$@" ;;
+  gen-token)
+    shift
+    if [ $# -lt 1 ]; then
+      echo "Usage: ./run.sh gen-token <name> [description]"
+      exit 1
+    fi
+    compose=$(get_compose_cmd)
+    RUN_COMPOSE="$compose $(build_f_args)" python3 utils/gen-token.py "$@"
+    ;;
+  list-tokens)
+    compose=$(get_compose_cmd)
+    $compose -f "$COMPOSE_FILE" exec -T db psql -U postgres -c "
+      SELECT * FROM _supabase.list_access_tokens(false);
+    " 2>/dev/null || echo "No tokens found or database not ready."
+    ;;
+  revoke-token)
+    shift
+    if [ $# -lt 1 ]; then
+      echo "Usage: ./run.sh revoke-token <token-uuid>"
+      exit 1
+    fi
+    compose=$(get_compose_cmd)
+    $compose -f "$COMPOSE_FILE" exec -T db psql -U postgres \
+      -v v_id="$1" \
+      -c "SELECT _supabase.revoke_token_by_id(:'v_id');" \
+      2>/dev/null || echo "Could not revoke token. Make sure Supabase is running."
+    ;;
   help|--help|-h) usage ;;
   *)        echo "Unknown command: ${1}"; usage; exit 1 ;;
 esac

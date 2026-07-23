@@ -1,0 +1,14 @@
+-- =============================================================================
+-- 📦 Custom Seed Data
+-- =============================================================================
+-- Place your SQL statements here to run on first database initialization.
+-- This file runs once when the database volume is first created.
+--
+-- Example:
+--   INSERT INTO public.users (email, name) VALUES ('admin@example.com', 'Admin');
+--   CREATE TABLE public.my_table (id SERIAL PRIMARY KEY, ...);
+--
+-- After adding data here, restart the database to reinitialize:
+--   docker compose down && docker compose up -d
+-- =============================================================================
+

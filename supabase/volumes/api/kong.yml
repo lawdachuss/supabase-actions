@@ -37,6 +37,7 @@ basicauth_credentials:
 ###
 services:
   ## Open Auth routes
+  ## Open Auth routes (with rate limiting to prevent brute force)
   - name: auth-v1-open
     _comment: 'Auth: /auth/v1/verify* -> http://auth:9999/verify*'
     url: http://auth:9999/verify
@@ -47,6 +48,10 @@ services:
           - /auth/v1/verify
     plugins:
       - name: cors
+      - name: rate-limiting
+        config:
+          minute: 30
+          policy: local
   - name: auth-v1-open-callback
     _comment: 'Auth: /auth/v1/callback* -> http://auth:9999/callback*'
     url: http://auth:9999/callback
@@ -57,6 +62,10 @@ services:
           - /auth/v1/callback
     plugins:
       - name: cors
+      - name: rate-limiting
+        config:
+          minute: 30
+          policy: local
   - name: auth-v1-open-authorize
     _comment: 'Auth: /auth/v1/authorize* -> http://auth:9999/authorize*'
     url: http://auth:9999/authorize
@@ -67,6 +76,10 @@ services:
           - /auth/v1/authorize
     plugins:
       - name: cors
+      - name: rate-limiting
+        config:
+          minute: 30
+          policy: local
   - name: auth-v1-open-jwks
     _comment: 'Auth: /auth/v1/.well-known/jwks.json -> http://auth:9999/.well-known/jwks.json'
     url: http://auth:9999/.well-known/jwks.json
@@ -87,6 +100,10 @@ services:
         - /auth/v1/sso/saml/acs
     plugins:
       - name: cors
+      - name: rate-limiting
+        config:
+          minute: 10
+          policy: local
 
   - name: auth-v1-open-sso-metadata
     url: "http://auth:9999/sso/saml/metadata"
@@ -304,41 +321,21 @@ services:
             - admin
             - anon
 
-  ## Storage API endpoint (with Authorization header transformation).
-  ## No key-auth — S3 protocol requests don't carry an apikey header.
-  ##
-  ## The request-transformer translates opaque API keys to asymmetric JWTs
-  ## and passes through existing Authorization headers (user JWTs, AWS SigV4).
-  ## When no Authorization or apikey header is present (S3 presigned URLs),
-  ## the Lua expression evaluates to nil which Kong renders as empty string.
-  ## The post-function strips this empty header so Storage's S3 signature
-  ## verification falls through to query-parameter parsing.
+  ## Storage catch-all — returns a clear message since storage is intentionally excluded
   - name: storage-v1
-    _comment: 'Storage: /storage/v1/* -> http://storage:5000/*'
-    url: http://storage:5000/
+    _comment: 'Storage: /storage/v1/* -> 503 (not included in this self-hosted setup)'
+    url: http://storage:5000/  # Original storage URL — request-termination blocks the request before reaching it
     routes:
       - name: storage-v1-all
-        strip_path: true
+        strip_path: false
         paths:
-          - /storage/v1/
+          - /storage/
     plugins:
+      - name: request-termination
+        config:
+          status_code: 503
+          message: "Storage is not included in this self-hosted setup"
       - name: cors
-      - name: request-transformer
-        config:
-          add:
-            headers:
-              - "Authorization: $LUA_AUTH_EXPR"
-          replace:
-            headers:
-              - "Authorization: $LUA_AUTH_EXPR"
-      - name: post-function
-        config:
-          access:
-            - |
-              local auth = kong.request.get_header("authorization")
-              if auth == nil or auth == "" or auth:find("^%s*$") then
-                kong.service.request.clear_header("authorization")
-              end
 
   ## Edge Functions routes
   - name: functions-v1
