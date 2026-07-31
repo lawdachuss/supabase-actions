@@ -238,7 +238,22 @@ jobs:
           echo 0 > "$STATUS_FILE"
 
           restore_db() {
-            timeout 120 docker compose wait db 2>/dev/null || { echo 1 > "$STATUS_FILE"; return; }
+            # FIX: docker compose wait <svc> blocks until the container STOPS (not
+            # until healthy), so the old `timeout 120 docker compose wait db` always
+            # timed out and the restore NEVER ran. Poll pg_isready instead.
+            DB_READY=0
+            for i in $(seq 1 60); do
+              if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+                DB_READY=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$DB_READY" -ne 1 ]; then
+              echo "⚠️  Timed out waiting for db to accept connections"
+              echo 1 > "$STATUS_FILE"
+              return
+            fi
             echo "PostgreSQL is accepting connections..."
 
             # ═══ CRITICAL: Wait for init scripts to finish ═══
@@ -336,7 +351,21 @@ jobs:
           }
 
           start_tunnel() {
-            timeout 120 docker compose wait kong 2>/dev/null || { echo 1 > "$STATUS_FILE"; return; }
+            # FIX: same as restore_db — docker compose wait would block until the
+            # container stops. Poll Kong's HTTP endpoint instead.
+            KONG_READY=0
+            for i in $(seq 1 60); do
+              if curl -s -o /dev/null http://localhost:8000 >/dev/null 2>&1; then
+                KONG_READY=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$KONG_READY" -ne 1 ]; then
+              echo "⚠️  Timed out waiting for Kong on :8000"
+              echo 1 > "$STATUS_FILE"
+              return
+            fi
             echo "Kong is ready on port 8000!"
             if [ -n "${{ secrets.CF_TUNNEL_TOKEN }}" ]; then
               nohup cloudflared tunnel --no-autoupdate run \
