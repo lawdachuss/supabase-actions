@@ -503,11 +503,15 @@ jobs:
               -c "INSERT INTO public.products (name, category, price, in_stock) VALUES ('Supabase Hoodie', 'apparel', 49.99, true), ('Supabase Mug', 'drinkware', 19.99, true), ('Supabase Sticker Pack', 'swag', 9.99, false), ('Postgres Poster', 'wall art', 14.99, true);" \
               -c "CREATE TABLE IF NOT EXISTS public.seed_log (id SERIAL PRIMARY KEY, seed_id UUID NOT NULL, seeded_at TIMESTAMPTZ NOT NULL DEFAULT now(), note TEXT);" \
               -c "INSERT INTO public.seed_log (seed_id, note) VALUES ('${SEED_ID}', 'persistence test seed');"
+          fi
 
-            # Vault: store an encrypted secret (survives restarts only if the pgsodium root key is restored too)
-            if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.secrets')" 2>/dev/null | grep -q "secrets"; then
-              docker compose exec -T db psql -U postgres -c "INSERT INTO vault.secrets (name, secret, description) VALUES ('persist_test', 'persist-me', 'restart persistence test');" 2>/dev/null || echo "  (vault insert failed)"
-            fi
+          # Vault: ensure a demo encrypted secret exists (idempotent — runs on fresh
+          # AND restored DBs). Stays decryptable across restarts only if the pgsodium
+          # root key is restored into the db-config volume before the DB boots.
+          if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.secrets')" 2>/dev/null | grep -q "secrets"; then
+            docker compose exec -T db psql -U postgres -c \
+              "INSERT INTO vault.secrets (name, secret, description) SELECT 'persist_test', 'persist-me', 'restart persistence test' WHERE NOT EXISTS (SELECT 1 FROM vault.secrets WHERE name = 'persist_test');" 2>/dev/null \
+              || echo "  (vault insert failed)"
           fi
 
           echo ""
