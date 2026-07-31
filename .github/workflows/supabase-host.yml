@@ -237,7 +237,7 @@ jobs:
             # DB boots, so the same encryption key is used and Vault data stays decryptable.
             if [ -f ./pgsodium_root.key ]; then
               echo "  🔑 Injecting pgsodium root key into db-config volume..."
-              DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1)
+              DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1 || true)
               if [ -z "$DB_VOL" ]; then
                 DB_VOL="supabase_db-config"
                 docker volume create "$DB_VOL" >/dev/null 2>&1 || true
@@ -628,7 +628,7 @@ jobs:
           fi
 
           # 2. Save the pgsodium root key (read straight from the db-config volume)
-          DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1)
+          DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1 || true)
           if [ -n "$DB_VOL" ] && \
             docker run --rm -v "$DB_VOL":/etc/postgresql-custom supabase/postgres:17.6.1.136 \
               sh -c "cat /etc/postgresql-custom/pgsodium_root.key" > ./pgsodium_root.key 2>/dev/null && \
