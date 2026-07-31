@@ -404,7 +404,7 @@ jobs:
           if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('public.products')" 2>/dev/null | grep -q "public.products"; then
             echo "♻️  'products' table found (restored from backup) — skipping seed."
           else
-            SEED_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "seed-$(date +%s)-$$")
+            SEED_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
             echo "🌱 FRESH database — creating tables and seeding data (seed_id=${SEED_ID})"
             docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 \
               -c "CREATE TABLE IF NOT EXISTS public.products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price NUMERIC(10,2) NOT NULL, in_stock BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now());" \
