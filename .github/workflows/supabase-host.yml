@@ -536,7 +536,15 @@ jobs:
           ls volumes/snippets 2>/dev/null | sed 's/^/    /' || echo "    (none)"
           echo "  🔑 vault secret (decryptable only if the pgsodium root key persisted):"
           if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.decrypted_secrets')" 2>/dev/null | grep -q "decrypted_secrets"; then
-            docker compose exec -T db psql -U postgres -c "SELECT name, decrypted_secret FROM vault.decrypted_secrets WHERE name='persist_test';" 2>/dev/null || echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
+            VAULT_ROWS=$(docker compose exec -T db psql -U postgres -t -A -c "SELECT COUNT(*) FROM vault.decrypted_secrets WHERE name='persist_test';" 2>/dev/null || echo "ERR")
+            if [ "$VAULT_ROWS" = "1" ]; then
+              echo "    ✅ vault decryption OK:"
+              docker compose exec -T db psql -U postgres -c "SELECT name, decrypted_secret FROM vault.decrypted_secrets WHERE name='persist_test';" 2>/dev/null || echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
+            elif [ "$VAULT_ROWS" = "ERR" ]; then
+              echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
+            else
+              echo "    ⚠️  persist_test row missing (count='${VAULT_ROWS:-0}') — vault data not restored?"
+            fi
           else
             echo "    (vault schema not present)"
           fi
