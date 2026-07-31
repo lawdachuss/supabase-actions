@@ -33,7 +33,8 @@ concurrency:
 
 env:
   SUPABASE_DIR: ./supabase
-  BACKUP_FILE: ./supabase/backup.dump
+  # Full-state archive: DB dump + edge functions + snippets + pgsodium key
+  BACKUP_FILE: ./supabase/supabase-state.tar.gz
   COMPOSE_FILE: docker-compose.yml:docker-compose.logs.yml
   DOCKER_SOCKET_LOCATION: /var/run/docker.sock
 
@@ -57,8 +58,8 @@ jobs:
           path: /tmp/docker-images.tar
           key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
-      # DB backup cache (separate key with fallback for cross-run persistence)
-      - name: 💾 Restore database cache
+      # Full-state archive cache (separate key with fallback for cross-run persistence)
+      - name: 💾 Restore state cache
         id: cache-db
         uses: actions/cache/restore@v4
         with:
@@ -223,6 +224,66 @@ jobs:
           else
             echo "⏭️  Docker image cache MISS — images will be pulled fresh"
           fi
+
+      # ── Restore full state (functions, snippets, pgsodium key) ──────────
+      - name: 📦 Restore full state (functions, snippets, pgsodium key)
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+
+          if [ -f ./supabase-state.tar.gz ]; then
+            echo "✅ State archive found — restoring edge functions, snippets, DB dump, pgsodium key..."
+            tar xzf ./supabase-state.tar.gz -C . 2>/dev/null || echo "⚠️  Failed to extract state archive"
+            # Inject the pgsodium root key into the db-config named volume BEFORE the
+            # DB boots, so the same encryption key is used and Vault data stays decryptable.
+            if [ -f ./pgsodium_root.key ]; then
+              echo "  🔑 Injecting pgsodium root key into db-config volume..."
+              DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1)
+              if [ -z "$DB_VOL" ]; then
+                DB_VOL="supabase_db-config"
+                docker volume create "$DB_VOL" >/dev/null 2>&1 || true
+              fi
+              if docker run --rm -v "$DB_VOL":/etc/postgresql-custom \
+                -v "$PWD/pgsodium_root.key:/tmp/pgsodium_root.key:ro" \
+                supabase/postgres:17.6.1.136 sh -c "cp /tmp/pgsodium_root.key /etc/postgresql-custom/pgsodium_root.key && chmod 644 /etc/postgresql-custom/pgsodium_root.key"; then
+                echo "  ✅ pgsodium root key injected into $DB_VOL"
+              else
+                echo "  ⚠️  pgsodium key injection failed — Vault data may not decrypt this run"
+              fi
+              rm -f ./pgsodium_root.key
+            else
+              echo "  ℹ️  No pgsodium key in archive (fresh encryption key will be generated)"
+            fi
+            echo "  📁 functions: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
+            echo "  📝 snippets:  $(ls volumes/snippets 2>/dev/null | tr '\n' ' ')"
+            if [ -f ./backup.dump ]; then
+              echo "  🗄️  DB dump: $(du -h ./backup.dump | cut -f1) — will be restored by restore_db()"
+            else
+              echo "  🗄️  DB dump: absent (fresh database)"
+            fi
+          else
+            echo "ℹ️  No state archive — fresh start"
+          fi
+
+          # Ensure edge functions + snippets exist BEFORE containers start.
+          # (edge-runtime boots with --main-service /home/deno/functions/main,
+          # so 'main' must exist at compose-up time or the service errors out.)
+          mkdir -p volumes/functions/main volumes/functions/sample volumes/snippets
+          if [ ! -f volumes/functions/main/index.ts ]; then
+            printf '%s\n' 'Deno.serve((req) => new Response("Hello from main", { headers: { "Content-Type": "text/plain" } }));' > volumes/functions/main/index.ts
+          fi
+          if [ ! -f volumes/functions/sample/index.ts ]; then
+            printf '%s\n' \
+              'Deno.serve((req) => {' \
+              '  const name = new URL(req.url).searchParams.get("name") ?? "world";' \
+              '  return new Response(JSON.stringify({ greeting: `hello ${name}` }), {' \
+              '    headers: { "Content-Type": "application/json" },' \
+              '  });' \
+              '});' > volumes/functions/sample/index.ts
+          fi
+          if [ ! -f volumes/snippets/seed_sample.sql ]; then
+            echo "-- persistence test snippet" > volumes/snippets/seed_sample.sql
+          fi
+          echo "  📁 edge functions ready: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
 
       # ── Start containers + restore DB + tunnel (all in parallel) ────────
       - name: ⚡ Start containers + restore DB + tunnel
@@ -442,6 +503,11 @@ jobs:
               -c "INSERT INTO public.products (name, category, price, in_stock) VALUES ('Supabase Hoodie', 'apparel', 49.99, true), ('Supabase Mug', 'drinkware', 19.99, true), ('Supabase Sticker Pack', 'swag', 9.99, false), ('Postgres Poster', 'wall art', 14.99, true);" \
               -c "CREATE TABLE IF NOT EXISTS public.seed_log (id SERIAL PRIMARY KEY, seed_id UUID NOT NULL, seeded_at TIMESTAMPTZ NOT NULL DEFAULT now(), note TEXT);" \
               -c "INSERT INTO public.seed_log (seed_id, note) VALUES ('${SEED_ID}', 'persistence test seed');"
+
+            # Vault: store an encrypted secret (survives restarts only if the pgsodium root key is restored too)
+            if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.secrets')" 2>/dev/null | grep -q "secrets"; then
+              docker compose exec -T db psql -U postgres -c "INSERT INTO vault.secrets (name, secret, description) VALUES ('persist_test', 'persist-me', 'restart persistence test');" 2>/dev/null || echo "  (vault insert failed)"
+            fi
           fi
 
           echo ""
@@ -460,6 +526,16 @@ jobs:
           docker compose exec -T db psql -U postgres -c "SELECT id, seed_id, seeded_at, note FROM public.seed_log ORDER BY id;" 2>/dev/null || echo "  (seed_log table missing)"
           echo "  📦 sample products:"
           docker compose exec -T db psql -U postgres -c "SELECT id, name, price, in_stock FROM public.products ORDER BY id;" 2>/dev/null || echo "  (products table missing)"
+          echo "  📁 edge functions:"
+          ls volumes/functions 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+          echo "  📝 studio snippets:"
+          ls volumes/snippets 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+          echo "  🔑 vault secret (decryptable only if the pgsodium root key persisted):"
+          if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.decrypted_secrets')" 2>/dev/null | grep -q "decrypted_secrets"; then
+            docker compose exec -T db psql -U postgres -c "SELECT name, decrypted_secret FROM vault.decrypted_secrets WHERE name='persist_test';" 2>/dev/null || echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
+          else
+            echo "    (vault schema not present)"
+          fi
           echo "=============================================================="
 
       # ── Save Docker images to cache (for next run) ─────────────────────
@@ -532,34 +608,49 @@ jobs:
 
           echo "Time's up! Starting graceful shutdown..."
 
-      # ── Backup database ─────────────────────────────────────────────────
-      # BUGFIX: Don't delete the old backup before creating a new one.
+      # ── Backup full state (DB + functions + snippets + pgsodium key) ────
+      # BUGFIX: Don't delete the old archive before creating a new one.
       # If the DB container goes down before backup (race on cancel),
-      # the old backup was being deleted with nothing to replace it → data loss.
-      - name: 💾 Backup database before shutdown
+      # the old archive was being deleted with nothing to replace it → data loss.
+      - name: 💾 Backup full state before shutdown
         if: always()
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          
-          # First check if the database container is actually running
+
+          # 1. Dump the database (if running)
           if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
             echo "Creating database backup..."
-            # Create new backup in temp file so old one survives if this fails
             docker compose exec -T db pg_dump -U postgres -F c -f /tmp/backup.dump.new postgres && \
             docker compose cp db:/tmp/backup.dump.new ./backup.dump.new && \
-            mv ./backup.dump.new ./backup.dump
-            if [ -f ./backup.dump ] && [ -s ./backup.dump ]; then
-              SIZE=$(du -h ./backup.dump | cut -f1)
-              echo "Database backed up ($SIZE)"
-            else
-              echo "pg_dump failed -- no backup created"
-            fi
+            mv ./backup.dump.new ./backup.dump || echo "⚠️  pg_dump failed — archiving without a fresh DB dump"
           else
-            if [ -f ./backup.dump ]; then
-              echo "Database not running -- preserving previous backup"
-            else
-              echo "Database container not running -- no prior backup to preserve"
-            fi
+            echo "Database not running — skipping DB dump"
+          fi
+
+          # 2. Save the pgsodium root key (read straight from the db-config volume)
+          DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1)
+          if [ -n "$DB_VOL" ] && \
+            docker run --rm -v "$DB_VOL":/etc/postgresql-custom supabase/postgres:17.6.1.136 \
+              sh -c "cat /etc/postgresql-custom/pgsodium_root.key" > ./pgsodium_root.key 2>/dev/null && \
+            [ -s ./pgsodium_root.key ]; then
+            echo "pgsodium root key saved ($(wc -c < ./pgsodium_root.key) bytes)"
+          else
+            rm -f ./pgsodium_root.key
+            echo "No pgsodium key found in db-config volume"
+          fi
+
+          # 3. Pack the full state archive (tolerates missing pieces)
+          ARCHIVE_FILES="volumes/functions volumes/snippets"
+          [ -f ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
+          [ -f ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
+          rm -f ./supabase-state.tar.gz.new
+          if tar czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>/dev/null && mv ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
+            rm -f ./pgsodium_root.key
+            SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)
+            echo "✅ Full state archive saved ($SIZE): $ARCHIVE_FILES"
+          else
+            rm -f ./pgsodium_root.key
+            echo "⚠️  State archive creation failed — previous archive preserved (if any)"
           fi
 
       # ── Stop services ───────────────────────────────────────────────────
@@ -570,9 +661,9 @@ jobs:
           docker compose down 2>/dev/null || true
           echo "All services stopped"
 
-      # ── Save database to cache ──────────────────────────────────────────
+      # ── Save full state archive to cache ────────────────────────────────
       # Uses a unique key per run (run_id) so cache is always updated
-      - name: 💿 Save database to GitHub Actions cache
+      - name: 💿 Save full state to GitHub Actions cache
         if: always()
         uses: actions/cache/save@v4
         with:
