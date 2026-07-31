@@ -508,10 +508,12 @@ jobs:
           # Vault: ensure a demo encrypted secret exists (idempotent — runs on fresh
           # AND restored DBs). Stays decryptable across restarts only if the pgsodium
           # root key is restored into the db-config volume before the DB boots.
+          # NOTE: must use vault.create_secret() — the vault.secrets table grants
+          # postgres SELECT/DELETE but NOT INSERT (extension-managed table).
           if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.secrets')" 2>/dev/null | grep -q "secrets"; then
             docker compose exec -T db psql -U postgres -c \
-              "INSERT INTO vault.secrets (name, secret, description) SELECT 'persist_test', 'persist-me', 'restart persistence test' WHERE NOT EXISTS (SELECT 1 FROM vault.secrets WHERE name = 'persist_test');" 2>/dev/null \
-              || echo "  (vault insert failed)"
+              "SELECT vault.create_secret('persist-me', 'persist_test', 'restart persistence test') WHERE NOT EXISTS (SELECT 1 FROM vault.secrets WHERE name = 'persist_test');" 2>/dev/null \
+              || echo "  (vault create_secret failed)"
           fi
 
           echo ""
