@@ -377,6 +377,59 @@ jobs:
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
 
+      # ── Seed demo data + verify persistence ────────────────────────────
+      # NOTE: Runs on EVERY deploy. Creates demo tables + seed rows ONLY
+      # when they're missing (fresh DB, or restored backup without them).
+      # Always prints a verification report including the seed_log marker:
+      # compare the seed_id across a kill → restart cycle to confirm data
+      # survived (backup → cache → restore).
+      - name: 🌱 Seed demo data + verify persistence
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+
+          # Wait until Postgres is accepting connections
+          PG_READY=0
+          for i in $(seq 1 60); do
+            if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+              PG_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$PG_READY" -ne 1 ]; then
+            echo "⚠️  Timed out waiting for Postgres to become ready — continuing anyway"
+          fi
+
+          echo "=============================================================="
+          if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('public.products')" 2>/dev/null | grep -q "public.products"; then
+            echo "♻️  'products' table found (restored from backup) — skipping seed."
+          else
+            SEED_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "seed-$(date +%s)-$$")
+            echo "🌱 FRESH database — creating tables and seeding data (seed_id=${SEED_ID})"
+            docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 \
+              -c "CREATE TABLE IF NOT EXISTS public.products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price NUMERIC(10,2) NOT NULL, in_stock BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now());" \
+              -c "INSERT INTO public.products (name, category, price, in_stock) VALUES ('Supabase Hoodie', 'apparel', 49.99, true), ('Supabase Mug', 'drinkware', 19.99, true), ('Supabase Sticker Pack', 'swag', 9.99, false), ('Postgres Poster', 'wall art', 14.99, true);" \
+              -c "CREATE TABLE IF NOT EXISTS public.seed_log (id SERIAL PRIMARY KEY, seed_id UUID NOT NULL, seeded_at TIMESTAMPTZ NOT NULL DEFAULT now(), note TEXT);" \
+              -c "INSERT INTO public.seed_log (seed_id, note) VALUES ('${SEED_ID}', 'persistence test seed');"
+          fi
+
+          echo ""
+          echo "=========== PERSISTENCE VERIFICATION REPORT ==========="
+          for TBL in products seed_log; do
+            if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('public.${TBL}')" 2>/dev/null | grep -q "public.${TBL}"; then
+              ROWS=$(docker compose exec -T db psql -U postgres -t -A -c "SELECT COUNT(*) FROM public.${TBL}" 2>/dev/null || echo "?")
+              echo "  ✅ table public.${TBL}: EXISTS (${ROWS} rows)"
+            else
+              echo "  ❌ table public.${TBL}: MISSING"
+            fi
+          done
+          echo ""
+          echo "  🔖 seed_log marker (same seed_id across restarts = data persisted):"
+          docker compose exec -T db psql -U postgres -c "SELECT id, seed_id, seeded_at, note FROM public.seed_log ORDER BY id;" 2>/dev/null || echo "  (seed_log table missing)"
+          echo "  📦 sample products:"
+          docker compose exec -T db psql -U postgres -c "SELECT id, name, price, in_stock FROM public.products ORDER BY id;" 2>/dev/null || echo "  (products table missing)"
+          echo "=============================================================="
+
       # ── Save Docker images to cache (for next run) ─────────────────────
       - name: 💿 Save Docker images to cache
         if: steps.cache-docker.outputs.cache-hit != 'true'
