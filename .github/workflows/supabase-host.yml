@@ -287,11 +287,47 @@ jobs:
           # Ensure the 'main' edge function exists BEFORE containers start.
           # (edge-runtime boots with --main-service /home/deno/functions/main,
           # so 'main' must exist at compose-up time or the service errors out.)
-          # Everything else (functions, snippets) is restored from the state archive.
+          #
+          # ⚠️ 'main' MUST be the dispatcher (official Supabase pattern): the
+          # edge-runtime hands EVERY request to 'main', which then loads
+          # /home/deno/functions/<name> per request via EdgeRuntime.userWorkers.
+          # A naive "Hello from main" fallback silently swallows every other
+          # function (logs, sample, ...) — exactly the bug we hit with /api/logs.
+          # We ALWAYS overwrite main after the state-archive restore so an older
+          # archived "Hello from main" can never shadow the router again.
           mkdir -p volumes/functions/main volumes/snippets
-          if [ ! -f volumes/functions/main/index.ts ]; then
-            printf '%s\n' 'Deno.serve((req) => new Response("Hello from main", { headers: { "Content-Type": "text/plain" } }));' > volumes/functions/main/index.ts
-          fi
+          cat > volumes/functions/main/index.ts <<'EOF'
+          // Dispatcher: routes /<function_name>/* to /home/deno/functions/<function_name>
+          // (official Supabase self-hosted pattern — functions load from disk per request)
+          Deno.serve(async (req) => {
+            const url = new URL(req.url);
+            const name = url.pathname.split('/')[1] || '';
+            if (!name) {
+              // Edge-runtime root — report alive (used by /api/logs/health)
+              return new Response(JSON.stringify({ ok: true, service: 'edge-runtime' }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+            const servicePath = `/home/deno/functions/${name}`;
+            try {
+              const worker = await EdgeRuntime.userWorkers.create({
+                servicePath,
+                memoryLimitMb: 150,
+                workerTimeoutMs: 60 * 1000,
+                noModuleCache: false,
+                importMapPath: null,
+                envVars: Object.entries(Deno.env.toObject()),
+              });
+              return await worker.fetch(req);
+            } catch (e) {
+              return new Response(JSON.stringify({ msg: String(e) }), {
+                status: 500,
+                headers: { 'content-type': 'application/json' },
+              });
+            }
+          });
+          EOF
           echo "  📁 edge functions ready: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
 
       # ── Install in-session cache helper (5-min snapshot uploads) ─────────
