@@ -250,21 +250,30 @@ async function handleSources() {
 }
 
 async function handleHealth() {
-  const checks: Array<{ service: string; url: string }> = [
+  // Realtime's tenant health endpoint requires the anon key as a Bearer token
+  // (same as the healthcheck in docker-compose.yml), so pass it along.
+  const anonKey = Deno.env.get('SUPABASE_ANON_KEY') ?? '';
+  const checks: Array<{ service: string; url: string; headers?: Record<string, string> }> = [
     { service: 'studio', url: 'http://studio:3000/api/platform/profile' },
-    { service: 'kong', url: 'http://kong:8000/' },
+    // Kong's proxy routes all require auth — probe the admin API /status instead,
+    // which is unauthenticated on the docker network and 200 when the gateway is up.
+    { service: 'kong', url: 'http://kong:8001/status' },
     { service: 'auth', url: 'http://auth:9999/health' },
     { service: 'rest', url: 'http://rest:3000/' },
-    { service: 'realtime', url: 'http://realtime-dev.supabase-realtime:4000/api/tenants/realtime-dev/health' },
+    {
+      service: 'realtime',
+      url: 'http://realtime-dev.supabase-realtime:4000/api/tenants/realtime-dev/health',
+      headers: { authorization: `Bearer ${anonKey}` },
+    },
     { service: 'meta', url: 'http://meta:8080/health' },
     { service: 'functions', url: 'http://functions:9000/' },
     { service: 'analytics', url: 'http://analytics:4000/health' },
     { service: 'vector', url: 'http://vector:9001/health' },
   ];
   const results: Record<string, unknown> = {};
-  await Promise.all(checks.map(async ({ service, url }) => {
+  await Promise.all(checks.map(async ({ service, url, headers }) => {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(3000) });
       results[service] = { ok: res.ok, status: res.status };
     } catch (e) {
       results[service] = { ok: false, error: String((e as Error).message ?? e) };
