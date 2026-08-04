@@ -15,8 +15,8 @@
 │                      │     │                      │     │  └── Studio      │
 └──────────────────────┘     └──────────────────────┘     └──────────────────┘
          ↕                                                        ↕
-  Permanent domain                                     State snapshots every 5 min
-  (never changes)                                      persist between runs
+  Permanent domain                                     State backup at shutdown
+  (never changes)                                      persists between runs
 ```
 
 ## ✨ Features
@@ -30,7 +30,7 @@
 | **Supabase Studio** | ✅ Dashboard UI (port 8000) |
 | **Edge Functions** | ✅ Deno-based edge functions |
 | **Permanent URL** | ✅ Cloudflare Tunnel (static domain) |
-| **Data persistence** | ✅ Auto-snapshot every 5 min → restored on next run |
+| **Data persistence** | ✅ Full state backed up at shutdown → restored next run |
 | **Object Storage** | ❌ Not included |
 
 ## ⏱️ How It Works
@@ -40,7 +40,7 @@
 3. **Starts all Supabase services** via Docker Compose (Postgres, Kong, Auth, PostgREST, Realtime, Studio, Edge Functions, Supavisor, Logflare, Vector)
 4. **Connects Cloudflare Tunnel** — your permanent URL goes live
 5. **Runs for ~5h30m** — access Studio, API, Auth, Realtime (maximizes the full 6-hour GitHub limit)
-6. **Auto-snapshot every 5 minutes** — the full state (DB + edge functions + snippets + Vault key) is written to the GitHub cache continuously, so a cancelled/restarted run loses at most ~5 minutes of work
+6. **Snapshot every 5 minutes (on disk)** — the full state (DB + edge functions + snippets + Vault key) is refreshed continuously and **persisted to the GitHub cache at shutdown** (GitHub no longer exposes cache credentials to `run:` steps, so mid-session cache uploads aren't possible). A clean handoff between scheduled runs loses nothing; a hard-cancelled run falls back to the previous run's backup
 7. **Graceful shutdown** — final backup, then repeat
 8. **Repeat** — next run picks up where you left off
 
@@ -331,8 +331,8 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 ### Cache limitations
 
 - GitHub Actions cache has **10GB limit** per repo
-- The state is snapshotted **every 5 minutes** during a session, so a cancelled run loses at most ~5 minutes of work
-- Stale snapshots are pruned automatically (the newest 3 are kept) to stay under the cache limit
+- The state is snapshotted every 5 minutes **on disk** and saved to the cache **at session end** — persistence relies on the end-of-run `actions/cache` save (GitHub doesn't expose cache-service env vars to `run:` steps, so per-snapshot uploads aren't possible)
+- Old state-cache entries are pruned automatically (the newest 3 are kept) to stay under the cache limit
 - The Docker image cache is stored **gzip-compressed** (`docker save | gzip`) and the DB dump uses **maximum compression** (`pg_dump -Z 9`), so both stay small within the 10GB budget
 - Analytics/log data lives in the separate `_supabase` database and is intentionally **not backed up** (it's disposable and would bloat every snapshot)
 - Cache is **evicted** after 7 days of inactivity
@@ -346,7 +346,7 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 |---|---|
 | Tunnel not connecting | Verify `CF_TUNNEL_TOKEN` is correct in GitHub Secrets |
 | Can't access URL | Check Cloudflare Tunnel dashboard → tunnel status |
-| Database not persisting | Check the "🔍 Verify restored state" step in the run log — snapshots are cached every 5 min |
+| Database not persisting | Check the "💿 Save final state to GitHub Actions cache" step in the run log — state is saved at session shutdown |
 | Workflow not running on schedule | GitHub may delay schedule events during high load |
 | "No space left on device" | GitHub runner has ~14GB free — clean up old Docker images |
 | Port already in use | Runner resets between runs, should be fresh |

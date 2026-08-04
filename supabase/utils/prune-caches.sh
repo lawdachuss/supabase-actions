@@ -2,11 +2,12 @@
 # =============================================================================
 # 🧹 prune-caches.sh — prune stale state-snapshot GitHub cache entries
 # =============================================================================
-# The keepalive loop writes a new snapshot to the Actions cache every 5 minutes
-# (keys 'supabase-db-live-<run_id>-<slot>'). Without pruning those accumulate
-# and can hit GitHub's 10GB per-repo cache cap, after which saves start failing.
+# Each run saves its state archive to the Actions cache at shutdown
+# (keys 'supabase-db-live-<run_id>-final'; GitHub doesn't expose cache-service
+# env vars to run: steps, so mid-session uploads aren't possible). Without
+# pruning those accumulate and can hit GitHub's 10GB per-repo cache cap.
 # This keeps only the newest KEEP entries (default 3) so the cache stays small
-# while the restore step always has the freshest snapshot available.
+# while the restore step always has the freshest state available.
 #
 # Requires:
 #   GITHUB_TOKEN      - must have 'actions: write' (best-effort if not granted)

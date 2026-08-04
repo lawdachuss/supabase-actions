@@ -4,8 +4,11 @@
 # What this does:
 # 1. Starts ALL Supabase services (full stack with Storage, Realtime, etc.)
 # 2. Restores your database from GitHub Actions cache (so data persists)
-# 2b. Auto-snapshots the FULL state every 5 minutes during the session, so a
-#     cancelled or restarted run loses at most ~5 minutes of work
+# 2b. Snapshots the FULL state every 5 minutes during the session (on-disk),
+#     persisted to the Actions cache at shutdown. NOTE: GitHub no longer
+#     exposes the cache-service env vars to run: steps, so per-snapshot cache
+#     uploads from the keepalive loop are impossible — persistence relies on
+#     the end-of-run actions/cache save (which runs from the action runtime).
 # 3. Exposes everything via Cloudflare Tunnel
 # 4. Runs for ~5h30m per session (maximizing the full 6-hour GitHub Actions limit)
 # 5. Scheduled every 6 hours — 20+ min gap between runs for clean handoff
@@ -67,8 +70,8 @@ jobs:
           key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
       # Full-state archive cache (separate key with fallback for cross-run persistence)
-      # Restores the NEWEST snapshot ('supabase-db-live-*', written every 5 min by
-      # the keepalive loop), falling back to legacy 'supabase-db-*' keys.
+      # Restores the most recent 'supabase-db-live-*' entry (written by the
+      # end-of-run cache save), falling back to legacy 'supabase-db-*' keys.
       - name: 💾 Restore state cache
         id: cache-db
         uses: actions/cache/restore@v4
@@ -335,48 +338,17 @@ jobs:
           EOF
           echo "  📁 edge functions ready: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
 
-      # ── Install in-session cache helper (5-min snapshot uploads) ─────────
-      # Lets the keepalive loop write snapshots straight into the Actions cache
-      # every 5 minutes. If this fails, the run degrades gracefully to the
-      # end-of-run backup (no crash).
-      - name: 🔧 Install cache helper (5-min snapshots)
-        run: |
-          mkdir -p /tmp/cachetool
-          cd /tmp/cachetool
-          npm init -y >/dev/null 2>&1 || true
-          # Pinned version for reproducibility (handles current runner env vars).
-          if npm install @actions/cache@3.3.0 --no-audit --no-fund --silent >/dev/null 2>&1; then
-            echo "✅ @actions/cache@3.3.0 installed"
-          else
-            echo "⚠️  @actions/cache install failed — falling back to end-of-run backup only"
-          fi
-          # Diagnostics: if these env vars are absent, 5-min cache saves cannot
-          # work and the run silently degrades to end-of-run-only persistence.
-          echo "  cache env: CACHE_URL=${ACTIONS_CACHE_URL:+set} RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set} RESULTS_URL=${ACTIONS_RESULTS_URL:+set} RESULTS_TOKEN=${ACTIONS_RESULTS_TOKEN:+set}"
-          cat > save.js <<'EOF'
-          const key = process.argv[2];
-          const path = process.argv[3];
-          try {
-            const { saveCache } = require('@actions/cache');
-            saveCache([path], key).then(
-              (id) => console.log(`[cache] saved ${key} (id=${id})`),
-              (e) => console.log(`[cache] save skipped for ${key}: ${e.message}`)
-            );
-          } catch (e) {
-            console.log(`[cache] save failed for ${key}: ${e.message}`);
-          }
-          EOF
-          if node -e "require('/tmp/cachetool/node_modules/@actions/cache')" >/dev/null 2>&1; then
-            echo "✅ cache helper ready"
-          else
-            echo "⚠️  cache helper NOT ready — snapshots will only be saved at end of run"
-          fi
+      # NOTE: no in-session cache helper. GitHub no longer provides the
+      # cache-service env vars (ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN) to
+      # run: steps, so snapshots can only be persisted via actions/cache steps
+      # (end-of-run save below). The keepalive loop writes snapshots to disk so
+      # that save always has the freshest archive.
 
-      # ── Prune stale snapshot entries (best-effort, keeps newest 3) ───────
-      # Keeps the Actions cache small so 5-min uploads never hit the 10GB repo
-      # cap. Also re-run hourly from inside the keepalive loop. Needs
-      # 'actions: write'; if it isn't granted, uploads still work — old entries
-      # just age out via GitHub's LRU eviction instead.
+      # ── Prune stale cache entries (best-effort, keeps newest 3) ──────────
+      # Keeps the Actions cache small (end-of-run state archives + docker image
+      # tar) so it never hits the 10GB repo cap. Also re-run hourly from inside
+      # the keepalive loop. Needs 'actions: write'; if it isn't granted, old
+      # entries just age out via GitHub's LRU eviction instead.
       - name: 🧹 Prune stale snapshot cache entries
         env:
           GH_TOKEN: ${{ github.token }}
@@ -643,11 +615,11 @@ jobs:
           path: /tmp/docker-images.tar.gz
           key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
-      # ── Run Supabase (keep alive + auto-snapshot every 5 minutes) ────────
+      # ── Run Supabase (keep alive + on-disk snapshots every 5 minutes) ────
       # Every 5 minutes the FULL state (DB dump + pgsodium key + functions +
-      # snippets) is written to the Actions cache under a fresh key. If this run
-      # is cancelled or restarted at ANY point, the next run restores the most
-      # recent snapshot — at most ~5 minutes of work is lost.
+      # snippets) is refreshed on disk; it's persisted to the Actions cache by
+      # the end-of-run cache save below (GitHub doesn't expose cache-service
+      # env vars to run: steps, so mid-session uploads are not possible).
       - name: ⏱️  Supabase is LIVE (auto-snapshot every 5 min)
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
@@ -669,7 +641,7 @@ jobs:
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "|  Domain:  https://$DOMAIN                                     |"
           fi
-          echo "|  Snapshots: every 5 minutes → cached for next run           |"
+          echo "|  Snapshots: every 5 min → saved at shutdown                 |"
           echo "|                                                             |"
           echo "|  Monitor: https://github.com/${{ github.repository }}/actions  |"
           echo "|  Badge:   https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
@@ -681,7 +653,7 @@ jobs:
           echo "+=============================================================+"
           echo ""
 
-          # ── Keepalive loop + health checks + 5-min snapshot autosave ──
+          # ── Keepalive loop + health checks + 5-min on-disk snapshots ──
           # run_attempt disambiguates 'Re-run' (GitHub reuses run_id but bumps
           # run_attempt), so re-run sessions never collide with existing cache keys.
           RUN_ID="${{ github.run_id }}"
@@ -693,22 +665,21 @@ jobs:
           while [ $(date +%s) -lt $END_TIME ]; do
             NOW=$(date +%s)
 
-            # Full-state snapshot every 5 minutes (DB dump + key + functions + snippets)
+            # Full-state snapshot every 5 minutes (DB dump + key + functions + snippets),
+            # kept on disk so the end-of-run cache save (if: always()) always has the
+            # freshest archive. GitHub no longer allows run-step cache writes.
             if [ "$NOW" -ge "$NEXT_SNAP" ]; then
               echo ""
-              echo "📸 [$(date '+%H:%M:%S')] Snapshot #$SLOT (every-5-min autosave)..."
+              echo "📸 [$(date '+%H:%M:%S')] Snapshot #$SLOT (every-5-min on-disk)..."
               bash utils/snapshot-state.sh || true
-              if [ -s ./supabase-state.tar.gz ] && [ -d /tmp/cachetool/node_modules/@actions/cache ]; then
-                ARCHIVE="$(pwd)/supabase-state.tar.gz"
-                KEY="supabase-db-live-${RUN_ID}-${RUN_ATTEMPT}-${SLOT}"
-                ( cd /tmp/cachetool && node save.js "$KEY" "$ARCHIVE" ) || true
+              if [ -s ./supabase-state.tar.gz ]; then
                 SNAPSHOTS=$((SNAPSHOTS + 1))
               else
-                echo "  ⚠️  cache helper or archive missing — snapshot kept on disk only"
+                echo "  ⚠️  archive not created — will retry next tick"
               fi
               NEXT_SNAP=$((NOW + 300))
               SLOT=$((SLOT + 1))
-              # Prune old snapshots from the cache once an hour (keeps it small)
+              # Prune old cache entries once an hour (keeps the 10GB cap in check)
               if [ $(( SLOT % 12 )) -eq 0 ]; then
                 bash utils/prune-caches.sh >/dev/null 2>&1 || true
               fi
@@ -729,7 +700,7 @@ jobs:
             if [ $(( TICK % 6 )) -eq 0 ]; then printf "."; fi
           done
           echo ""
-          echo "Session complete — $SNAPSHOTS snapshots cached. Starting graceful shutdown..."
+          echo "Session complete — $SNAPSHOTS snapshots written to disk (saved to cache at shutdown). Starting graceful shutdown..."
 
       # ── Final state backup before shutdown ──────────────────────────────
       # Same script the keepalive loop uses every 5 min. Runs even if an
