@@ -10,7 +10,17 @@ Thumbs.db
 /supabase/volumes/db/data/
 /supabase/volumes/storage/
 /supabase/volumes/snippets/
-/supabase/volumes/functions/
+/supabase/volumes/functions/*
+# The logs edge function ships with the repo (powers /api/logs)
+!/supabase/volumes/functions/logs/
+!/supabase/volumes/functions/logs/*
+
+# State archives (database dumps — contain data, never commit)
+/supabase/backup.dump
+/supabase/backup.dump.new
+/supabase/pgsodium_root.key
+/supabase/supabase-state.tar.gz
+/supabase/supabase-state.tar.gz.new
 
 # Cloned/test directories (old troubleshooting copies)
 /tmp-supabase/

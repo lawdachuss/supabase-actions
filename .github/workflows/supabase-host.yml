@@ -4,9 +4,11 @@
 # What this does:
 # 1. Starts ALL Supabase services (full stack with Storage, Realtime, etc.)
 # 2. Restores your database from GitHub Actions cache (so data persists)
+# 2b. Auto-snapshots the FULL state every 5 minutes during the session, so a
+#     cancelled or restarted run loses at most ~5 minutes of work
 # 3. Exposes everything via Cloudflare Tunnel
-# 4. Runs for ~5h45m per session (maximizing the full 6-hour GitHub Actions limit)
-# 5. Scheduled every 6 hours — 20 min gap between runs for clean handoff
+# 4. Runs for ~5h30m per session (maximizing the full 6-hour GitHub Actions limit)
+# 5. Scheduled every 6 hours — 20+ min gap between runs for clean handoff
 #
 # Required GitHub Secrets:
 #   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
@@ -42,6 +44,9 @@ jobs:
   supabase:
     runs-on: ubuntu-latest
     timeout-minutes: 355                  # 5h55m — 5 min buffer under 360 min hard limit
+    permissions:
+      contents: read                      # checkout
+      actions: write                      # prune stale state-snapshot cache entries
 
     steps:
       # ── Checkout ──────────────────────────────────────────────────────
@@ -51,21 +56,27 @@ jobs:
       # ── Restore caches ────────────────────────────────────────────────
       # NOTE: No compose YAML changes below this line — that would change
       # hashFiles() cache key, causing Docker image cache to miss every run.
+      # Docker images are cached gzip-compressed (docker save | gzip) so the
+      # cache stays small within GitHub's 10GB per-repo limit. docker load
+      # auto-detects gzip on the restore side.
       - name: 🐳 Restore Docker image cache
         id: cache-docker
         uses: actions/cache/restore@v4
         with:
-          path: /tmp/docker-images.tar
+          path: /tmp/docker-images.tar.gz
           key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
       # Full-state archive cache (separate key with fallback for cross-run persistence)
+      # Restores the NEWEST snapshot ('supabase-db-live-*', written every 5 min by
+      # the keepalive loop), falling back to legacy 'supabase-db-*' keys.
       - name: 💾 Restore state cache
         id: cache-db
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.BACKUP_FILE }}
-          key: supabase-db-${{ github.run_id }}
+          key: supabase-db-live-${{ github.run_id }}
           restore-keys: |
+            supabase-db-live-
             supabase-db-
           fail-on-cache-miss: false
 
@@ -88,7 +99,7 @@ jobs:
           mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs} &
           
           # Start docker compose pull early (runs in parallel with setup)
-          if [ ! -f /tmp/docker-images.tar ]; then
+          if [ ! -f /tmp/docker-images.tar.gz ]; then
             echo "⏳ Cache file not found — pulling Docker images in background..."
             docker compose pull 2>&1 | tail -3 &
           else
@@ -215,12 +226,21 @@ jobs:
       # ── Load cached Docker images ─────────────────────────────────────
       - name: 📦 Load Docker images from cache
         run: |
-          CACHE_FILE=/tmp/docker-images.tar
+          CACHE_FILE=/tmp/docker-images.tar.gz
           if [ -f "$CACHE_FILE" ] && [ -s "$CACHE_FILE" ]; then
             SIZE=$(du -h "$CACHE_FILE" | cut -f1)
-            echo "✅ Docker image cache HIT ($SIZE) — loading..."
-            docker load < "$CACHE_FILE" 2>&1 | tail -3
-            echo "✅ Docker images loaded from cache"
+            echo "✅ Docker image cache HIT ($SIZE gzip) — loading..."
+            # docker load auto-detects gzip-compressed archives
+            if docker load < "$CACHE_FILE" 2>&1 | tail -3; then
+              echo "✅ Docker images loaded from cache"
+            else
+              # Corrupt/truncated cache entry (e.g. interrupted upload) — drop it
+              # and pull fresh instead of failing the whole run at startup.
+              echo "⚠️  Cache entry corrupt or truncated — removing it and pulling fresh images..."
+              rm -f "$CACHE_FILE"
+              cd ${{ env.SUPABASE_DIR }}
+              docker compose pull 2>&1 | tail -3 || true
+            fi
           else
             echo "⏭️  Docker image cache MISS — images will be pulled fresh"
           fi
@@ -264,26 +284,64 @@ jobs:
             echo "ℹ️  No state archive — fresh start"
           fi
 
-          # Ensure edge functions + snippets exist BEFORE containers start.
+          # Ensure the 'main' edge function exists BEFORE containers start.
           # (edge-runtime boots with --main-service /home/deno/functions/main,
           # so 'main' must exist at compose-up time or the service errors out.)
-          mkdir -p volumes/functions/main volumes/functions/sample volumes/snippets
+          # Everything else (functions, snippets) is restored from the state archive.
+          mkdir -p volumes/functions/main volumes/snippets
           if [ ! -f volumes/functions/main/index.ts ]; then
             printf '%s\n' 'Deno.serve((req) => new Response("Hello from main", { headers: { "Content-Type": "text/plain" } }));' > volumes/functions/main/index.ts
           fi
-          if [ ! -f volumes/functions/sample/index.ts ]; then
-            printf '%s\n' \
-              'Deno.serve((req) => {' \
-              '  const name = new URL(req.url).searchParams.get("name") ?? "world";' \
-              '  return new Response(JSON.stringify({ greeting: `hello ${name}` }), {' \
-              '    headers: { "Content-Type": "application/json" },' \
-              '  });' \
-              '});' > volumes/functions/sample/index.ts
-          fi
-          if [ ! -f volumes/snippets/seed_sample.sql ]; then
-            echo "-- persistence test snippet" > volumes/snippets/seed_sample.sql
-          fi
           echo "  📁 edge functions ready: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
+
+      # ── Install in-session cache helper (5-min snapshot uploads) ─────────
+      # Lets the keepalive loop write snapshots straight into the Actions cache
+      # every 5 minutes. If this fails, the run degrades gracefully to the
+      # end-of-run backup (no crash).
+      - name: 🔧 Install cache helper (5-min snapshots)
+        run: |
+          mkdir -p /tmp/cachetool
+          cd /tmp/cachetool
+          npm init -y >/dev/null 2>&1 || true
+          # Pinned version for reproducibility (handles current runner env vars).
+          if npm install @actions/cache@3.3.0 --no-audit --no-fund --silent >/dev/null 2>&1; then
+            echo "✅ @actions/cache@3.3.0 installed"
+          else
+            echo "⚠️  @actions/cache install failed — falling back to end-of-run backup only"
+          fi
+          # Diagnostics: if these env vars are absent, 5-min cache saves cannot
+          # work and the run silently degrades to end-of-run-only persistence.
+          echo "  cache env: CACHE_URL=${ACTIONS_CACHE_URL:+set} RUNTIME_TOKEN=${ACTIONS_RUNTIME_TOKEN:+set} RESULTS_URL=${ACTIONS_RESULTS_URL:+set} RESULTS_TOKEN=${ACTIONS_RESULTS_TOKEN:+set}"
+          cat > save.js <<'EOF'
+          const key = process.argv[2];
+          const path = process.argv[3];
+          try {
+            const { saveCache } = require('@actions/cache');
+            saveCache([path], key).then(
+              (id) => console.log(`[cache] saved ${key} (id=${id})`),
+              (e) => console.log(`[cache] save skipped for ${key}: ${e.message}`)
+            );
+          } catch (e) {
+            console.log(`[cache] save failed for ${key}: ${e.message}`);
+          }
+          EOF
+          if node -e "require('/tmp/cachetool/node_modules/@actions/cache')" >/dev/null 2>&1; then
+            echo "✅ cache helper ready"
+          else
+            echo "⚠️  cache helper NOT ready — snapshots will only be saved at end of run"
+          fi
+
+      # ── Prune stale snapshot entries (best-effort, keeps newest 3) ───────
+      # Keeps the Actions cache small so 5-min uploads never hit the 10GB repo
+      # cap. Also re-run hourly from inside the keepalive loop. Needs
+      # 'actions: write'; if it isn't granted, uploads still work — old entries
+      # just age out via GitHub's LRU eviction instead.
+      - name: 🧹 Prune stale snapshot cache entries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          bash utils/prune-caches.sh || true
 
       # ── Start containers + restore DB + tunnel (all in parallel) ────────
       - name: ⚡ Start containers + restore DB + tunnel
@@ -467,13 +525,11 @@ jobs:
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
 
-      # ── Seed demo data + verify persistence ────────────────────────────
-      # NOTE: Runs on EVERY deploy. Creates demo tables + seed rows ONLY
-      # when they're missing (fresh DB, or restored backup without them).
-      # Always prints a verification report including the seed_log marker:
-      # compare the seed_id across a kill → restart cycle to confirm data
-      # survived (backup → cache → restore).
-      - name: 🌱 Seed demo data + verify persistence
+      # ── Verify restored state (READ-ONLY) ───────────────────────────────
+      # Reports what survived the backup → cache → restore cycle so you can
+      # confirm your changes persisted. Deliberately creates nothing: tables,
+      # rows and settings you deleted stay deleted (no more auto-seed).
+      - name: 🔍 Verify restored state (read-only)
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
@@ -491,68 +547,37 @@ jobs:
           fi
 
           echo "=============================================================="
-          HAS_PRODUCTS=$(docker compose exec -T db psql -U postgres -t -A -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='products' AND table_type='BASE TABLE'" 2>/dev/null | tr -d '[:space:]')
-          echo "  [check] products table count in public schema => '${HAS_PRODUCTS:-0}'"
-          if [ "${HAS_PRODUCTS:-0}" = "1" ]; then
-            echo "♻️  'products' table found (restored from backup) — skipping seed."
+          echo "  🔖 cache hit:      ${{ steps.cache-db.outputs.cache-hit }}"
+          if [ -f ./supabase-state.tar.gz ]; then
+            echo "  🗜️  restored archive: $(du -h ./supabase-state.tar.gz | cut -f1)"
           else
-            SEED_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())")
-            echo "🌱 FRESH database — creating tables and seeding data (seed_id=${SEED_ID})"
-            docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 \
-              -c "CREATE TABLE IF NOT EXISTS public.products (id SERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT, price NUMERIC(10,2) NOT NULL, in_stock BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now());" \
-              -c "INSERT INTO public.products (name, category, price, in_stock) VALUES ('Supabase Hoodie', 'apparel', 49.99, true), ('Supabase Mug', 'drinkware', 19.99, true), ('Supabase Sticker Pack', 'swag', 9.99, false), ('Postgres Poster', 'wall art', 14.99, true);" \
-              -c "CREATE TABLE IF NOT EXISTS public.seed_log (id SERIAL PRIMARY KEY, seed_id UUID NOT NULL, seeded_at TIMESTAMPTZ NOT NULL DEFAULT now(), note TEXT);" \
-              -c "INSERT INTO public.seed_log (seed_id, note) VALUES ('${SEED_ID}', 'persistence test seed');"
+            echo "  🗜️  restored archive: none (fresh start)"
           fi
-
-          # Vault: ensure a demo encrypted secret exists (idempotent — runs on fresh
-          # AND restored DBs). Stays decryptable across restarts only if the pgsodium
-          # root key is restored into the db-config volume before the DB boots.
-          # NOTE: must use vault.create_secret() — the vault.secrets table grants
-          # postgres SELECT/DELETE but NOT INSERT (extension-managed table).
-          if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.secrets')" 2>/dev/null | grep -q "secrets"; then
-            docker compose exec -T db psql -U postgres -c \
-              "SELECT vault.create_secret('persist-me', 'persist_test', 'restart persistence test') WHERE NOT EXISTS (SELECT 1 FROM vault.secrets WHERE name = 'persist_test');" 2>/dev/null \
-              || echo "  (vault create_secret failed)"
-          fi
-
           echo ""
-          echo "=========== PERSISTENCE VERIFICATION REPORT ==========="
-          for TBL in products seed_log; do
-            TBL_COUNT=$(docker compose exec -T db psql -U postgres -t -A -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='${TBL}' AND table_type='BASE TABLE'" 2>/dev/null | tr -d '[:space:]')
-            if [ "${TBL_COUNT:-0}" = "1" ]; then
-              ROWS=$(docker compose exec -T db psql -U postgres -t -A -c "SELECT COUNT(*) FROM public.${TBL}" 2>/dev/null || echo "?")
-              echo "  ✅ table public.${TBL}: EXISTS (${ROWS} rows)"
-            else
-              echo "  ❌ table public.${TBL}: MISSING"
-            fi
-          done
-          echo ""
-          echo "  🔖 seed_log marker (same seed_id across restarts = data persisted):"
-          docker compose exec -T db psql -U postgres -c "SELECT id, seed_id, seeded_at, note FROM public.seed_log ORDER BY id;" 2>/dev/null || echo "  (seed_log table missing)"
-          echo "  📦 sample products:"
-          docker compose exec -T db psql -U postgres -c "SELECT id, name, price, in_stock FROM public.products ORDER BY id;" 2>/dev/null || echo "  (products table missing)"
+          echo "  📊 user tables (public schema):"
+          docker compose exec -T db psql -U postgres -t -A -c \
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" 2>/dev/null | tr -d '[:space:]' | sed 's/^/    /'
+          echo "  🗃️  public tables:"
+          docker compose exec -T db psql -U postgres -t -A -c \
+            "SELECT string_agg(table_name, ', ') FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" 2>/dev/null | sed 's/^/    /' || echo "    (none)"
           echo "  📁 edge functions:"
           ls volumes/functions 2>/dev/null | sed 's/^/    /' || echo "    (none)"
           echo "  📝 studio snippets:"
           ls volumes/snippets 2>/dev/null | sed 's/^/    /' || echo "    (none)"
-          echo "  🔑 vault secret (decryptable only if the pgsodium root key persisted):"
+          echo "  🔖 seed_log (from earlier sessions, if any):"
+          docker compose exec -T db psql -U postgres -c "SELECT id, seed_id, seeded_at, note FROM public.seed_log ORDER BY id;" 2>/dev/null || echo "    (no seed_log table — auto-seed removed)"
+          echo "  🔑 vault (decryptable only if the pgsodium root key persisted):"
           if docker compose exec -T db psql -U postgres -t -A -c "SELECT to_regclass('vault.decrypted_secrets')" 2>/dev/null | grep -q "decrypted_secrets"; then
-            VAULT_ROWS=$(docker compose exec -T db psql -U postgres -t -A -c "SELECT COUNT(*) FROM vault.decrypted_secrets WHERE name='persist_test';" 2>/dev/null || echo "ERR")
-            if [ "$VAULT_ROWS" = "1" ]; then
-              echo "    ✅ vault decryption OK:"
-              docker compose exec -T db psql -U postgres -c "SELECT name, decrypted_secret FROM vault.decrypted_secrets WHERE name='persist_test';" 2>/dev/null || echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
-            elif [ "$VAULT_ROWS" = "ERR" ]; then
-              echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
-            else
-              echo "    ⚠️  persist_test row missing (count='${VAULT_ROWS:-0}') — vault data not restored?"
-            fi
+            docker compose exec -T db psql -U postgres -c "SELECT name, decrypted_secret FROM vault.decrypted_secrets LIMIT 5;" 2>/dev/null || echo "    ⚠️  vault decryption FAILED (pgsodium key changed?)"
           else
             echo "    (vault schema not present)"
           fi
           echo "=============================================================="
 
       # ── Save Docker images to cache (for next run) ─────────────────────
+      # gzip -1: fast compression (this runs only on a cache MISS). Keeps the
+      # cached archive far under GitHub's 10GB per-repo cache limit. The raw vs
+      # gzip sizes are printed so the compression win is visible in the logs.
       - name: 💿 Save Docker images to cache
         if: steps.cache-docker.outputs.cache-hit != 'true'
         run: |
@@ -560,24 +585,36 @@ jobs:
           echo "💾 Docker cache MISS — saving pulled images for next run..."
           docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'supabase|kong|postgrest|timberio') \
             -o /tmp/docker-images.tar 2>&1 | tail -3
-          SIZE=$(du -h /tmp/docker-images.tar 2>/dev/null | cut -f1 || echo "unknown")
-          echo "✅ Docker images saved ($SIZE) — ready for upload"
+          if [ -s /tmp/docker-images.tar ]; then
+            RAW=$(du -h /tmp/docker-images.tar | cut -f1)
+            gzip -1 -f /tmp/docker-images.tar
+            SIZE=$(du -h /tmp/docker-images.tar.gz | cut -f1)
+            echo "✅ Docker images saved (raw: $RAW → gzip: $SIZE) — ready for upload"
+          else
+            echo "⚠️  docker save produced no output — failing so the cache upload is skipped"
+            exit 1
+          fi
 
       - name: 📤 Upload Docker images to GitHub cache
         if: steps.cache-docker.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: /tmp/docker-images.tar
+          path: /tmp/docker-images.tar.gz
           key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
 
-      # ── Run Supabase (keep alive with health checks) ────────────────────
-      - name: ⏱️  Supabase is LIVE
+      # ── Run Supabase (keep alive + auto-snapshot every 5 minutes) ────────
+      # Every 5 minutes the FULL state (DB dump + pgsodium key + functions +
+      # snippets) is written to the Actions cache under a fresh key. If this run
+      # is cancelled or restarted at ANY point, the next run restores the most
+      # recent snapshot — at most ~5 minutes of work is lost.
+      - name: ⏱️  Supabase is LIVE (auto-snapshot every 5 min)
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
-          DURATION=20400  # 5h40m — leaves ~8 min buffer for shutdown steps
+          DURATION=19800  # 5h30m — leaves buffer for 5-min snapshots + shutdown steps
           END_TIME=$(( $(date +%s) + DURATION ))
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
 
@@ -591,6 +628,7 @@ jobs:
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "|  Domain:  https://$DOMAIN                                     |"
           fi
+          echo "|  Snapshots: every 5 minutes → cached for next run           |"
           echo "|                                                             |"
           echo "|  Monitor: https://github.com/${{ github.repository }}/actions  |"
           echo "|  Badge:   https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
@@ -602,70 +640,66 @@ jobs:
           echo "+=============================================================+"
           echo ""
 
-          # Keep alive loop with health checks (tick every 10s)
+          # ── Keepalive loop + health checks + 5-min snapshot autosave ──
+          # run_attempt disambiguates 'Re-run' (GitHub reuses run_id but bumps
+          # run_attempt), so re-run sessions never collide with existing cache keys.
+          RUN_ID="${{ github.run_id }}"
+          RUN_ATTEMPT="${{ github.run_attempt }}"
+          SLOT=0
+          SNAPSHOTS=0
+          TICK=0
+          NEXT_SNAP=$(date +%s)
           while [ $(date +%s) -lt $END_TIME ]; do
-            if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
-              REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
-              echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining"
-            else
-              echo "$(date '+%H:%M:%S') -- Health check failed"
-              docker compose ps --no-color 2>/dev/null | head -10 || true
+            NOW=$(date +%s)
+
+            # Full-state snapshot every 5 minutes (DB dump + key + functions + snippets)
+            if [ "$NOW" -ge "$NEXT_SNAP" ]; then
+              echo ""
+              echo "📸 [$(date '+%H:%M:%S')] Snapshot #$SLOT (every-5-min autosave)..."
+              bash utils/snapshot-state.sh || true
+              if [ -s ./supabase-state.tar.gz ] && [ -d /tmp/cachetool/node_modules/@actions/cache ]; then
+                ARCHIVE="$(pwd)/supabase-state.tar.gz"
+                KEY="supabase-db-live-${RUN_ID}-${RUN_ATTEMPT}-${SLOT}"
+                ( cd /tmp/cachetool && node save.js "$KEY" "$ARCHIVE" ) || true
+                SNAPSHOTS=$((SNAPSHOTS + 1))
+              else
+                echo "  ⚠️  cache helper or archive missing — snapshot kept on disk only"
+              fi
+              NEXT_SNAP=$((NOW + 300))
+              SLOT=$((SLOT + 1))
+              # Prune old snapshots from the cache once an hour (keeps it small)
+              if [ $(( SLOT % 12 )) -eq 0 ]; then
+                bash utils/prune-caches.sh >/dev/null 2>&1 || true
+              fi
             fi
-            # Wait 60 seconds with a heartbeat every 10s so logs stay live
-            for tick in $(seq 1 6); do
-              if [ $(date +%s) -ge $END_TIME ]; then break; fi
-              sleep 10
-              printf "."
-            done
-            echo ""
+
+            # Health check + heartbeat every 60s (tick = 10s)
+            if [ $(( TICK % 6 )) -eq 0 ]; then
+              if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
+                REMAINING=$(( (END_TIME - NOW) / 60 ))
+                echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining | snapshots: $SNAPSHOTS"
+              else
+                echo "$(date '+%H:%M:%S') -- Health check failed"
+                docker compose ps --no-color 2>/dev/null | head -10 || true
+              fi
+            fi
+            sleep 10
+            TICK=$((TICK + 1))
+            if [ $(( TICK % 6 )) -eq 0 ]; then printf "."; fi
           done
+          echo ""
+          echo "Session complete — $SNAPSHOTS snapshots cached. Starting graceful shutdown..."
 
-          echo "Time's up! Starting graceful shutdown..."
-
-      # ── Backup full state (DB + functions + snippets + pgsodium key) ────
-      # BUGFIX: Don't delete the old archive before creating a new one.
-      # If the DB container goes down before backup (race on cancel),
-      # the old archive was being deleted with nothing to replace it → data loss.
-      - name: 💾 Backup full state before shutdown
+      # ── Final state backup before shutdown ──────────────────────────────
+      # Same script the keepalive loop uses every 5 min. Runs even if an
+      # earlier step failed (if: always()), so the cache always receives the
+      # freshest possible archive at shutdown. Crash-safe: the previous
+      # archive is never deleted before the new one is fully written.
+      - name: 💾 Final state backup before shutdown
         if: always()
         run: |
           cd ${{ env.SUPABASE_DIR }}
-
-          # 1. Dump the database (if running)
-          if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
-            echo "Creating database backup..."
-            docker compose exec -T db pg_dump -U postgres -F c -f /tmp/backup.dump.new postgres && \
-            docker compose cp db:/tmp/backup.dump.new ./backup.dump.new && \
-            mv ./backup.dump.new ./backup.dump || echo "⚠️  pg_dump failed — archiving without a fresh DB dump"
-          else
-            echo "Database not running — skipping DB dump"
-          fi
-
-          # 2. Save the pgsodium root key (read straight from the db-config volume)
-          DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1 || true)
-          if [ -n "$DB_VOL" ] && \
-            docker run --rm -v "$DB_VOL":/etc/postgresql-custom supabase/postgres:17.6.1.136 \
-              sh -c "cat /etc/postgresql-custom/pgsodium_root.key" > ./pgsodium_root.key 2>/dev/null && \
-            [ -s ./pgsodium_root.key ]; then
-            echo "pgsodium root key saved ($(wc -c < ./pgsodium_root.key) bytes)"
-          else
-            rm -f ./pgsodium_root.key
-            echo "No pgsodium key found in db-config volume"
-          fi
-
-          # 3. Pack the full state archive (tolerates missing pieces)
-          ARCHIVE_FILES="volumes/functions volumes/snippets"
-          [ -f ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
-          [ -f ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
-          rm -f ./supabase-state.tar.gz.new
-          if tar czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>/dev/null && mv ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
-            rm -f ./pgsodium_root.key
-            SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)
-            echo "✅ Full state archive saved ($SIZE): $ARCHIVE_FILES"
-          else
-            rm -f ./pgsodium_root.key
-            echo "⚠️  State archive creation failed — previous archive preserved (if any)"
-          fi
+          bash utils/snapshot-state.sh || true
 
       # ── Stop services ───────────────────────────────────────────────────
       - name: 🛑 Stop Supabase services
@@ -676,19 +710,22 @@ jobs:
           echo "All services stopped"
 
       # ── Save full state archive to cache ────────────────────────────────
-      # Uses a unique key per run (run_id) so cache is always updated
-      - name: 💿 Save full state to GitHub Actions cache
+      # Final safety-net upload. The keepalive loop already saved a snapshot
+      # every 5 minutes under 'supabase-db-live-*' keys; this one guarantees
+      # the very latest state is cached even if the loop's uploads were skipped.
+      - name: 💿 Save final state to GitHub Actions cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: ${{ env.BACKUP_FILE }}
-          key: supabase-db-${{ github.run_id }}
+          key: supabase-db-live-${{ github.run_id }}-${{ github.run_attempt }}-final
 
       # ── Summary ─────────────────────────────────────────────────────────
       - name: 📋 Log session summary
         if: always()
         env:
           TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
           echo ""
@@ -707,3 +744,8 @@ jobs:
           echo "|  Monitor: https://github.com/${{ github.repository }}/actions    |"
           echo "+=============================================================+"
           echo ""
+          # Cache usage vs GitHub's 10GB per-repo limit (best-effort report)
+          USAGE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/caches" 2>/dev/null | \
+            python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"{d.get(\"total_size_bytes\",0)/1024/1024/1024:.2f} GB across {d.get(\"total_count\",0)} cache entries (limit 10 GB)")' 2>/dev/null || echo "unknown")
+          echo "  🗜️  GitHub cache usage: $USAGE"

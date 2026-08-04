@@ -350,6 +350,37 @@ services:
     plugins:
       - name: cors
 
+  ## System Logs API — /api/logs* -> edge function 'logs' (admin only)
+  ## Serves Vector→Logflare→Postgres logs + live service health. Requires the
+  ## service_role key (key-auth + admin ACL): apikey header/query.
+  - name: logs-api
+    _comment: 'Logs: /api/logs* -> http://functions:9000/logs/*'
+    url: http://functions:9000/logs
+    read_timeout: 60000
+    routes:
+      - name: logs-api-all
+        strip_path: true
+        paths:
+          - /api/logs
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: $LUA_AUTH_EXPR"
+          replace:
+            headers:
+              - "Authorization: $LUA_AUTH_EXPR"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+
   ## OAuth 2.0 Authorization Server Metadata (RFC 8414)
   - name: well-known-oauth
     _comment: 'Auth: /.well-known/oauth-authorization-server -> http://auth:9999/.well-known/oauth-authorization-server'
