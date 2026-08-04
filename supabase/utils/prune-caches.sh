@@ -29,7 +29,7 @@ API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches"
 # except the <keep> newest (sorted by created_at).
 prune() {
   local prefix="$1" keep="$2"
-  export PREFIX="$prefix" KEEP="$keep"
+  export KEEP="$keep"
   local ids
   ids=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \

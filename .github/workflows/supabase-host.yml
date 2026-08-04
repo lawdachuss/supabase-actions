@@ -654,10 +654,7 @@ jobs:
           echo ""
 
           # ── Keepalive loop + health checks + 5-min on-disk snapshots ──
-          # run_attempt disambiguates 'Re-run' (GitHub reuses run_id but bumps
-          # run_attempt), so re-run sessions never collide with existing cache keys.
-          RUN_ID="${{ github.run_id }}"
-          RUN_ATTEMPT="${{ github.run_attempt }}"
+          # (run_id/run_attempt are used by the final cache-save step's key)
           SLOT=0
           SNAPSHOTS=0
           TICK=0
