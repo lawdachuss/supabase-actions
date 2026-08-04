@@ -31,6 +31,67 @@ function db() {
   return sql;
 }
 
+// ── Auth ─────────────────────────────────────────────────────────────────────
+// Kong protects /api/logs with key-auth + admin ACL, but the public
+// /functions/v1/* route ALSO reaches this function, so we must verify the
+// caller here too. Accept the exact service_role key or any HS256 service_role
+// JWT signed with JWT_SECRET (both env vars are set on the functions service).
+const b64uToBytes = (s: string): Uint8Array => {
+  const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = b64.length % 4 ? '='.repeat(4 - (b64.length % 4)) : '';
+  const bin = atob(b64 + pad);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+};
+
+function bytesToB64u(b: Uint8Array): string {
+  let bin = '';
+  for (const byte of b) bin += String.fromCharCode(byte);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function verifyServiceKey(token: string): Promise<boolean> {
+  const secret = Deno.env.get('JWT_SECRET');
+  const exact = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+  if (exact && token === exact) return true; // exact match (fast path)
+  if (!secret) return false;
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64uToBytes(parts[1])));
+  } catch {
+    return false;
+  }
+  if (payload.role !== 'service_role') return false;
+  if (typeof payload.exp === 'number' && payload.exp < Date.now() / 1000) return false;
+  const data = new TextEncoder().encode(`${parts[0]}.${parts[1]}`);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
+  return safeEqual(bytesToB64u(sig), parts[2]);
+}
+
+async function authorize(req: Request): Promise<boolean> {
+  const url = new URL(req.url);
+  const token =
+    req.headers.get('apikey') ??
+    url.searchParams.get('apikey') ??
+    req.headers.get('authorization')?.replace(/^Bearer\s+/i, '');
+  return !!token && (await verifyServiceKey(token));
+}
+
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
@@ -239,6 +300,9 @@ Deno.serve(async (req) => {
   const url = new URL(req.url);
   // Kong strips /api/logs and forwards to /logs/..., so tolerate both.
   const path = url.pathname.replace(/^\/logs/, '').replace(/\/+$/, '') || '/';
+  if (!(await authorize(req))) {
+    return json({ error: 'Unauthorized — service_role key required (apikey header/query)' }, 401);
+  }
   try {
     if (path === '/') return json(await handleEvents(url));
     if (path === '/sources') return json(await handleSources());
