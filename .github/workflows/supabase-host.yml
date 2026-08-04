@@ -273,6 +273,11 @@ jobs:
             else
               echo "  ℹ️  No pgsodium key in archive (fresh encryption key will be generated)"
             fi
+            # Committed functions (e.g. the 'logs' system function) MUST win over
+            # stale copies restored from an older session's archive — re-apply
+            # tracked files after extraction. Untracked user functions (sample, …)
+            # stay as restored.
+            git checkout -- volumes/functions/ 2>/dev/null || true
             echo "  📁 functions: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
             echo "  📝 snippets:  $(ls volumes/snippets 2>/dev/null | tr '\n' ' ')"
             if [ -f ./backup.dump ]; then
