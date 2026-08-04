@@ -4,16 +4,15 @@
 # =============================================================================
 # Each run saves its state archive to the Actions cache at shutdown (keys
 # 'supabase-db-live-<run_id>-final'; GitHub doesn't expose cache-service env
-# vars to run: steps, so mid-session uploads aren't possible) and a gzip'd
-# Docker image archive ('docker-images-<compose-hash>'). Over time those
-# accumulate — and when docker-compose.yml changes, the old docker-images key
-# becomes an orphaned multi-GB entry nobody restores. This keeps only the
-# newest few of each family so the cache stays well under the 10GB repo cap
-# while the restore step always has the freshest data available.
+# vars to run: steps, so mid-session uploads aren't possible). Over time those
+# accumulate and can hit GitHub's 10GB per-repo cache cap. This keeps only the
+# newest few of each family so the cache stays small while the restore step
+# always has the freshest data available.
 #
 # Policy:
 #   supabase-db-*    keep newest KEEP (default 3)  — state archives
 #   docker-images-*  keep newest DOCKER_KEEP (default 2) — image tars
+#                    (only present if the Docker cache is ever re-added)
 #
 # Requires:
 #   GITHUB_TOKEN      - must have 'actions: write' (best-effort if not granted)

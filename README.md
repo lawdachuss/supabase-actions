@@ -333,7 +333,8 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 - GitHub Actions cache has **10GB limit** per repo
 - The state is snapshotted every 5 minutes **on disk** and saved to the cache **at session end** — persistence relies on the end-of-run `actions/cache` save (GitHub doesn't expose cache-service env vars to `run:` steps, so per-snapshot uploads aren't possible)
 - Old state-cache entries are pruned automatically (the newest 3 are kept) to stay under the cache limit
-- The Docker image cache is stored **gzip-compressed** (`docker save | gzip`) and the DB dump uses **maximum compression** (`pg_dump -Z 9`), so both stay small within the 10GB budget
+- Docker images are **not cached** — they're pulled fresh each run (~2 min, in parallel with setup), so the cache budget is used only for the (tiny) database state archives
+- The DB dump uses **maximum compression** (`pg_dump -Z 9`), so state archives stay tiny within the 10GB budget
 - Analytics/log data lives in the separate `_supabase` database and is intentionally **not backed up** (it's disposable and would bloat every snapshot)
 - Cache is **evicted** after 7 days of inactivity
 - If cache is lost, you start fresh (schema is auto-created by Supabase SQL init scripts)

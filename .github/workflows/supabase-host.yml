@@ -57,17 +57,10 @@ jobs:
         uses: actions/checkout@v4
 
       # ── Restore caches ────────────────────────────────────────────────
-      # NOTE: No compose YAML changes below this line — that would change
-      # hashFiles() cache key, causing Docker image cache to miss every run.
-      # Docker images are cached gzip-compressed (docker save | gzip) so the
-      # cache stays small within GitHub's 10GB per-repo limit. docker load
-      # auto-detects gzip on the restore side.
-      - name: 🐳 Restore Docker image cache
-        id: cache-docker
-        uses: actions/cache/restore@v4
-        with:
-          path: /tmp/docker-images.tar.gz
-          key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
+      # NOTE: Docker images are NOT cached anymore — they pull fresh each run
+      # (~2 min, in parallel with setup), which keeps the GitHub cache tiny.
+      # Only the full-state archive (DB + functions + snippets + vault key)
+      # lives in the cache.
 
       # Full-state archive cache (separate key with fallback for cross-run persistence)
       # Restores the most recent 'supabase-db-live-*' entry (written by the
@@ -101,13 +94,10 @@ jobs:
           pip install 'ecdsa>=0.19.0' -q &
           mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs} &
           
-          # Start docker compose pull early (runs in parallel with setup)
-          if [ ! -f /tmp/docker-images.tar.gz ]; then
-            echo "⏳ Cache file not found — pulling Docker images in background..."
-            docker compose pull 2>&1 | tail -3 &
-          else
-            echo "✅ Cache file exists — pull skipped, will load from cache"
-          fi
+          # Pull Docker images in the background (runs in parallel with setup).
+          # No image cache anymore — images are re-pullable and pull quickly.
+          echo "⏳ Pulling Docker images in background..."
+          docker compose pull 2>&1 | tail -3 &
           wait
           
           # ══════════════════════════════════════════════════════════════
@@ -226,28 +216,6 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
 
-      # ── Load cached Docker images ─────────────────────────────────────
-      - name: 📦 Load Docker images from cache
-        run: |
-          CACHE_FILE=/tmp/docker-images.tar.gz
-          if [ -f "$CACHE_FILE" ] && [ -s "$CACHE_FILE" ]; then
-            SIZE=$(du -h "$CACHE_FILE" | cut -f1)
-            echo "✅ Docker image cache HIT ($SIZE gzip) — loading..."
-            # docker load auto-detects gzip-compressed archives
-            if docker load < "$CACHE_FILE" 2>&1 | tail -3; then
-              echo "✅ Docker images loaded from cache"
-            else
-              # Corrupt/truncated cache entry (e.g. interrupted upload) — drop it
-              # and pull fresh instead of failing the whole run at startup.
-              echo "⚠️  Cache entry corrupt or truncated — removing it and pulling fresh images..."
-              rm -f "$CACHE_FILE"
-              cd ${{ env.SUPABASE_DIR }}
-              docker compose pull 2>&1 | tail -3 || true
-            fi
-          else
-            echo "⏭️  Docker image cache MISS — images will be pulled fresh"
-          fi
-
       # ── Restore full state (functions, snippets, pgsodium key) ──────────
       - name: 📦 Restore full state (functions, snippets, pgsodium key)
         run: |
@@ -345,10 +313,10 @@ jobs:
       # that save always has the freshest archive.
 
       # ── Prune stale cache entries (best-effort, keeps newest 3) ──────────
-      # Keeps the Actions cache small (end-of-run state archives + docker image
-      # tar) so it never hits the 10GB repo cap. Also re-run hourly from inside
-      # the keepalive loop. Needs 'actions: write'; if it isn't granted, old
-      # entries just age out via GitHub's LRU eviction instead.
+      # Keeps the Actions cache small (end-of-run state archives) so it never
+      # hits the 10GB repo cap. Also re-run hourly from inside the keepalive
+      # loop. Needs 'actions: write'; if it isn't granted, old entries just
+      # age out via GitHub's LRU eviction instead.
       - name: 🧹 Prune stale snapshot cache entries
         env:
           GH_TOKEN: ${{ github.token }}
@@ -587,34 +555,6 @@ jobs:
           fi
           echo "=============================================================="
 
-      # ── Save Docker images to cache (for next run) ─────────────────────
-      # gzip -1: fast compression (this runs only on a cache MISS). Keeps the
-      # cached archive far under GitHub's 10GB per-repo cache limit. The raw vs
-      # gzip sizes are printed so the compression win is visible in the logs.
-      - name: 💿 Save Docker images to cache
-        if: steps.cache-docker.outputs.cache-hit != 'true'
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-          echo "💾 Docker cache MISS — saving pulled images for next run..."
-          docker save $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'supabase|kong|postgrest|timberio') \
-            -o /tmp/docker-images.tar 2>&1 | tail -3
-          if [ -s /tmp/docker-images.tar ]; then
-            RAW=$(du -h /tmp/docker-images.tar | cut -f1)
-            gzip -1 -f /tmp/docker-images.tar
-            SIZE=$(du -h /tmp/docker-images.tar.gz | cut -f1)
-            echo "✅ Docker images saved (raw: $RAW → gzip: $SIZE) — ready for upload"
-          else
-            echo "⚠️  docker save produced no output — failing so the cache upload is skipped"
-            exit 1
-          fi
-
-      - name: 📤 Upload Docker images to GitHub cache
-        if: steps.cache-docker.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: /tmp/docker-images.tar.gz
-          key: docker-images-${{ hashFiles('supabase/docker-compose.yml', 'supabase/docker-compose.logs.yml') }}
-
       # ── Run Supabase (keep alive + on-disk snapshots every 5 minutes) ────
       # Every 5 minutes the FULL state (DB dump + pgsodium key + functions +
       # snippets) is refreshed on disk; it's persisted to the Actions cache by
@@ -719,9 +659,8 @@ jobs:
           echo "All services stopped"
 
       # ── Save full state archive to cache ────────────────────────────────
-      # Final safety-net upload. The keepalive loop already saved a snapshot
-      # every 5 minutes under 'supabase-db-live-*' keys; this one guarantees
-      # the very latest state is cached even if the loop's uploads were skipped.
+      # The keepalive loop writes on-disk snapshots every 5 minutes; this step
+      # persists the freshest one to the Actions cache at the end of the run.
       - name: 💿 Save final state to GitHub Actions cache
         if: always()
         uses: actions/cache/save@v4
