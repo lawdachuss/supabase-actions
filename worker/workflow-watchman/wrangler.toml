@@ -11,7 +11,7 @@ compatibility_date = "2025-04-01"
 # Set via: wrangler secret put DISCORD_WEBHOOK_URL
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["*/1 * * * *"]
 
 # Optional token guarding the public dashboard/metrics pages (sent as
 # 'x-watchman-token' header or ?token= query param). Leave unset for open access.

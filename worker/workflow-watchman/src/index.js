@@ -7,7 +7,9 @@
  *
  * Repo-specific behaviour:
  *   - node-1..node-18 (secure-rdp.yml):  20 min grace,  8 restarts / 24h max
- *   - supabase-actions (supabase-host.yml): 2 min grace — 24/7 session chaining
+ *     (checked every 5th minute — long grace, no need for fast polls)
+ *   - supabase-actions (supabase-host.yml): 1 min grace — 24/7 session chaining
+ *     (fast-polled EVERY minute so the handoff gap stays ~1-2 min)
  */
 
 const OWNER = "lawdachuss";
@@ -34,11 +36,12 @@ const REPO_CONFIGS = [
   { repo: "node-17",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
   { repo: "node-18",  workflow: "secure-rdp.yml", branch: "main", graceMs: 20 * 60 * 1000, throttleMax: 8 },
 
-  // supabase-actions — 24/7 self-hosted Supabase. Sessions run ~5h30m then stop;
+  // supabase-actions — 24/7 self-hosted Supabase. Sessions run ~5h05m then stop;
   // restart the moment one completes so the stack is up around the clock.
   // Short grace = fast handoff. The repo's own 6-hour schedule still runs as a
   // no-cancel fallback (it queues behind the active session instead of killing it).
-  { repo: "supabase-actions", workflow: "supabase-host.yml", branch: "master", graceMs: 2 * 60 * 1000, throttleMax: 8 },
+  // fastPoll: true = checked on EVERY cron tick (1 min) so the dead gap is ~1-2 min.
+  { repo: "supabase-actions", workflow: "supabase-host.yml", branch: "master", graceMs: 60 * 1000, throttleMax: 8, fastPoll: true },
 ];
 
 const THROTTLE_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
@@ -238,7 +241,7 @@ a { color:#3b82f6; }
 </head>
 <body>
 <h1>🛡️ workflow-watchman</h1>
-<p class="subtitle">Monitoring ${repos.length} repos • cron */5 * * * *</p>
+<p class="subtitle">Monitoring ${repos.length} repos • cron */1 * * * * (fast-poll supabase-actions)</p>
 <table>
 <thead><tr><th>Repo</th><th>Status</th><th>Last Run</th><th>Age</th><th>Restarts</th></tr></thead>
 <tbody>${rows}</tbody>
@@ -452,7 +455,14 @@ export default {
       return;
     }
     const headers = ghHeaders(token);
+    // Fast-poll gate: the cron fires every minute, but only repos flagged
+    // fastPoll (supabase-actions) are checked on EVERY tick. The node repos
+    // (20-min grace) only need checking every 5th minute, which keeps GitHub
+    // rate-limit and free-plan CPU usage low while the 24/7 chain gets
+    // ~1-minute detection of a dead session.
+    const isNodeTick = Math.floor(Date.now() / 60000) % 5 === 0;
     await runWithConcurrency(REPO_CONFIGS, 4, async (config) => {
+      if (!config.fastPoll && !isNodeTick) return;
       try {
         const state = await evaluateRepo(config, headers);
         if (state.needsRestart) {
