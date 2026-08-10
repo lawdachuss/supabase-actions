@@ -640,6 +640,11 @@ jobs:
             fi
 
             # Health check + heartbeat every 60s (tick = 10s)
+            # Probes BOTH local Kong (localhost:8000) AND the public tunnel
+            # domain (if configured) — so a dead cloudflared or dead Kong both
+            # count. curl exits 0 on any HTTP response (incl. Kong's 401), so
+            # these are liveness checks: they fail only when the endpoint is
+            # unreachable.
             # NOTE: after 3 CONSECUTIVE failed health checks (~3 min) the step
             # exits non-zero. The run then concludes 'failure', which the
             # workflow-watchman worker sees within ~1-2 min and restarts — so a
@@ -647,7 +652,16 @@ jobs:
             # idle for the remaining ~5h. The if: always() steps below still run
             # (final backup + cache save), so the freshest state is preserved.
             if [ $(( TICK % 6 )) -eq 0 ]; then
-              if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
+              HEALTH_OK=1
+              if ! curl -s -o /dev/null --max-time 15 http://localhost:8000; then
+                HEALTH_OK=0
+                echo "  ✗ localhost:8000 (Kong) unreachable"
+              fi
+              if [ -n "$TUNNEL_DOMAIN" ] && ! curl -s -o /dev/null --max-time 15 "https://$DOMAIN"; then
+                HEALTH_OK=0
+                echo "  ✗ tunnel https://$DOMAIN unreachable"
+              fi
+              if [ "$HEALTH_OK" -eq 1 ]; then
                 FAILS=0
                 REMAINING=$(( (END_TIME - NOW) / 60 ))
                 echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining | snapshots: $SNAPSHOTS"
@@ -657,7 +671,7 @@ jobs:
                 docker compose ps --no-color 2>/dev/null | head -10 || true
                 if [ "$FAILS" -ge 3 ]; then
                   echo ""
-                  echo "🚨 HEALTH CHECK FAILED 3x IN A ROW — Supabase is DOWN. Exiting to trigger watchman restart (cache save still runs)."
+                  echo "🚨 HEALTH CHECK FAILED 3x IN A ROW — Supabase/tunnel is DOWN. Exiting to trigger watchman restart (cache save still runs)."
                   exit 1
                 fi
               fi
