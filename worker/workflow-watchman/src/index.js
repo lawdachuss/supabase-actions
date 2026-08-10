@@ -52,6 +52,14 @@ const HEALTH_CHECK_INTERVAL = 30 * 1000; // 30 seconds
 // lastDispatchAt: prevents double-dispatch races when the schedule-queued run
 // and our dispatch land in the same cron window. lastErrorAt: caps Discord
 // error spam to once per 30 min per repo (a broken config was alerting every 5 min).
+//
+// NOTE: these live in module state, which is per-isolate in Workers. With the
+// 1-min cron, a slow health check (up to 3 min) can overlap the next scheduled
+// invocation in a different isolate, where the cooldown isn't visible. This is
+// acceptable: the active-run check (queued/pending counts as active) catches a
+// just-dispatched run within seconds, a duplicate with cancel-in-progress: false
+// only QUEUES (never cancels a live session), and throttleMax bounds the blast
+// radius. A KV/cache-backed lock would close the window entirely if ever needed.
 const DISPATCH_COOLDOWN_MS = 90 * 1000;
 const ERROR_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
 const lastDispatchAt = {};
