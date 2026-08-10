@@ -11,7 +11,11 @@
 #     the end-of-run actions/cache save (which runs from the action runtime).
 # 3. Exposes everything via Cloudflare Tunnel
 # 4. Runs for ~5h30m per session (maximizing the full 6-hour GitHub Actions limit)
-# 5. Scheduled every 6 hours — 20+ min gap between runs for clean handoff
+# 5. 24/7 chaining: the workflow-watchman Cloudflare Worker dispatches a new
+#    run the moment a session completes (2 min grace). The 6-hour schedule
+#    remains as a no-cancel fallback — with cancel-in-progress: false it
+#    QUEUES behind the active session and starts only after it ends, so it
+#    never kills a live session (watchman fills schedule delays too).
 #
 # Required GitHub Secrets:
 #   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
@@ -22,19 +26,28 @@
 # =============================================================================
 
 name: 🚀 Full Supabase Self-Hosted
+run-name: 🚀 Full Supabase Self-Hosted${{ github.event.inputs.triggered_by == 'workflow-watchman' && ' (watchman)' || '' }}
 
 on:
-  workflow_dispatch:                     # Manual trigger - click "Run workflow" in GitHub UI
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'Source of the trigger (workflow-watchman auto-restart)'
+        required: false
+        default: ''
   schedule:
-    - cron: '0 */6 * * *'               # Every 6 hours — 15min gap between runs
+    - cron: '0 */6 * * *'               # Fallback heartbeat — queues behind active session
 
-  # NOTE: 'push' trigger removed because every git push cancels the running 5h45m session
-  # (concurrency.cancel-in-progress kills the old run when a new one starts).
-  # Use workflow_dispatch to test workflow changes instead.
+  # NOTE: 'push' trigger removed on purpose — a push mid-session would queue a
+  # duplicate run (concurrency no longer cancels live sessions). Manual runs now
+  # QUEUE behind the active session and start after it ends. Use workflow_dispatch
+  # or the workflow-watchman worker to restart instead.
 
 concurrency:
   group: supabase-host
-  cancel-in-progress: true               # Cancel old run when new one starts (clean handoff)
+  # NO cancel-in-progress: a new run (schedule or watchman) QUEUES behind the
+  # active session and starts only after it ends. Never kills a live session.
+  cancel-in-progress: false
 
 env:
   SUPABASE_DIR: ./supabase
@@ -567,7 +580,10 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
-          DURATION=19800  # 5h30m — leaves buffer for 5-min snapshots + shutdown steps
+          DURATION=18300  # 5h05m — leaves ~50 min buffer for final backup + cache save
+          # (was 5h30m; the old 25 min shutdown budget was too tight for large DBs
+          # and could cut the cache save off at the 355-min timeout, losing up to
+          # 5h of data on the next restore).
           END_TIME=$(( $(date +%s) + DURATION ))
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
 
@@ -587,7 +603,7 @@ jobs:
           echo "|  Badge:   https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
           echo "|                                                             |"
           echo "|  Runs until: $(date -d @$END_TIME '+%H:%M UTC')                 |"
-          echo "|  Auto-restart: every 6 hours                                |"
+          echo "|  Auto-restart: watchman + 6h sched                           |"
           echo "|  Remaining: $(( DURATION / 60 )) min                                      |"
           echo "|                                                             |"
           echo "+=============================================================+"
@@ -684,7 +700,7 @@ jobs:
             SIZE=$(du -h ${{ env.BACKUP_FILE }} | cut -f1)
             echo "|  Database backed up ($SIZE)                                |"
           fi
-          echo "|  Next run in ~6 hours (scheduled)                          |"
+          echo "|  Next run: watchman auto-restart (~5 min)                  |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "|  https://$DOMAIN                                              |"
             echo "|  Badge: https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"

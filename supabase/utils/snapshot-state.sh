@@ -20,11 +20,13 @@ cd "$COMPOSE_DIR"
 # ── 1. Dump the database (only if the db container is up) ──────────────
 if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
   echo "  🗄️  pg_dump..."
-  # -Z 9: maximum compression for the custom-format dump, so snapshots stay
-  # small within GitHub's 10GB per-repo cache budget. (The analytics/log data
-  # lives in the separate '_supabase' database and is intentionally not
-  # backed up — it's disposable and would bloat every snapshot.)
-  if docker compose exec -T db pg_dump -U postgres -F c -Z 9 -f /tmp/backup.dump.new postgres \
+  # -Z 6: good compression for the custom-format dump — keeps snapshots small
+  # within GitHub's 10GB per-repo cache budget without burning excessive CPU in
+  # the live DB container every 5 minutes (max -Z 9 on a large DB can stall the
+  # session). (The analytics/log data lives in the separate '_supabase' database
+  # and is intentionally not backed up — it's disposable and would bloat every
+  # snapshot.)
+  if docker compose exec -T db pg_dump -U postgres -F c -Z 6 -f /tmp/backup.dump.new postgres \
        && docker compose cp db:/tmp/backup.dump.new ./backup.dump.new \
        && mv -f ./backup.dump.new ./backup.dump; then
     echo "  ✅ database dump updated ($(du -h ./backup.dump | cut -f1))"
