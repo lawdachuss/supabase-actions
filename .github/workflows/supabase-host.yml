@@ -614,6 +614,7 @@ jobs:
           SLOT=0
           SNAPSHOTS=0
           TICK=0
+          FAILS=0
           NEXT_SNAP=$(date +%s)
           while [ $(date +%s) -lt $END_TIME ]; do
             NOW=$(date +%s)
@@ -639,13 +640,26 @@ jobs:
             fi
 
             # Health check + heartbeat every 60s (tick = 10s)
+            # NOTE: after 3 CONSECUTIVE failed health checks (~3 min) the step
+            # exits non-zero. The run then concludes 'failure', which the
+            # workflow-watchman worker sees within ~1-2 min and restarts — so a
+            # mid-session crash (Kong/Postgres/tunnel death) can never silently
+            # idle for the remaining ~5h. The if: always() steps below still run
+            # (final backup + cache save), so the freshest state is preserved.
             if [ $(( TICK % 6 )) -eq 0 ]; then
               if curl -s -o /dev/null http://localhost:8000 > /dev/null 2>&1; then
+                FAILS=0
                 REMAINING=$(( (END_TIME - NOW) / 60 ))
                 echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining | snapshots: $SNAPSHOTS"
               else
-                echo "$(date '+%H:%M:%S') -- Health check failed"
+                FAILS=$((FAILS + 1))
+                echo "$(date '+%H:%M:%S') -- Health check failed ($FAILS/3 consecutive)"
                 docker compose ps --no-color 2>/dev/null | head -10 || true
+                if [ "$FAILS" -ge 3 ]; then
+                  echo ""
+                  echo "🚨 HEALTH CHECK FAILED 3x IN A ROW — Supabase is DOWN. Exiting to trigger watchman restart (cache save still runs)."
+                  exit 1
+                fi
               fi
             fi
             sleep 10

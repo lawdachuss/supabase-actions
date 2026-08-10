@@ -41,7 +41,10 @@ const REPO_CONFIGS = [
   // Short grace = fast handoff. The repo's own 6-hour schedule still runs as a
   // no-cancel fallback (it queues behind the active session instead of killing it).
   // fastPoll: true = checked on EVERY cron tick (1 min) so the dead gap is ~1-2 min.
-  { repo: "supabase-actions", workflow: "supabase-host.yml", branch: "master", graceMs: 60 * 1000, throttleMax: 8, fastPoll: true },
+  // throttleMax 12: normal 24/7 chaining needs ~4-5 sessions/day; the headroom
+  // covers a rapid-fail loop (schedule + watchman double-triggering) without the
+  // watchman going silent for 24h.
+  { repo: "supabase-actions", workflow: "supabase-host.yml", branch: "master", graceMs: 60 * 1000, throttleMax: 12, fastPoll: true },
 ];
 
 const THROTTLE_WINDOW = 24 * 60 * 60 * 1000; // 24 hours
