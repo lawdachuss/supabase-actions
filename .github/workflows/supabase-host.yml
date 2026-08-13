@@ -23,6 +23,16 @@
 #   POSTGRES_PASSWORD   - Your secure PostgreSQL password
 #   JWT_SECRET          - JWT signing secret (32+ chars)
 #   DASHBOARD_PASSWORD  - Supabase Studio admin password
+#
+# Optional SMTP secrets (REAL auth emails — confirmation / reset / OTP actually
+# reach users instead of the dev-only inbucket fake SMTP). Leave unset to keep
+# inbucket. Any SMTP provider works (Resend, SendGrid, SES, Brevo, ...):
+#   SMTP_HOST          e.g. smtp.resend.com
+#   SMTP_PORT          e.g. 587
+#   SMTP_USER          e.g. resend
+#   SMTP_PASS          the provider's SMTP password / API key
+#   SMTP_ADMIN_EMAIL   verified From address (must be allowed by the provider)
+#   SMTP_SENDER_NAME   display name shown as the sender
 # =============================================================================
 
 name: 🚀 Full Supabase Self-Hosted
@@ -210,6 +220,30 @@ jobs:
             'ANON_KEY_ASYMMETRIC=': f'ANON_KEY_ASYMMETRIC={anon_asymmetric}',
             'SERVICE_ROLE_KEY_ASYMMETRIC=': f'SERVICE_ROLE_KEY_ASYMMETRIC={service_asymmetric}',
           }
+          # Real SMTP (optional) — replaces the fake inbucket defaults so auth
+          # confirmation/reset emails actually deliver. Leave SMTP_HOST unset
+          # to keep inbucket (dev-only fake SMTP).
+          if os.environ.get('SMTP_HOST'):
+              reps.update({
+                  'SMTP_ADMIN_EMAIL=admin@example.com': f'SMTP_ADMIN_EMAIL={os.environ.get("SMTP_ADMIN_EMAIL", "admin@example.com")}',
+                  'SMTP_HOST=supabase-mail': f'SMTP_HOST={os.environ["SMTP_HOST"]}',
+                  'SMTP_PORT=2500': f'SMTP_PORT={os.environ.get("SMTP_PORT", "587")}',
+                  'SMTP_USER=fake_mail_user': f'SMTP_USER={os.environ.get("SMTP_USER", "resend")}',
+                  'SMTP_PASS=fake_mail_password': f'SMTP_PASS={os.environ.get("SMTP_PASS", "")}',
+                  'SMTP_SENDER_NAME=fake_sender': f'SMTP_SENDER_NAME={os.environ.get("SMTP_SENDER_NAME", "Supabase")}',
+              })
+              print("SMTP: real provider configured")
+          else:
+              print("SMTP: SMTP_HOST not set — keeping inbucket (dev-only fake SMTP)")
+          # OAuth providers (optional): enabling is driven purely by the client-ID
+          # secret being set. Redirect URI is API_EXTERNAL_URL/callback (the
+          # public URL), already handled by the compose file.
+          for prov in ('GOOGLE', 'GITHUB'):
+              if os.environ.get(f'{prov}_CLIENT_ID'):
+                  reps[f'{prov}_ENABLED=false'] = f'{prov}_ENABLED=true'
+                  reps[f'{prov}_CLIENT_ID='] = f'{prov}_CLIENT_ID={os.environ[f"{prov}_CLIENT_ID"]}'
+                  reps[f'{prov}_SECRET='] = f'{prov}_SECRET={os.environ[f"{prov}_SECRET"]}'
+                  print(f'OAuth: {prov} enabled')
           missing = []
           for old, new in reps.items():
               if old in env_content:
@@ -228,6 +262,18 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          # Optional real SMTP for auth emails (falls back to inbucket if unset)
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_ADMIN_EMAIL: ${{ secrets.SMTP_ADMIN_EMAIL }}
+          SMTP_SENDER_NAME: ${{ secrets.SMTP_SENDER_NAME }}
+          # Optional OAuth providers (auto-enabled when the client ID secret is set)
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_SECRET: ${{ secrets.GOOGLE_SECRET }}
+          GITHUB_CLIENT_ID: ${{ secrets.GITHUB_CLIENT_ID }}
+          GITHUB_SECRET: ${{ secrets.GITHUB_SECRET }}
 
       # ── Restore full state (functions, snippets, pgsodium key) ──────────
       - name: 📦 Restore full state (functions, snippets, pgsodium key)
@@ -437,6 +483,13 @@ jobs:
                 echo "(Non-critical warnings only — data should be intact)"
               fi
             fi
+            # Surface what pg_restore's "errors ignored on restore: N" actually
+            # are (usually benign owner/grant conflicts on a Supabase restore,
+            # but now visible instead of hidden).
+            if grep -qi "error:" "$RESTORE_LOG" 2>/dev/null; then
+              echo "  ⚠️  pg_restore error summary (top 15):"
+              grep -i "error:" "$RESTORE_LOG" | sed 's/^/      /' | sort | uniq -c | sort -rn | head -15
+            fi
             rm -f "$RESTORE_LOG"
 
             # ═══ Verify restore success ═══
@@ -511,6 +564,14 @@ jobs:
           start_tunnel &
           wait
 
+          # FIX: supavisor (pooler) crash-loops at boot — it starts while the
+          # parallel pg_restore --clean is still dropping/recreating the
+          # supabase_admin role and _supavisor schema it boots against, so its
+          # migrate + pooler.exs eval fail and 'restart: unless-stopped' spins
+          # forever. One clean restart after the restore gives it a stable DB.
+          docker compose restart supavisor >/dev/null 2>&1 || echo "  ⚠️  pooler restart failed — will retry on next restart policy tick"
+          sleep 5
+
           ERR=$(cat "$STATUS_FILE")
           rm -f "$STATUS_FILE"
           if [ "$ERR" -ne 0 ]; then
@@ -518,6 +579,54 @@ jobs:
           fi
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
+
+      # ── Apply committed migrations (versioned schema changes) ────────────
+      # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs
+      # already get the volumes/db/*.sql init scripts at first boot). Files are
+      # tracked in public._schema_migrations so each one runs only once across
+      # sessions — the tracking table itself is carried by the state backup.
+      - name: 🗂️ Apply committed migrations
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+
+          PG_READY=0
+          for i in $(seq 1 60); do
+            if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+              PG_READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$PG_READY" -ne 1 ]; then
+            echo "⚠️  Postgres not ready — skipping migrations"
+            exit 0
+          fi
+
+          docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE IF NOT EXISTS public._schema_migrations (name text PRIMARY KEY, applied_at timestamptz DEFAULT now());" >/dev/null 2>&1 || true
+
+          APPLIED=0
+          for f in migrations/*.sql; do
+            [ -e "$f" ] || continue
+            NAME=$(basename "$f")
+            if docker compose exec -T db psql -U postgres -t -A -c \
+              "SELECT 1 FROM public._schema_migrations WHERE name = '$NAME'" 2>/dev/null | grep -q 1; then
+              echo "  ↷ $NAME already applied — skipping"
+              continue
+            fi
+            echo "  ▶ Applying $NAME..."
+            if docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 < "$f" >/dev/null 2>&1; then
+              docker compose exec -T db psql -U postgres -c \
+                "INSERT INTO public._schema_migrations(name) VALUES ('$NAME')" >/dev/null 2>&1 || true
+              echo "  ✅ $NAME applied"
+              APPLIED=$((APPLIED + 1))
+            else
+              echo "  ⚠️  $NAME FAILED — not marked applied (will retry next session); fix and re-commit"
+            fi
+          done
+          if [ "$APPLIED" -eq 0 ]; then
+            echo "ℹ️  No new migrations (supabase/migrations empty or up to date)"
+          fi
 
       # ── Verify restored state (READ-ONLY) ───────────────────────────────
       # Reports what survived the backup → cache → restore cycle so you can

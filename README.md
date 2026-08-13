@@ -29,6 +29,11 @@
 | **Realtime subscriptions** | ✅ WebSocket-based live queries |
 | **Supabase Studio** | ✅ Dashboard UI (port 8000) |
 | **Edge Functions** | ✅ Deno-based edge functions |
+| **Google / GitHub OAuth** | ✅ (opt-in — set client secrets) |
+| **pgvector (AI/vector search)** | ✅ |
+| **pg_cron (scheduled jobs)** | ✅ |
+| **Custom access token hook** | ✅ (opt-in) |
+| **Versioned migrations** | ✅ (`supabase/migrations/`) |
 | **Permanent URL** | ✅ Cloudflare Tunnel (static domain) |
 | **Data persistence** | ✅ Full state backed up at shutdown → restored next run |
 | **Object Storage** | ❌ Not included |
@@ -44,7 +49,7 @@
 7. **Graceful shutdown** — final backup, then repeat
 8. **Repeat** — next run picks up where you left off
 
-> **Downtime:** ~15 minutes between runs (scheduled every 6 hours, runs for 5h45m)
+> **Downtime:** ~1-2 minutes between runs via workflow-watchman (scheduled runs queue behind the active session; sessions run ~5h05m)
 
 ## 📡 Health Check / Monitoring
 
@@ -174,6 +179,12 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | `POSTGRES_PASSWORD` | `.env` → PostgreSQL container | Superuser password for the database. Used internally by all Supabase services. |
 | `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates all API keys from this secret. |
 | `DASHBOARD_PASSWORD` | `.env` → Supabase Studio | Login password for Studio at port 8000 (username: `supabase`). |
+| `SMTP_HOST` | `.env` → GoTrue (auth email) | SMTP server hostname (e.g. `smtp.resend.com`). Optional — unset keeps dev-only inbucket. |
+| `SMTP_PORT` | `.env` → GoTrue (auth email) | SMTP port (587 TLS typical). |
+| `SMTP_USER` | `.env` → GoTrue (auth email) | SMTP username (Resend: `resend`). |
+| `SMTP_PASS` | `.env` → GoTrue (auth email) | SMTP password / API key. |
+| `SMTP_ADMIN_EMAIL` | `.env` → GoTrue (auth email) | Verified From address for auth emails. |
+| `SMTP_SENDER_NAME` | `.env` → GoTrue (auth email) | Sender display name (e.g. `Supabase`). |
 
 #### Auto-Generated Keys (no setup needed)
 
@@ -196,6 +207,50 @@ The workflow automatically generates all these keys from `JWT_SECRET` — no man
 | `LOGFLARE_PUBLIC_TOKEN` / `LOGFLARE_PRIVATE_TOKEN` | `JWT_SECRET` (HMAC-SHA512) | Logflare logging |
 
 > **💡 All keys are deterministic** — same `JWT_SECRET` always produces the same keys. Find them in workflow logs under the "Super-fast startup" step.
+
+#### 📧 Real auth emails (optional)
+
+By default auth emails (signup confirmation, password reset, OTP) go to the dev-only **inbucket** fake SMTP and are silently dropped. To actually deliver them, set the SMTP secrets above to any transactional SMTP provider — e.g. [Resend](https://resend.com) (free tier: 100 emails/day):
+
+```bash
+gh secret set SMTP_HOST -b"smtp.resend.com"
+gh secret set SMTP_PORT -b"587"
+gh secret set SMTP_USER -b"resend"
+gh secret set SMTP_PASS -b"<your-resend-api-key>"
+gh secret set SMTP_ADMIN_EMAIL -b"noreply@your-domain.com"   # must be verified with Resend
+gh secret set SMTP_SENDER_NAME -b"Supabase"
+```
+
+Since `ENABLE_EMAIL_AUTOCONFIRM=false`, new signups require email confirmation — with real SMTP the confirmation links and password resets start working end-to-end.
+
+#### 🔐 Google / GitHub OAuth (optional)
+
+Set the provider's client ID + secret as GitHub secrets and the workflow auto-enables it (`GOOGLE_ENABLED`/`GITHUB_ENABLED` flip to `true`, redirect URIs are derived from your tunnel domain):
+
+```bash
+# Create an OAuth app first:
+#   Google: https://console.cloud.google.com/apis/credentials
+#   GitHub: https://github.com/settings/developers
+# Authorized redirect URI must be: https://<CF_TUNNEL_DOMAIN>/auth/v1/callback
+gh secret set GOOGLE_CLIENT_ID -b"<id>"
+gh secret set GOOGLE_SECRET -b"<secret>"
+# or
+gh secret set GITHUB_CLIENT_ID -b"<id>"
+gh secret set GITHUB_SECRET -b"<secret>"
+```
+
+Anonymous users are enabled by default (`ENABLE_ANONYMOUS_USERS=true`) — guests can use the app and later upgrade to a real account.
+
+## 🗂️ Versioned migrations
+
+Schema changes that must survive sessions live in `supabase/migrations/*.sql` (committed). A workflow step applies them on top of the restored database every session, tracking applied files in `public._schema_migrations` so each runs exactly once:
+
+```bash
+echo "ALTER TABLE public.users ADD COLUMN IF NOT EXISTS avatar_url text;" > supabase/migrations/002-avatar-url.sql
+git add supabase/migrations/002-avatar-url.sql && git commit && git push
+```
+
+Failed migrations are left unapplied and retry next session. See `supabase/migrations/README.md`. A ready-to-use **custom access token hook** (`001-custom-access-token-hook.sql`) is included — flip `ENABLE_CUSTOM_ACCESS_TOKEN_HOOK=true` to turn it on and edit the function to add claims.
 
 ## 🔑 Personal Access Tokens
 
@@ -288,7 +343,7 @@ Already configured for max utilization. The settings are:
 ```yaml
 timeout-minutes: 355   # 5h55m — 5 min buffer under 360 min hard limit
 # In the keep-alive step:
-DURATION=20400  # 5h40m — leaves time for setup (~5 min) + shutdown (~5 min)
+DURATION=18300  # 5h05m — leaves ~50 min buffer for the final backup + cache save
 ```
 
 ### Enable Analytics in Dashboard
@@ -300,7 +355,7 @@ The logs/analytics tab in Studio is disabled by default (`ENABLED_FEATURES_LOGS_
 
 ### Add OAuth providers
 
-Set environment variables in the workflow (e.g., `GOTRUE_EXTERNAL_GOOGLE_ENABLED`, `GOOGLE_CLIENT_ID`).
+Set `GOOGLE_CLIENT_ID`/`GOOGLE_SECRET` or `GITHUB_CLIENT_ID`/`GITHUB_SECRET` as repo secrets — the workflow enables the provider automatically (see 🔐 Google / GitHub OAuth above).
 
 ---
 
@@ -313,7 +368,7 @@ Object storage is intentionally excluded but can be re-added (see Troubleshootin
 This setup is **free** (GitHub Actions + Cloudflare free tier). The trade-off:
 - ✅ **Zero cost** to run
 - ✅ **Auto-scaling** runners
-- ✅ **Full 6-hour window utilized** (5h45m uptime + 15m gap between runs)
+- ✅ **Full 6-hour window utilized** (5h05m uptime + ~2m gap via watchman)
 - ❌ **~15 minutes downtime** between 6-hour runs
 - ❌ **Ephemeral** — cache could be evicted if not used for 7+ days
 
@@ -352,6 +407,7 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 | "No space left on device" | GitHub runner has ~14GB free — clean up old Docker images |
 | Port already in use | Runner resets between runs, should be fresh |
 | Rate limited (429) | Open auth routes limited to 30 req/min; SSO ACS to 10 req/min |
+| `supabase-pooler` restarting | Fixed automatically: the workflow restarts supavisor once the DB restore completes. If it still crash-loops, check the start step output for SMTP/.env config errors. |
 | Kong returning errors | Check workflow logs; `KONG_PROXY_ERROR_LOG` is output to stdout |
 | Want object storage? | Add `storage` and `imgproxy` services back to `docker-compose.yml` and mount `storage` SQL init |
 
