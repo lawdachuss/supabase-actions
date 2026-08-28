@@ -234,7 +234,10 @@ jobs:
               })
               print("SMTP: real provider configured")
           else:
-              print("SMTP: SMTP_HOST not set — keeping inbucket (dev-only fake SMTP)")
+              # No real SMTP — enable autoconfirm so signup/password-reset
+              # work without needing a reachable mail server.
+              reps['ENABLE_EMAIL_AUTOCONFIRM=false'] = 'ENABLE_EMAIL_AUTOCONFIRM=true'
+              print("SMTP: SMTP_HOST not set — enabling autoconfirm (no email verification required)")
           # OAuth providers (optional): enabling is driven purely by the client-ID
           # secret being set. Redirect URI is API_EXTERNAL_URL/callback (the
           # public URL), already handled by the compose file.
