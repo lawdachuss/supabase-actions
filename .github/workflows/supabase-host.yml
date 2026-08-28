@@ -631,6 +631,17 @@ jobs:
             echo "ℹ️  No new migrations (supabase/migrations empty or up to date)"
           fi
 
+      # ── Confirm all unconfirmed users (fixes stuck signups) ─────────────
+      # If ENABLE_EMAIL_AUTOCONFIRM was false in a previous session and Inbucket
+      # failed to deliver the confirmation email, users remain stuck with
+      # email_confirmed_at = NULL. This catches them on every startup.
+      - name: ✉️ Confirm all unconfirmed users
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          docker compose exec -T db psql -U postgres -c \
+            "UPDATE auth.users SET email_confirmed_at = NOW(), email_change_confirm_status = 0 WHERE email_confirmed_at IS NULL;"
+          echo "✅ All unconfirmed users confirmed"
+
       # ── Verify restored state (READ-ONLY) ───────────────────────────────
       # Reports what survived the backup → cache → restore cycle so you can
       # confirm your changes persisted. Deliberately creates nothing: tables,
