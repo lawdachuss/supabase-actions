@@ -206,6 +206,7 @@ jobs:
             'UpNVntn3cDxHJpq99YMc1T1AQgQpc8kfYTuRgBiYa15BLrx8etQoXz3gZv1/u2oq': skb,
             'http://localhost:8000': public_url,
             'SITE_URL=http://localhost:3000': f'SITE_URL={public_url}',
+            'ADDITIONAL_REDIRECT_URLS=': f'ADDITIONAL_REDIRECT_URLS={public_url}',
             'REALTIME_DB_ENC_KEY=supabaserealtime': f'REALTIME_DB_ENC_KEY={rek}',
             'VAULT_ENC_KEY=your-32-character-encryption-key': f'VAULT_ENC_KEY={vek}',
             'PG_META_CRYPTO_KEY=your-encryption-key-32-chars-min': f'PG_META_CRYPTO_KEY={pmk}',
