@@ -24,3 +24,7 @@ Thumbs.db
 
 # Cloned/test directories (old troubleshooting copies)
 /tmp-supabase/
+node_modules/
+derive-key.cjs
+package.json
+package-lock.json

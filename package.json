@@ -1,6 +1,0 @@
-{
-  "dependencies": {
-    "ecdsa": "^0.7.0",
-    "elliptic": "^6.6.1"
-  }
-}
