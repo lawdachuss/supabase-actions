@@ -756,19 +756,19 @@ jobs:
 
           # Write clickable links directly to GitHub Actions Run Summary
           if [ -n "$GITHUB_STEP_SUMMARY" ]; then
-            cat <<EOF >> "$GITHUB_STEP_SUMMARY"
-### 🚀 Supabase & Redis are LIVE!
-
-| Service | Link / Endpoint |
-|---|---|
-| 🖥️ **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |
-| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |
-| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |
-| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |
-
-- **Redis URI**: \`redis://default:${REDIS_PASSWORD:-...}@redis:6379\`
-- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')
-EOF
+            {
+              echo "### 🚀 Supabase & Redis are LIVE!"
+              echo ""
+              echo "| Service | Link / Endpoint |"
+              echo "|---|---|"
+              echo "| 🖥️ **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
+              echo "| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
+              echo "| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
+              echo "| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
+              echo ""
+              echo "- **Redis URI**: \`redis://default:${REDIS_PASSWORD:-...}@redis:6379\`"
+              echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
 
