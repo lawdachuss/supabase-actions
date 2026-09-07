@@ -503,6 +503,22 @@ services:
       #      - ::1
       #    deny: []
 
+  ## Redis Commander Web GUI
+  - name: redis-dashboard
+    _comment: 'Redis Commander: host redis.* or /redis -> http://supabase-redis-commander:8081'
+    url: http://supabase-redis-commander:8081/
+    routes:
+      - name: redis-dashboard-host
+        strip_path: false
+        hosts:
+          - ~^redis\..+$
+      - name: redis-dashboard-path
+        strip_path: true
+        paths:
+          - /redis
+    plugins:
+      - name: cors
+
   ## Protected Dashboard - catch all remaining routes
   - name: dashboard
     _comment: 'Studio: /* -> http://studio:3000/*'
