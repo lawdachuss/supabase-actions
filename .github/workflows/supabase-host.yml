@@ -842,7 +842,7 @@ jobs:
                 echo "- **CLI Command**: \`redis-cli -h ${REDIS_TCP_HOST:-bore.pub} -p ${REDIS_TCP_PORT} -a ${REDIS_PASSWORD:-Basudevkr123}\`"
                 echo ""
               fi
-              echo "- **Redis Web GUI**: [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) (credentials: \`admin\` / \`$DASHBOARD_PASSWORD\`)"
+              echo "- **Redis Web GUI**: [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) (credentials: \`redis\` / \`redis\`)"
               echo "- **Redis Internal**: \`redis:6379\` (Docker network)"
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
