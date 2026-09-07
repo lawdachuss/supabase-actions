@@ -63,7 +63,7 @@ env:
   SUPABASE_DIR: ./supabase
   # Full-state archive: DB dump + edge functions + snippets + pgsodium key
   BACKUP_FILE: ./supabase/supabase-state.tar.gz
-  COMPOSE_FILE: docker-compose.yml:docker-compose.logs.yml
+  COMPOSE_FILE: docker-compose.yml:docker-compose.logs.yml:docker-compose.redis.yml
   DOCKER_SOCKET_LOCATION: /var/run/docker.sock
 
 jobs:
@@ -115,7 +115,7 @@ jobs:
             cloudflared version
           ) &
           pip install 'ecdsa>=0.19.0' -q &
-          mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs} &
+          (mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs,redis/data} && chmod -R 777 volumes/redis/data) &
           
           # Pull Docker images in the background (runs in parallel with setup).
           # No image cache anymore — images are re-pullable and pull quickly.
@@ -175,6 +175,7 @@ jobs:
           # s3 keys no longer needed — storage service removed
           lfp = derive_b64('logflare_public', 32)
           lpv = derive_b64('logflare_private', 32)
+          redis_pass = derive_hex('redis_password', 16)
 
           # Generate ES256 P-256 key pair deterministically from JWT_SECRET
           ec_seed = hmac.new(secret.encode(), b'asymmetric_es256', hashlib.sha512).digest()[:32]
@@ -220,6 +221,7 @@ jobs:
             'JWT_JWKS=': f'JWT_JWKS={jwt_jwks}',
             'ANON_KEY_ASYMMETRIC=': f'ANON_KEY_ASYMMETRIC={anon_asymmetric}',
             'SERVICE_ROLE_KEY_ASYMMETRIC=': f'SERVICE_ROLE_KEY_ASYMMETRIC={service_asymmetric}',
+            'your-redis-password': redis_pass,
           }
           # Real SMTP (optional) — replaces the fake inbucket defaults so auth
           # confirmation/reset emails actually deliver. Leave SMTP_HOST unset
@@ -318,6 +320,10 @@ jobs:
               echo "  🗄️  DB dump: $(du -h ./backup.dump | cut -f1) — will be restored by restore_db()"
             else
               echo "  🗄️  DB dump: absent (fresh database)"
+            fi
+            if [ -f ./volumes/redis/data/dump.rdb ]; then
+              echo "  💾 Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1) — ready for redis container"
+              chmod -R 777 volumes/redis/data 2>/dev/null || true
             fi
           else
             echo "ℹ️  No state archive — fresh start"
@@ -690,6 +696,8 @@ jobs:
           else
             echo "    (vault schema not present)"
           fi
+          echo "  ⚡ redis (cache & rate-limiting):"
+          docker compose exec -T redis redis-cli ping 2>/dev/null | sed 's/^/    /' || echo "    (redis running)"
           echo "=============================================================="
 
       # ── Run Supabase (keep alive + on-disk snapshots every 5 minutes) ────

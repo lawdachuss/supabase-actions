@@ -111,6 +111,7 @@ services:
       SERVICE_ROLE_KEY_ASYMMETRIC: ${SERVICE_ROLE_KEY_ASYMMETRIC:-}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
 
   auth:
@@ -382,6 +383,8 @@ services:
       # Used by the 'logs' edge function (/api/logs) to read the Vector→Logflare
       # log pipeline stored in the separate '_supabase' database.
       LOGS_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/_supabase
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_URL: redis://default:${REDIS_PASSWORD:-}@redis:6379
       # TODO: Allow configuring VERIFY_JWT per function.
       VERIFY_JWT: "${FUNCTIONS_VERIFY_JWT}"
     command:

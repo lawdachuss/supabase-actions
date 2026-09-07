@@ -1,0 +1,39 @@
+# This override adds a Redis 7 in-memory data store to the self-hosted stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.redis.yml up -d
+#
+# Or include it in COMPOSE_FILE in .env:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.logs.yml:docker-compose.redis.yml
+#
+# Redis is available on the Docker network as 'redis:6379' to all services.
+# To connect from edge functions or your app:
+#   redis://default:${REDIS_PASSWORD}@redis:6379
+
+services:
+
+  redis:
+    container_name: supabase-redis
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - ${REDIS_PORT:-6379}:6379
+    volumes:
+      - ./volumes/redis/data:/data:z
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command:
+      [
+        "redis-server",
+        "--requirepass", "${REDIS_PASSWORD}",
+        "--maxmemory", "${REDIS_MAXMEMORY:-128mb}",
+        "--maxmemory-policy", "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}",
+        "--save", "300", "1",
+        "--save", "60", "100",
+        "--dir", "/data"
+      ]

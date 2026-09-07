@@ -10,6 +10,7 @@
 │  (anywhere)          │     │  perm URL (static)   │     │  Runner          │
 │                      │ ◀── │                      │ ◀── │  ├── Kong:8000   │
 │                      │     │                      │     │  ├── Postgres    │
+│                      │     │                      │     │  ├── Redis 7     │
 │                      │     │                      │     │  ├── Auth        │
 │                      │     │                      │     │  ├── Realtime    │
 │                      │     │                      │     │  └── Studio      │
@@ -24,6 +25,7 @@
 | Feature | Included |
 |---|---|
 | **PostgreSQL database** | ✅ Full Supabase Postgres |
+| **Redis 7 In-Memory Cache** | ✅ Cache + Kong rate-limiting backend + RDB persistence |
 | **PostgREST API** | ✅ Auto-generated REST API |
 | **Auth (GoTrue)** | ✅ Login, signup, JWT, OAuth |
 | **Realtime subscriptions** | ✅ WebSocket-based live queries |
@@ -41,8 +43,8 @@
 ## ⏱️ How It Works
 
 1. **Workflow triggers** — manually or every 6 hours via cron
-2. **Restores database** from GitHub Actions cache (your data survives)
-3. **Starts all Supabase services** via Docker Compose (Postgres, Kong, Auth, PostgREST, Realtime, Studio, Edge Functions, Supavisor, Logflare, Vector)
+2. **Restores database and Redis** from GitHub Actions cache (your data survives)
+3. **Starts all Supabase services** via Docker Compose (Postgres, Redis, Kong, Auth, PostgREST, Realtime, Studio, Edge Functions, Supavisor, Logflare, Vector)
 4. **Connects Cloudflare Tunnel** — your permanent URL goes live
 5. **Runs for ~5h30m** — access Studio, API, Auth, Realtime (maximizes the full 6-hour GitHub limit)
 6. **Snapshot every 5 minutes (on disk)** — the full state (DB + edge functions + snippets + Vault key) is refreshed continuously and **persisted to the GitHub cache at shutdown** (GitHub no longer exposes cache credentials to `run:` steps, so mid-session cache uploads aren't possible). A clean handoff between scheduled runs loses nothing; a hard-cancelled run falls back to the previous run's backup
@@ -271,6 +273,52 @@ Tokens are HS256 JWTs with service_role privileges, tracked in the database for 
 
 ```bash
 curl -H "Authorization: Bearer <token>" https://your-domain.com/rest/v1/your_table
+```
+
+## ⚡ Self-Hosted Redis 7
+
+A lightweight Redis 7 instance (`redis:7-alpine`) runs alongside the Supabase stack.
+
+### Key Capabilities
+- **Kong Rate-Limiting Backend**: Kong route rate limiting is backed by Redis instead of in-memory local policy, keeping accurate rate-limit counts.
+- **Application Cache**: Accessible on the Docker internal network by all services, Edge Functions, and backend containers.
+- **Cross-Session Persistence**: Redis `SAVE` snapshots (`dump.rdb`) are archived into `supabase-state.tar.gz` and restored automatically across GitHub Actions sessions.
+- **Interactive Shell**:
+  ```bash
+  ./run.sh redis-cli
+  ```
+- **Connection Details**:
+  - Host: `redis` (internal docker network) or `localhost` (host port)
+  - Port: `6379`
+  - Password: `${REDIS_PASSWORD}` (configured in `.env`)
+  - Connection URI: `redis://default:${REDIS_PASSWORD}@redis:6379`
+
+### 🌐 Frontend HTTP Cache API (`/functions/v1/cache`)
+
+External browser or mobile frontends can access Redis directly via HTTPS through the built-in edge function:
+
+```javascript
+// 1. Set a key (with optional TTL in seconds)
+await fetch("https://supabase.yourdomain.com/functions/v1/cache", {
+  method: "POST",
+  headers: {
+    "apikey": SUPABASE_ANON_KEY,
+    "Content-Type": "application/json"
+  },
+  body: JSON.stringify({ key: "user:123", value: { name: "Alice" }, ttl: 3600 })
+});
+
+// 2. Get a key
+const res = await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=user:123", {
+  headers: { "apikey": SUPABASE_ANON_KEY }
+});
+const data = await res.json(); // { key: "user:123", value: { name: "Alice" }, exists: true, ttl: 3599 }
+
+// 3. Delete a key
+await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=user:123", {
+  method: "DELETE",
+  headers: { "apikey": SUPABASE_ANON_KEY }
+});
 ```
 
 ### Step 6: Push & Run

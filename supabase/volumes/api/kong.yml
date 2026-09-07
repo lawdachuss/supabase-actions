@@ -51,7 +51,13 @@ services:
       - name: rate-limiting
         config:
           minute: 30
-          policy: local
+          policy: redis
+          fault_tolerant: true
+          redis_host: redis
+          redis_port: 6379
+          redis_password: $REDIS_PASSWORD
+          redis_timeout: 2000
+          redis_database: 0
   - name: auth-v1-open-callback
     _comment: 'Auth: /auth/v1/callback* -> http://auth:9999/callback*'
     url: http://auth:9999/callback
@@ -65,7 +71,13 @@ services:
       - name: rate-limiting
         config:
           minute: 30
-          policy: local
+          policy: redis
+          fault_tolerant: true
+          redis_host: redis
+          redis_port: 6379
+          redis_password: $REDIS_PASSWORD
+          redis_timeout: 2000
+          redis_database: 0
   - name: auth-v1-open-authorize
     _comment: 'Auth: /auth/v1/authorize* -> http://auth:9999/authorize*'
     url: http://auth:9999/authorize
@@ -79,7 +91,13 @@ services:
       - name: rate-limiting
         config:
           minute: 30
-          policy: local
+          policy: redis
+          fault_tolerant: true
+          redis_host: redis
+          redis_port: 6379
+          redis_password: $REDIS_PASSWORD
+          redis_timeout: 2000
+          redis_database: 0
   - name: auth-v1-open-jwks
     _comment: 'Auth: /auth/v1/.well-known/jwks.json -> http://auth:9999/.well-known/jwks.json'
     url: http://auth:9999/.well-known/jwks.json
@@ -103,7 +121,13 @@ services:
       - name: rate-limiting
         config:
           minute: 10
-          policy: local
+          policy: redis
+          fault_tolerant: true
+          redis_host: redis
+          redis_port: 6379
+          redis_password: $REDIS_PASSWORD
+          redis_timeout: 2000
+          redis_database: 0
 
   - name: auth-v1-open-sso-metadata
     url: "http://auth:9999/sso/saml/metadata"

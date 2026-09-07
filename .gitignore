@@ -9,11 +9,14 @@ Thumbs.db
 /volumes/
 /supabase/volumes/db/data/
 /supabase/volumes/storage/
+/supabase/volumes/redis/data/
 /supabase/volumes/snippets/
 /supabase/volumes/functions/*
-# The logs edge function ships with the repo (powers /api/logs)
+# The logs and cache edge functions ship with the repo
 !/supabase/volumes/functions/logs/
 !/supabase/volumes/functions/logs/*
+!/supabase/volumes/functions/cache/
+!/supabase/volumes/functions/cache/*
 
 # State archives (database dumps — contain data, never commit)
 /supabase/backup.dump

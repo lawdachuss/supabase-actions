@@ -49,10 +49,24 @@ else
   echo "  ℹ️  no pgsodium key found in db-config volume"
 fi
 
-# ── 3. Pack the full-state archive (tolerates missing pieces) ───────────
+# ── 3. Save Redis data (if redis container is running) ──────────────────
+if docker compose ps --services --filter "status=running" 2>/dev/null | grep -q "^redis$"; then
+  echo "  💾 saving Redis data..."
+  REDIS_AUTH_FLAG=""
+  if [ -n "${REDIS_PASSWORD:-}" ]; then
+    REDIS_AUTH_FLAG="-a ${REDIS_PASSWORD}"
+  fi
+  docker compose exec -T redis redis-cli $REDIS_AUTH_FLAG save > /dev/null 2>&1 || true
+  if [ -s ./volumes/redis/data/dump.rdb ]; then
+    echo "  ✅ Redis dump saved ($(du -h ./volumes/redis/data/dump.rdb | cut -f1))"
+  fi
+fi
+
+# ── 4. Pack the full-state archive (tolerates missing pieces) ───────────
 ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -s ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
 [ -s ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
+[ -d ./volumes/redis/data ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/redis/data"
 rm -f ./supabase-state.tar.gz.new
 if tar czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>/dev/null && \
    mv -f ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then

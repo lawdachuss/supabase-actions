@@ -5,7 +5,7 @@ COMPOSE_DIR="$(cd "$(dirname "$0")/supabase" && pwd)"
 cd "$COMPOSE_DIR"
 
 # Default compose files when COMPOSE_FILE env var is not set
-DEFAULT_FILES="docker-compose.yml:docker-compose.logs.yml"
+DEFAULT_FILES="docker-compose.yml:docker-compose.logs.yml:docker-compose.redis.yml"
 COMPOSE_FILE="${COMPOSE_FILE:-$DEFAULT_FILES}"
 
 # Convert colon-separated paths to -f arguments for docker compose
@@ -28,6 +28,7 @@ Commands:
   status             Show container status
   logs [service]     Show logs (optional: filter by service name)
   psql               Open interactive PostgreSQL shell
+  redis-cli          Open interactive Redis shell
   backup [dir]       Backup database to timestamped archive
   restore <file>     Restore from a backup archive
   reset              WARNING: Deletes ALL data and resets from scratch
@@ -96,6 +97,16 @@ cmd_psql() {
   local compose
   compose=$(get_compose_cmd)
   $compose -f "$COMPOSE_FILE" exec db psql -U postgres
+}
+
+cmd_redis() {
+  local compose
+  compose=$(get_compose_cmd)
+  local auth_args=()
+  if [ -n "${REDIS_PASSWORD:-}" ]; then
+    auth_args+=("-a" "$REDIS_PASSWORD")
+  fi
+  $compose -f "$COMPOSE_FILE" exec redis redis-cli "${auth_args[@]}" "$@"
 }
 
 cmd_backup() {
@@ -172,6 +183,7 @@ cmd_reset() {
 
   echo "Removing all data..."
   rm -rf volumes/db/data/*
+  rm -rf volumes/redis/data/*
   rm -rf volumes/snippets/*
   rm -rf volumes/functions/*
 
@@ -180,7 +192,8 @@ cmd_reset() {
 
 cmd_config() {
   echo "Available compose overrides (in supabase/):"
-  echo "  docker-compose.logs.yml  - Logflare analytics + Vector log pipeline"
+  echo "  docker-compose.logs.yml   - Logflare analytics + Vector log pipeline"
+  echo "  docker-compose.redis.yml  - Redis 7 in-memory cache and key-value store"
   echo ""
   echo "Usage: docker compose -f docker-compose.yml -f <override> up -d"
   echo "Or set COMPOSE_FILE in .env to include them."
@@ -194,6 +207,7 @@ case "${1:-help}" in
   status)   cmd_status ;;
   logs)     shift; cmd_logs "$@" ;;
   psql)     cmd_psql ;;
+  redis-cli|redis) shift; cmd_redis "$@" ;;
   backup)   shift; cmd_backup "$@" ;;
   restore)  shift; cmd_restore "$@" ;;
   reset)    cmd_reset ;;
