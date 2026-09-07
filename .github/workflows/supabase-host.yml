@@ -556,13 +556,24 @@ jobs:
             fi
             echo "Kong is ready on port 8000!"
             if [ -n "${{ secrets.CF_TUNNEL_TOKEN }}" ]; then
+              # Run tunnel using remotely managed token (supports multiple hostnames in Zero Trust dashboard)
               nohup cloudflared tunnel --no-autoupdate run \
-                --url http://localhost:8000 \
                 --token ${{ secrets.CF_TUNNEL_TOKEN }} \
                 > /tmp/cloudflared.log 2>&1 &
               TUNNEL_PID=$!
               echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
               echo "Cloudflare Tunnel starting..."
+              sleep 4
+              # Fallback if no ingress rules configured in Zero Trust dashboard
+              if grep -qi "no ingress rules" /tmp/cloudflared.log 2>/dev/null || ! kill -0 $TUNNEL_PID 2>/dev/null; then
+                kill $TUNNEL_PID 2>/dev/null || true
+                nohup cloudflared tunnel --no-autoupdate run \
+                  --url http://localhost:8000 \
+                  --token ${{ secrets.CF_TUNNEL_TOKEN }} \
+                  > /tmp/cloudflared.log 2>&1 &
+                TUNNEL_PID=$!
+                echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
+              fi
               for i in $(seq 1 12); do
                 sleep 5
                 if ! kill -0 $TUNNEL_PID 2>/dev/null; then
@@ -590,19 +601,36 @@ jobs:
               sleep 1
             done
             if command -v bore >/dev/null 2>&1; then
-              nohup bore local 6379 --to bore.pub > /tmp/bore.log 2>&1 &
+              # Attempt to bind permanent fixed port 26379 first
+              nohup bore local 6379 --to bore.pub --port 26379 > /tmp/bore.log 2>&1 &
               BORE_PID=$!
               echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
-              for i in $(seq 1 12); do
+              for i in $(seq 1 5); do
                 sleep 1
                 BORE_PORT=$(grep -oP 'listening at bore.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
                 if [ -n "$BORE_PORT" ]; then
-                  echo "REDIS_TCP_PORT=$BORE_PORT" >> $GITHUB_ENV
-                  echo "REDIS_TCP_HOST=bore.pub" >> $GITHUB_ENV
-                  echo "Redis TCP tunnel active at bore.pub:$BORE_PORT"
                   break
                 fi
               done
+              # If fixed port was already taken on bore.pub, fall back to any available port
+              if [ -z "$BORE_PORT" ]; then
+                kill $BORE_PID 2>/dev/null || true
+                nohup bore local 6379 --to bore.pub > /tmp/bore.log 2>&1 &
+                BORE_PID=$!
+                echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
+                for i in $(seq 1 8); do
+                  sleep 1
+                  BORE_PORT=$(grep -oP 'listening at bore.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
+                  if [ -n "$BORE_PORT" ]; then
+                    break
+                  fi
+                done
+              fi
+              if [ -n "$BORE_PORT" ]; then
+                echo "REDIS_TCP_PORT=$BORE_PORT" >> $GITHUB_ENV
+                echo "REDIS_TCP_HOST=bore.pub" >> $GITHUB_ENV
+                echo "Redis TCP tunnel active at bore.pub:$BORE_PORT"
+              fi
             fi
           }
 
@@ -759,30 +787,34 @@ jobs:
           REDIS_PASSWORD=$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')
           export REDIS_PASSWORD  # must be exported so snapshot-state.sh subprocess can use it for redis-cli auth
 
+          BASE_DOMAIN=$(echo "$DOMAIN" | sed 's/^supabase\.//')
+          REDIS_SUBDOMAIN="redis.$BASE_DOMAIN"
+
           echo ""
           echo "+=============================================================+"
           echo "|         SUPABASE IS LIVE ON GITHUB ACTIONS                  |"
           echo "+=============================================================+"
           echo "|                                                             |"
-          echo "|  Studio:    http://localhost:8000                           |"
-          echo "|  Tunnel:    Connected via Cloudflare                        |"
+          echo "|  Studio:        http://localhost:8000                       |"
+          echo "|  Tunnel:        Connected via Cloudflare                    |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
-            echo "|  Domain:    https://$DOMAIN                                   |"
-            echo "|  Cache API: https://$DOMAIN/functions/v1/cache             |"
+            echo "|  Studio Domain: https://$DOMAIN                               |"
+            echo "|  Redis Web UI:  https://$REDIS_SUBDOMAIN (port 8081)           |"
+            echo "|  Cache API:     https://$DOMAIN/functions/v1/cache         |"
           fi
           if [ -n "${REDIS_TCP_PORT:-}" ]; then
-            echo "|  Redis TCP: ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT} (direct from anywhere)       |"
+            echo "|  Redis TCP:     ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT} (or $REDIS_SUBDOMAIN)     |"
           else
-            echo "|  Redis:     redis:6379 (Docker internal network)            |"
+            echo "|  Redis:         redis:6379 (Docker internal network)        |"
           fi
-          echo "|  Snapshots: every 5 min → saved at shutdown                 |"
+          echo "|  Snapshots:     every 5 min → saved at shutdown             |"
           echo "|                                                             |"
-          echo "|  Monitor:   https://github.com/${{ github.repository }}/actions|"
-          echo "|  Badge:     https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
+          echo "|  Monitor:       https://github.com/${{ github.repository }}/actions|"
+          echo "|  Badge:         https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
           echo "|                                                             |"
-          echo "|  Runs until: $(date -d @$END_TIME '+%H:%M UTC')                 |"
-          echo "|  Auto-restart: watchman + 6h sched                          |"
-          echo "|  Remaining: $(( DURATION / 60 )) min                                     |"
+          echo "|  Runs until:    $(date -d @$END_TIME '+%H:%M UTC')             |"
+          echo "|  Auto-restart:  watchman + 6h sched                         |"
+          echo "|  Remaining:     $(( DURATION / 60 )) min                                 |"
           echo "|                                                             |"
           echo "+=============================================================+"
           echo ""
@@ -795,26 +827,28 @@ jobs:
               echo "| Service | Link / Endpoint |"
               echo "|---|---|"
               echo "| 🖥️ **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
-              echo "| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
+              echo "| ⚡ **Redis Web Dashboard** | [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) *(route to \`localhost:8081\` in CF Zero Trust)* |"
               if [ -n "${REDIS_TCP_PORT:-}" ]; then
-                echo "| ⚡ **Redis Direct TCP** | \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\` |"
+                echo "| ⚡ **Redis Direct TCP** | \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@$REDIS_SUBDOMAIN:${REDIS_TCP_PORT}\` |"
               fi
+              echo "| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
               echo "| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
               echo "| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
               echo ""
               if [ -n "${REDIS_TCP_PORT:-}" ]; then
                 echo "#### ⚡ Connect to Redis from Anywhere:"
-                echo "- **URI**: \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\`"
-                echo "- **CLI**: \`redis-cli -h ${REDIS_TCP_HOST:-bore.pub} -p ${REDIS_TCP_PORT} -a ${REDIS_PASSWORD:-Basudevkr123}\`"
-                echo "- **Host**: \`${REDIS_TCP_HOST:-bore.pub}\` | **Port**: \`${REDIS_TCP_PORT}\` | **Auth**: \`${REDIS_PASSWORD:-Basudevkr123}\`"
+                echo "- **Permanent URI**: \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@$REDIS_SUBDOMAIN:${REDIS_TCP_PORT}\` *(requires CNAME \`$REDIS_SUBDOMAIN\` → \`bore.pub\` in DNS)*"
+                echo "- **Direct Relay URI**: \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\`"
+                echo "- **CLI Command**: \`redis-cli -h ${REDIS_TCP_HOST:-bore.pub} -p ${REDIS_TCP_PORT} -a ${REDIS_PASSWORD:-Basudevkr123}\`"
                 echo ""
               fi
+              echo "- **Redis Web GUI**: [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) (credentials: \`admin\` / \`$DASHBOARD_PASSWORD\`)"
               echo "- **Redis Internal**: \`redis:6379\` (Docker network)"
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ -n "${REDIS_TCP_PORT:-}" ]; then
-            echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}"
+            echo "::notice title=🚀 Supabase & Redis Live::Studio: https://$DOMAIN | Redis Web: https://$REDIS_SUBDOMAIN | TCP: ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}"
           else
             echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
           fi
