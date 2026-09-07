@@ -176,7 +176,7 @@ jobs:
           # s3 keys no longer needed — storage service removed
           lfp = derive_b64('logflare_public', 32)
           lpv = derive_b64('logflare_private', 32)
-          redis_pass = derive_hex('redis_password', 16)
+          redis_pass = os.environ.get('REDIS_PASSWORD') or derive_hex('redis_password', 16)
 
           # Generate ES256 P-256 key pair deterministically from JWT_SECRET
           ec_seed = hmac.new(secret.encode(), b'asymmetric_es256', hashlib.sha512).digest()[:32]
@@ -223,6 +223,8 @@ jobs:
             'ANON_KEY_ASYMMETRIC=': f'ANON_KEY_ASYMMETRIC={anon_asymmetric}',
             'SERVICE_ROLE_KEY_ASYMMETRIC=': f'SERVICE_ROLE_KEY_ASYMMETRIC={service_asymmetric}',
             'your-redis-password': redis_pass,
+            'REDIS_PASSWORD=Basudevkr123': f'REDIS_PASSWORD={redis_pass}',
+            'REDIS_PASSWORD=sR7kP2mN9xQ4wL6vB3jF8tY5hD1cA0eG': f'REDIS_PASSWORD={redis_pass}',
           }
           # Real SMTP (optional) — replaces the fake inbucket defaults so auth
           # confirmation/reset emails actually deliver. Leave SMTP_HOST unset
@@ -268,6 +270,7 @@ jobs:
         env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
           # Optional real SMTP for auth emails (falls back to inbucket if unset)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
