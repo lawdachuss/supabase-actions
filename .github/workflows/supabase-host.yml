@@ -718,25 +718,31 @@ jobs:
           # 5h of data on the next restore).
           END_TIME=$(( $(date +%s) + DURATION ))
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
+          # Load generated passwords from .env so they can be shown in logs
+          set -a
+          [ -f .env ] && . .env
+          set +a
 
           echo ""
           echo "+=============================================================+"
           echo "|         SUPABASE IS LIVE ON GITHUB ACTIONS                  |"
           echo "+=============================================================+"
           echo "|                                                             |"
-          echo "|  Studio:  http://localhost:8000                             |"
-          echo "|  Tunnel:  Connected via Cloudflare                          |"
+          echo "|  Studio:    http://localhost:8000                           |"
+          echo "|  Tunnel:    Connected via Cloudflare                        |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
-            echo "|  Domain:  https://$DOMAIN                                     |"
+            echo "|  Domain:    https://$DOMAIN                                   |"
+            echo "|  Cache API: https://$DOMAIN/functions/v1/cache             |"
           fi
+          echo "|  Redis URI: redis://default:${REDIS_PASSWORD:-...}@redis:6379     |"
           echo "|  Snapshots: every 5 min → saved at shutdown                 |"
           echo "|                                                             |"
-          echo "|  Monitor: https://github.com/${{ github.repository }}/actions  |"
-          echo "|  Badge:   https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
+          echo "|  Monitor:   https://github.com/${{ github.repository }}/actions|"
+          echo "|  Badge:     https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
           echo "|                                                             |"
           echo "|  Runs until: $(date -d @$END_TIME '+%H:%M UTC')                 |"
-          echo "|  Auto-restart: watchman + 6h sched                           |"
-          echo "|  Remaining: $(( DURATION / 60 )) min                                      |"
+          echo "|  Auto-restart: watchman + 6h sched                          |"
+          echo "|  Remaining: $(( DURATION / 60 )) min                                     |"
           echo "|                                                             |"
           echo "+=============================================================+"
           echo ""
