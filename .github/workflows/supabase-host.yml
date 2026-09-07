@@ -725,10 +725,8 @@ jobs:
           # 5h of data on the next restore).
           END_TIME=$(( $(date +%s) + DURATION ))
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
-          # Load generated passwords from .env so they can be shown in logs
-          set -a
-          [ -f .env ] && . .env
-          set +a
+          # Read Redis password safely from .env without shell-evaluating JSON values
+          REDIS_PASSWORD=$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')
 
           echo ""
           echo "+=============================================================+"
