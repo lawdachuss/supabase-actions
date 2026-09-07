@@ -57,8 +57,15 @@ if docker compose ps --services --filter "status=running" 2>/dev/null | grep -q 
     REDIS_AUTH_FLAG="-a ${REDIS_PASSWORD}"
   fi
   docker compose exec -T redis redis-cli $REDIS_AUTH_FLAG save > /dev/null 2>&1 || true
-  if [ -s ./volumes/redis/data/dump.rdb ]; then
-    echo "  ✅ Redis dump saved ($(du -h ./volumes/redis/data/dump.rdb | cut -f1))"
+  # Safely copy dump.rdb via docker cp (daemon level, avoids directory lock/race)
+  if docker compose cp redis:/data/dump.rdb ./dump.rdb.new 2>/dev/null && [ -s ./dump.rdb.new ]; then
+    mv -f ./dump.rdb.new ./dump.rdb
+    chmod 644 ./dump.rdb 2>/dev/null || true
+    echo "  ✅ Redis dump saved ($(du -h ./dump.rdb | cut -f1))"
+  elif [ -s ./volumes/redis/data/dump.rdb ]; then
+    cp -f ./volumes/redis/data/dump.rdb ./dump.rdb 2>/dev/null || true
+    chmod 644 ./dump.rdb 2>/dev/null || true
+    echo "  ✅ Redis dump copied ($(du -h ./dump.rdb | cut -f1))"
   fi
 fi
 
@@ -66,14 +73,18 @@ fi
 ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -s ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
 [ -s ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
-[ -d ./volumes/redis/data ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/redis/data"
+[ -s ./dump.rdb ] && ARCHIVE_FILES="$ARCHIVE_FILES dump.rdb"
 rm -f ./supabase-state.tar.gz.new
-if tar czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>/dev/null && \
+TAR_LOG=$(mktemp)
+if tar --warning=no-file-changed -czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>"$TAR_LOG" && \
    mv -f ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
   SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)
   echo "  ✅ state archive updated ($SIZE): $ARCHIVE_FILES"
+  rm -f "$TAR_LOG"
 else
   rm -f ./supabase-state.tar.gz.new
   echo "  ⚠️  archive creation failed — previous archive preserved"
+  [ -s "$TAR_LOG" ] && sed 's/^/      /' "$TAR_LOG"
+  rm -f "$TAR_LOG"
   exit 1
 fi

@@ -322,7 +322,13 @@ jobs:
             else
               echo "  🗄️  DB dump: absent (fresh database)"
             fi
-            if [ -f ./volumes/redis/data/dump.rdb ]; then
+            if [ -f ./dump.rdb ]; then
+              echo "  💾 Redis dump: $(du -h ./dump.rdb | cut -f1) — restoring to volumes/redis/data"
+              mkdir -p volumes/redis/data
+              cp -f ./dump.rdb volumes/redis/data/dump.rdb
+              chmod -R 777 volumes/redis/data
+              rm -f ./dump.rdb
+            elif [ -f ./volumes/redis/data/dump.rdb ]; then
               echo "  💾 Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1) — ready for redis container"
               chmod -R 777 volumes/redis/data 2>/dev/null || true
             fi

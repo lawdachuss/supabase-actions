@@ -21,6 +21,8 @@ Thumbs.db
 # State archives (database dumps — contain data, never commit)
 /supabase/backup.dump
 /supabase/backup.dump.new
+/supabase/dump.rdb
+/supabase/dump.rdb.new
 /supabase/pgsodium_root.key
 /supabase/supabase-state.tar.gz
 /supabase/supabase-state.tar.gz.new
