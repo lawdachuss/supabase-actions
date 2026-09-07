@@ -964,7 +964,7 @@ jobs:
       # freshest possible archive at shutdown. Crash-safe: the previous
       # archive is never deleted before the new one is fully written.
       - name: 💾 Final state backup before shutdown
-        if: always()
+        if: "!cancelled()"
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/snapshot-state.sh || true
@@ -986,9 +986,9 @@ jobs:
       # ── Save full state archive to cache ────────────────────────────────
       # The keepalive loop writes on-disk snapshots every 5 minutes; this step
       # persists the freshest one to the Actions cache at the end of the run.
-      # Only runs if a valid, non-empty state archive exists.
+      # Only runs if NOT cancelled and a valid state archive exists on disk.
       - name: 💿 Save final state to GitHub Actions cache
-        if: always() && hashFiles(env.BACKUP_FILE) != ''
+        if: "!cancelled() && hashFiles('supabase/supabase-state.tar.gz') != ''"
         uses: actions/cache/save@v4
         with:
           path: ${{ env.BACKUP_FILE }}
