@@ -482,38 +482,23 @@ jobs:
               return
             fi
 
-            # ── Pre-clean: wipe only user schemas so pg_restore never needs to
-            # DROP auth/system tables (which postgres doesn't own → 631 errors).
-            # Drop+recreate public ourselves, then restore WITHOUT --clean.
-            echo "  🧹 Pre-cleaning public schema (user data)..."
+            # Grant postgres access to auth schema so pg_restore and migrations can access it
             docker compose exec -T db psql -U postgres -d postgres -c "
-              DROP SCHEMA IF EXISTS public CASCADE;
-              CREATE SCHEMA public;
-              GRANT ALL ON SCHEMA public TO postgres;
-              GRANT ALL ON SCHEMA public TO public;
-              GRANT ALL ON SCHEMA public TO anon;
-              GRANT ALL ON SCHEMA public TO authenticated;
-              GRANT ALL ON SCHEMA public TO service_role;
-            " 2>/dev/null || echo "  ⚠️  public schema pre-clean skipped"
-
-            # Grant postgres read access to auth schema so migrations that JOIN
-            # against auth.users (e.g. 002-backfill-user-emails.sql) succeed.
-            docker compose exec -T db psql -U postgres -d postgres -c "
-              GRANT USAGE ON SCHEMA auth TO postgres;
-              GRANT SELECT ON ALL TABLES IN SCHEMA auth TO postgres;
+              GRANT ALL ON SCHEMA auth TO postgres;
+              GRANT ALL ON ALL TABLES IN SCHEMA auth TO postgres;
+              GRANT ALL ON ALL SEQUENCES IN SCHEMA auth TO postgres;
+              GRANT ALL ON ALL ROUTINES IN SCHEMA auth TO postgres;
             " 2>/dev/null || true
 
-            # Restore WITHOUT --clean (pre-clean done above).
-            # --no-owner / --no-privileges: ownership managed by init scripts.
+            # Restore with clean and disable-triggers to ensure table structures and constraints restore cleanly
             RESTORE_LOG=$(mktemp)
             if docker compose exec -T db pg_restore -U postgres -d postgres \
-              --no-owner --no-privileges \
+              --clean --if-exists --no-owner --no-privileges --disable-triggers \
               --jobs 2 \
               /tmp/backup.dump 2>"$RESTORE_LOG"; then
               echo "✅ Database fully restored from backup"
             else
-              # pg_restore exits non-zero even for harmless system-schema notices.
-              # Only treat as real failure if public schema user data had errors.
+              # pg_restore exits non-zero for harmless system-schema notices/warnings.
               PUBLIC_ERRORS=$(grep -c "error:.*schema.*public\|error:.*table.*public" "$RESTORE_LOG" 2>/dev/null || echo 0)
               if [ "${PUBLIC_ERRORS:-0}" -gt 0 ]; then
                 echo "ERROR: pg_restore had errors in public schema:"
@@ -983,6 +968,12 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/snapshot-state.sh || true
+          # Safeguard: if archive is suspiciously small (<500KB), remove it so an aborted run never overwrites a real database in cache
+          ARCHIVE_SIZE=$(stat -c%s ${{ env.BACKUP_FILE }} 2>/dev/null || echo 0)
+          if [ "$ARCHIVE_SIZE" -lt 500000 ]; then
+            echo "⚠️ Archive is suspiciously small (${ARCHIVE_SIZE}B) — refusing to overwrite production cache!"
+            rm -f ${{ env.BACKUP_FILE }}
+          fi
 
       # ── Stop services ───────────────────────────────────────────────────
       - name: 🛑 Stop Supabase services
@@ -995,8 +986,9 @@ jobs:
       # ── Save full state archive to cache ────────────────────────────────
       # The keepalive loop writes on-disk snapshots every 5 minutes; this step
       # persists the freshest one to the Actions cache at the end of the run.
+      # Only runs if a valid, non-empty state archive exists.
       - name: 💿 Save final state to GitHub Actions cache
-        if: always()
+        if: always() && hashFiles(env.BACKUP_FILE) != ''
         uses: actions/cache/save@v4
         with:
           path: ${{ env.BACKUP_FILE }}

@@ -27,9 +27,18 @@ if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
   # and is intentionally not backed up — it's disposable and would bloat every
   # snapshot.)
   if docker compose exec -T db pg_dump -U postgres -F c -Z 6 -f /tmp/backup.dump.new postgres \
-       && docker compose cp db:/tmp/backup.dump.new ./backup.dump.new \
-       && mv -f ./backup.dump.new ./backup.dump; then
-    echo "  ✅ database dump updated ($(du -h ./backup.dump | cut -f1))"
+       && docker compose cp db:/tmp/backup.dump.new ./backup.dump.new; then
+    NEW_SIZE=$(stat -c%s ./backup.dump.new 2>/dev/null || echo 0)
+    OLD_SIZE=$(stat -c%s ./backup.dump 2>/dev/null || echo 0)
+    # Safeguard: never overwrite an existing large database backup (>1MB) with a tiny/empty dump (<500KB)
+    if [ "$OLD_SIZE" -gt 1000000 ] && [ "$NEW_SIZE" -lt 500000 ]; then
+      echo "  ⚠️  DANGER: New dump is suspiciously small (${NEW_SIZE}B vs ${OLD_SIZE}B)."
+      echo "  ⚠️  Preserving existing backup.dump (${OLD_SIZE}B) to prevent accidental data loss!"
+      rm -f ./backup.dump.new
+    else
+      mv -f ./backup.dump.new ./backup.dump
+      echo "  ✅ database dump updated ($(du -h ./backup.dump | cut -f1))"
+    fi
   else
     echo "  ⚠️  pg_dump failed — reusing previous backup.dump (if any)"
   fi
