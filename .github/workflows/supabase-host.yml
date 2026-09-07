@@ -740,7 +740,7 @@ jobs:
             echo "|  Domain:    https://$DOMAIN                                   |"
             echo "|  Cache API: https://$DOMAIN/functions/v1/cache             |"
           fi
-          echo "|  Redis URI: redis://default:${REDIS_PASSWORD:-...}@redis:6379     |"
+          echo "|  Redis:     redis:6379 (password → REDIS_PASSWORD in .env)         |"
           echo "|  Snapshots: every 5 min → saved at shutdown                 |"
           echo "|                                                             |"
           echo "|  Monitor:   https://github.com/${{ github.repository }}/actions|"
@@ -765,7 +765,7 @@ jobs:
               echo "| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
               echo "| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
               echo ""
-              echo "- **Redis URI**: \`redis://default:${REDIS_PASSWORD:-...}@redis:6379\`"
+              echo "- **Redis**: \`redis:6379\` (internal Docker network — password is \`REDIS_PASSWORD\` in \`.env\`)"
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
