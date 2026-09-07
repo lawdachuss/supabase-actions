@@ -127,8 +127,9 @@ jobs:
           # PHASE 2: Configure .env (fast — ~3s)
           # ══════════════════════════════════════════════════════════════
           cp .env.example .env
-          if [ -n "${{ secrets.CF_TUNNEL_DOMAIN }}" ]; then
-            export PUBLIC_URL="https://${{ secrets.CF_TUNNEL_DOMAIN }}"
+          CF_DOMAIN="${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}"
+          if [ -n "$CF_DOMAIN" ]; then
+            export PUBLIC_URL="https://$CF_DOMAIN"
           else
             export PUBLIC_URL="http://localhost:8000"
           fi
@@ -707,7 +708,7 @@ jobs:
       # env vars to run: steps, so mid-session uploads are not possible).
       - name: ⏱️  Supabase is LIVE (auto-snapshot every 5 min)
         env:
-          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+          TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
@@ -746,6 +747,24 @@ jobs:
           echo "|                                                             |"
           echo "+=============================================================+"
           echo ""
+
+          # Write clickable links directly to GitHub Actions Run Summary
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            cat <<EOF >> "$GITHUB_STEP_SUMMARY"
+### 🚀 Supabase & Redis are LIVE!
+
+| Service | Link / Endpoint |
+|---|---|
+| 🖥️ **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |
+| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |
+| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |
+| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |
+
+- **Redis URI**: \`redis://default:${REDIS_PASSWORD:-...}@redis:6379\`
+- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')
+EOF
+          fi
+          echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
 
           # ── Keepalive loop + health checks + 5-min on-disk snapshots ──
           # (run_id/run_attempt are used by the final cache-save step's key)
@@ -854,7 +873,7 @@ jobs:
       - name: 📋 Log session summary
         if: always()
         env:
-          TUNNEL_DOMAIN: ${{ secrets.CF_TUNNEL_DOMAIN }}
+          TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           GH_TOKEN: ${{ github.token }}
         run: |
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
