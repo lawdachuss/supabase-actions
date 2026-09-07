@@ -108,10 +108,12 @@ jobs:
           # PHASE 1: Prepare dependencies (parallel background jobs)
           # ══════════════════════════════════════════════════════════════
           (
-            # Download cloudflared
+            # Download cloudflared & bore (TCP tunnel for Redis)
             curl -sL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
               -o /usr/local/bin/cloudflared &&
             chmod +x /usr/local/bin/cloudflared &&
+            curl -sL --retry 3 https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /usr/local/bin &&
+            chmod +x /usr/local/bin/bore &&
             cloudflared version
           ) &
           pip install 'ecdsa>=0.19.0' -q &
@@ -580,8 +582,33 @@ jobs:
             fi
           }
 
+          start_redis_tunnel() {
+            for i in $(seq 1 30); do
+              if docker compose exec -T redis redis-cli ping >/dev/null 2>&1; then
+                break
+              fi
+              sleep 1
+            done
+            if command -v bore >/dev/null 2>&1; then
+              nohup bore local 6379 --to bore.pub > /tmp/bore.log 2>&1 &
+              BORE_PID=$!
+              echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
+              for i in $(seq 1 12); do
+                sleep 1
+                BORE_PORT=$(grep -oP 'listening at bore.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
+                if [ -n "$BORE_PORT" ]; then
+                  echo "REDIS_TCP_PORT=$BORE_PORT" >> $GITHUB_ENV
+                  echo "REDIS_TCP_HOST=bore.pub" >> $GITHUB_ENV
+                  echo "Redis TCP tunnel active at bore.pub:$BORE_PORT"
+                  break
+                fi
+              done
+            fi
+          }
+
           restore_db &
           start_tunnel &
+          start_redis_tunnel &
           wait
 
           # FIX: supavisor (pooler) crash-loops at boot — it starts while the
@@ -743,7 +770,11 @@ jobs:
             echo "|  Domain:    https://$DOMAIN                                   |"
             echo "|  Cache API: https://$DOMAIN/functions/v1/cache             |"
           fi
-          echo "|  Redis:     redis:6379 (password → REDIS_PASSWORD in .env)         |"
+          if [ -n "${REDIS_TCP_PORT:-}" ]; then
+            echo "|  Redis TCP: ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT} (direct from anywhere)       |"
+          else
+            echo "|  Redis:     redis:6379 (Docker internal network)            |"
+          fi
           echo "|  Snapshots: every 5 min → saved at shutdown                 |"
           echo "|                                                             |"
           echo "|  Monitor:   https://github.com/${{ github.repository }}/actions|"
@@ -765,14 +796,28 @@ jobs:
               echo "|---|---|"
               echo "| 🖥️ **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
               echo "| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
+              if [ -n "${REDIS_TCP_PORT:-}" ]; then
+                echo "| ⚡ **Redis Direct TCP** | \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\` |"
+              fi
               echo "| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
               echo "| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
               echo ""
-              echo "- **Redis**: \`redis:6379\` (internal Docker network — password is \`REDIS_PASSWORD\` in \`.env\`)"
+              if [ -n "${REDIS_TCP_PORT:-}" ]; then
+                echo "#### ⚡ Connect to Redis from Anywhere:"
+                echo "- **URI**: \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\`"
+                echo "- **CLI**: \`redis-cli -h ${REDIS_TCP_HOST:-bore.pub} -p ${REDIS_TCP_PORT} -a ${REDIS_PASSWORD:-Basudevkr123}\`"
+                echo "- **Host**: \`${REDIS_TCP_HOST:-bore.pub}\` | **Port**: \`${REDIS_TCP_PORT}\` | **Auth**: \`${REDIS_PASSWORD:-Basudevkr123}\`"
+                echo ""
+              fi
+              echo "- **Redis Internal**: \`redis:6379\` (Docker network)"
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
+          if [ -n "${REDIS_TCP_PORT:-}" ]; then
+            echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}"
+          else
+            echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
+          fi
 
           # ── Keepalive loop + health checks + 5-min on-disk snapshots ──
           # (run_id/run_attempt are used by the final cache-save step's key)
@@ -830,6 +875,11 @@ jobs:
                 FAILS=0
                 REMAINING=$(( (END_TIME - NOW) / 60 ))
                 echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining | snapshots: $SNAPSHOTS"
+                if [ -n "${BORE_PID:-}" ] && ! kill -0 "$BORE_PID" 2>/dev/null; then
+                  echo "  ⚠️ bore process exited — restarting Redis tunnel..."
+                  nohup bore local 6379 --to bore.pub > /tmp/bore.log 2>&1 &
+                  BORE_PID=$!
+                fi
               else
                 FAILS=$((FAILS + 1))
                 echo "$(date '+%H:%M:%S') -- Health check failed ($FAILS/3 consecutive)"
