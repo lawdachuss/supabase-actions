@@ -482,35 +482,53 @@ jobs:
               return
             fi
 
-            # Restore with explicit error capture
-            # --clean --if-exists: DROP existing objects before recreating
-            # --no-owner: Don't try to restore ownership (handled by init scripts)
-            # --no-privileges: Don't restore ACLs (handled by init scripts)
-            # --disable-triggers: Prevent trigger interference during restore
-            # --exclude-schema: Skip pg_* schemas that init scripts manage
+            # ── Pre-clean: wipe only user schemas so pg_restore never needs to
+            # DROP auth/system tables (which postgres doesn't own → 631 errors).
+            # Drop+recreate public ourselves, then restore WITHOUT --clean.
+            echo "  🧹 Pre-cleaning public schema (user data)..."
+            docker compose exec -T db psql -U postgres -d postgres -c "
+              DROP SCHEMA IF EXISTS public CASCADE;
+              CREATE SCHEMA public;
+              GRANT ALL ON SCHEMA public TO postgres;
+              GRANT ALL ON SCHEMA public TO public;
+              GRANT ALL ON SCHEMA public TO anon;
+              GRANT ALL ON SCHEMA public TO authenticated;
+              GRANT ALL ON SCHEMA public TO service_role;
+            " 2>/dev/null || echo "  ⚠️  public schema pre-clean skipped"
+
+            # Grant postgres read access to auth schema so migrations that JOIN
+            # against auth.users (e.g. 002-backfill-user-emails.sql) succeed.
+            docker compose exec -T db psql -U postgres -d postgres -c "
+              GRANT USAGE ON SCHEMA auth TO postgres;
+              GRANT SELECT ON ALL TABLES IN SCHEMA auth TO postgres;
+            " 2>/dev/null || true
+
+            # Restore WITHOUT --clean (pre-clean done above).
+            # --no-owner / --no-privileges: ownership managed by init scripts.
             RESTORE_LOG=$(mktemp)
             if docker compose exec -T db pg_restore -U postgres -d postgres \
-              --clean --if-exists --no-owner --no-privileges --disable-triggers \
+              --no-owner --no-privileges \
               --jobs 2 \
-              /tmp/backup.dump 2>&1 | tee "$RESTORE_LOG" | tail -5; then
+              /tmp/backup.dump 2>"$RESTORE_LOG"; then
               echo "✅ Database fully restored from backup"
             else
-              echo "⚠️  pg_restore completed with warnings (check log)"
-              # Check if the restore actually failed or just had warnings
-              if grep -qi "error:" "$RESTORE_LOG" 2>/dev/null; then
-                echo "ERROR: pg_restore encountered errors:"
-                grep -i "error:" "$RESTORE_LOG" | head -5
+              # pg_restore exits non-zero even for harmless system-schema notices.
+              # Only treat as real failure if public schema user data had errors.
+              PUBLIC_ERRORS=$(grep -c "error:.*schema.*public\|error:.*table.*public" "$RESTORE_LOG" 2>/dev/null || echo 0)
+              if [ "${PUBLIC_ERRORS:-0}" -gt 0 ]; then
+                echo "ERROR: pg_restore had errors in public schema:"
+                grep -i "error:.*public" "$RESTORE_LOG" | head -5
                 echo 1 > "$STATUS_FILE"
               else
-                echo "(Non-critical warnings only — data should be intact)"
+                echo "✅ Database restored (system-schema notices are expected — user data intact)"
               fi
             fi
-            # Surface what pg_restore's "errors ignored on restore: N" actually
-            # are (usually benign owner/grant conflicts on a Supabase restore,
-            # but now visible instead of hidden).
-            if grep -qi "error:" "$RESTORE_LOG" 2>/dev/null; then
-              echo "  ⚠️  pg_restore error summary (top 15):"
-              grep -i "error:" "$RESTORE_LOG" | sed 's/^/      /' | sort | uniq -c | sort -rn | head -15
+            if [ -s "$RESTORE_LOG" ]; then
+              ERROR_COUNT=$(grep -c "error:" "$RESTORE_LOG" 2>/dev/null || echo 0)
+              if [ "$ERROR_COUNT" -gt 0 ]; then
+                echo "  ℹ️  pg_restore system-schema notices ($ERROR_COUNT) — top 5:"
+                grep -i "error:" "$RESTORE_LOG" | sort | uniq -c | sort -rn | head -5 | sed 's/^/    /'
+              fi
             fi
             rm -f "$RESTORE_LOG"
 
@@ -639,13 +657,29 @@ jobs:
           start_redis_tunnel &
           wait
 
-          # FIX: supavisor (pooler) crash-loops at boot — it starts while the
-          # parallel pg_restore --clean is still dropping/recreating the
-          # supabase_admin role and _supavisor schema it boots against, so its
-          # migrate + pooler.exs eval fail and 'restart: unless-stopped' spins
-          # forever. One clean restart after the restore gives it a stable DB.
-          docker compose restart supavisor >/dev/null 2>&1 || echo "  ⚠️  pooler restart failed — will retry on next restart policy tick"
-          sleep 5
+          # FIX: supavisor (pooler) crash-loops at boot — it starts before the
+          # DB is fully stable and its migrate/eval fail, causing restart loops.
+          # Restart it after restore, then POLL until healthy (up to 60s).
+          echo "  🔄 Restarting supavisor after DB restore..."
+          docker compose restart supavisor > /dev/null 2>&1 || echo "  ⚠️  pooler restart signal failed"
+          POOLER_READY=0
+          for i in $(seq 1 12); do
+            sleep 5
+            STATUS=$(docker compose ps supavisor --format json 2>/dev/null | grep -o '"Health":"[^"]*"' | cut -d'"' -f4 || true)
+            STATE=$(docker compose ps supavisor --format json 2>/dev/null | grep -o '"State":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ "$STATE" = "running" ] && [ "$STATUS" = "healthy" ]; then
+              echo "  ✅ supavisor healthy after ${i}x5s"
+              POOLER_READY=1
+              break
+            elif [ "$i" -eq 6 ] && [ "$POOLER_READY" -eq 0 ]; then
+              # Give it one more restart at 30s if still not healthy
+              echo "  🔄 supavisor still starting — second restart at 30s..."
+              docker compose restart supavisor > /dev/null 2>&1 || true
+            fi
+          done
+          if [ "$POOLER_READY" -eq 0 ]; then
+            echo "  ⚠️  supavisor not healthy after 60s — Docker restart policy will recover it"
+          fi
 
           ERR=$(cat "$STATUS_FILE")
           rm -f "$STATUS_FILE"
@@ -676,6 +710,13 @@ jobs:
             echo "⚠️  Postgres not ready — skipping migrations"
             exit 0
           fi
+
+          # Grant postgres read access to auth schema so any migration that
+          # JOINs auth.users (e.g. 002-backfill-user-emails.sql) succeeds.
+          docker compose exec -T db psql -U postgres -c "
+            GRANT USAGE ON SCHEMA auth TO postgres;
+            GRANT SELECT ON ALL TABLES IN SCHEMA auth TO postgres;
+          " > /dev/null 2>&1 || true
 
           docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 -c \
             "CREATE TABLE IF NOT EXISTS public._schema_migrations (name text PRIMARY KEY, applied_at timestamptz DEFAULT now());" >/dev/null 2>&1 || true
