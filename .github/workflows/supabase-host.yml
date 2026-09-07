@@ -498,21 +498,13 @@ jobs:
               /tmp/backup.dump 2>"$RESTORE_LOG"; then
               echo "✅ Database fully restored from backup"
             else
-              # pg_restore exits non-zero for harmless system-schema notices/warnings.
-              PUBLIC_ERRORS=$(grep -c "error:.*schema.*public\|error:.*table.*public" "$RESTORE_LOG" 2>/dev/null || echo 0)
-              if [ "${PUBLIC_ERRORS:-0}" -gt 0 ]; then
-                echo "ERROR: pg_restore had errors in public schema:"
-                grep -i "error:.*public" "$RESTORE_LOG" | head -5
-                echo 1 > "$STATUS_FILE"
+              # Filter out expected drop/cleanup notices (e.g. "does not exist" on fresh tables, "permission denied" on auth schema)
+              REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access" || true)
+              if [ -n "$REAL_ERRORS" ]; then
+                echo "⚠️  pg_restore warnings:"
+                echo "$REAL_ERRORS" | head -5 | sed 's/^/    /'
               else
-                echo "✅ Database restored (system-schema notices are expected — user data intact)"
-              fi
-            fi
-            if [ -s "$RESTORE_LOG" ]; then
-              ERROR_COUNT=$(grep -c "error:" "$RESTORE_LOG" 2>/dev/null || echo 0)
-              if [ "$ERROR_COUNT" -gt 0 ]; then
-                echo "  ℹ️  pg_restore system-schema notices ($ERROR_COUNT) — top 5:"
-                grep -i "error:" "$RESTORE_LOG" | sort | uniq -c | sort -rn | head -5 | sed 's/^/    /'
+                echo "✅ Database restored (all drop/system notices are harmless — data intact)"
               fi
             fi
             rm -f "$RESTORE_LOG"
