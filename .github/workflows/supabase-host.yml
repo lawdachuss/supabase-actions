@@ -727,6 +727,7 @@ jobs:
           DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
           # Read Redis password safely from .env without shell-evaluating JSON values
           REDIS_PASSWORD=$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')
+          export REDIS_PASSWORD  # must be exported so snapshot-state.sh subprocess can use it for redis-cli auth
 
           echo ""
           echo "+=============================================================+"
