@@ -264,6 +264,79 @@ ensure_registration_open() {
   fi
 }
 
+seed_admin() {
+  # Deterministic first admin: bootstrapping through the web registration form
+  # is rate-limited and easy to flake on, so when the restored DB has no users
+  # yet we seed one directly in Postgres (bcrypt via pgcrypto — no php/htpasswd
+  # needed on the runner). Schema is introspected to survive Coolify version
+  # drift; any failure is non-fatal (open registration stays as the fallback).
+  if ! docker exec coolify-db psql -U coolify -d coolify -t -A -c \
+      "SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('public.teams') IS NOT NULL AND to_regclass('public.team_user') IS NOT NULL;" 2>/dev/null | grep -q t; then
+    echo "  ⚠️  users/teams schema not present yet — admin seeding skipped"
+    return 0
+  fi
+  local n
+  n="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | head -1 | tr -d ' \r')"
+  if [ "$n" != "0" ]; then
+    echo "  👤 existing users ($n) — admin seeding skipped"
+    return 0
+  fi
+
+  local name email pw
+  name="$(env_value COOLIFY_ADMIN_NAME)";      [ -z "$name" ] && name="Test Admin"
+  email="$(env_value COOLIFY_ADMIN_EMAIL)";    [ -z "$email" ] && email="admin@chuglii.in"
+  pw="$(env_value COOLIFY_ADMIN_PASSWORD)";    [ -z "$pw" ] && pw="Chuglii.Co!Admin#2026"
+
+  local q c
+  local teams_owner="" teams_ownerv="" teams_personal="" teams_personalv=""
+  local tu_role="" tu_rolev=""
+  q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='teams' AND column_name='user_id';"
+  c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
+  [ "$c" = "1" ] && { teams_owner=" ,user_id"; teams_ownerv=" ,__UID__"; }
+  q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='teams' AND column_name='personal_team';"
+  c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
+  [ "$c" = "1" ] && { teams_personal=" ,personal_team"; teams_personalv=" ,true"; }
+  q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='team_user' AND column_name='role';"
+  c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
+  [ "$c" = "1" ] && { tu_role=" ,role"; tu_rolev=" ,'admin'"; }
+
+  local sql
+  sql=$(cat <<'SQL'
+DO $do$
+DECLARE
+  u_id bigint;
+  t_id bigint;
+BEGIN
+  CREATE EXTENSION IF NOT EXISTS pgcrypto;
+  INSERT INTO users (name,email,password,email_verified_at,created_at,updated_at)
+    VALUES ('__NAME__','__EMAIL__',crypt('__PW__',gen_salt('bf')),now(),now(),now())
+    RETURNING id INTO u_id;
+  INSERT INTO teams (name__T_OWNER____T_PERS__ ,created_at,updated_at)
+    VALUES ('__NAME__'__T_OWNERV____T_PERSV__ ,now(),now())
+    RETURNING id INTO t_id;
+  UPDATE users SET current_team_id=t_id WHERE id=u_id;
+  INSERT INTO team_user (team_id,user_id__TU_ROLE__,created_at,updated_at)
+    VALUES (t_id,u_id__TU_ROLEV__,now(),now());
+  RAISE NOTICE 'Coolify admin seeded (user %)', u_id;
+END
+$do$;
+SQL
+)
+  sql="${sql//__NAME__/$name}"
+  sql="${sql//__EMAIL__/$email}"
+  sql="${sql//__PW__/$pw}"
+  sql="${sql//__T_OWNER__/$teams_owner}";  sql="${sql//__T_OWNERV__/$teams_ownerv}"
+  sql="${sql//__T_PERS__/$teams_personal}"; sql="${sql//__T_PERSV__/$teams_personalv}"
+  sql="${sql//__TU_ROLE__/$tu_role}";       sql="${sql//__TU_ROLEV__/$tu_rolev}"
+
+  if docker exec coolify-db psql -U coolify -d coolify -v ON_ERROR_STOP=1 -c "$sql" >/dev/null 2>&1; then
+    n="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | head -1 | tr -d ' \r')"
+    echo "  ✅ admin seeded: $name <$email> ($n user(s) now) — login: $email / $pw"
+  else
+    echo "  ⚠️  admin seeding failed (schema drift?) — web registration remains available"
+  fi
+}
+
 start() {
   prep
 
@@ -352,6 +425,9 @@ start() {
   # Coolify disables open registration after the first user; the setting is
   # stored in the restored DB, so re-allow user signup on every restore.
   ensure_registration_open || true
+
+  # First admin (web registration is rate-limited): seed when no users exist.
+  seed_admin || true
 
   local app_url root_pass
   app_url="$(env_value COOLIFY_APP_URL)"
