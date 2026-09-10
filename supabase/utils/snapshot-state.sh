@@ -119,6 +119,12 @@ ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -s ./coolify_backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES coolify_backup.dump"
 [ -s ./volumes/coolify/source/.env ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/source/.env"
 [ -d ./volumes/coolify/ssh ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/ssh"
+# Coolify's on-disk state for projects/apps (generated compose files etc.) — so
+# a restored session has byte-identical configs for the auto-redeploy pass.
+[ -d ./volumes/coolify/applications ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/applications"
+[ -d ./volumes/coolify/databases ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/databases"
+[ -d ./volumes/coolify/services ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/services"
+[ -d ./volumes/coolify/backups ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/backups"
 rm -f ./supabase-state.tar.gz.new
 TAR_LOG=$(mktemp)
 if tar --warning=no-file-changed -czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>"$TAR_LOG" && \

@@ -204,6 +204,46 @@ pull() {
   echo "🐳 Image pull finished."
 }
 
+redeploy_apps() {
+  # A fresh GitHub Actions session is a brand-new VM: the Coolify metadata DB,
+  # SSH keys and per-app configs survive (restored from the archive), but the
+  # deployed containers, images and their volumes do NOT. So after the DB is
+  # restored and Coolify is healthy, fire each stored application's Deploy
+  # Webhook to bring it back. Apps without a "Deploy Webhook" enabled in the
+  # Coolify UI are skipped (endpoint 404s) and stay visible-but-stopped.
+  # Best-effort only — never fails the session. Opt out: COOLIFY_AUTO_REDEPLOY=0
+  local base_url
+  base_url="$(env_value COOLIFY_APP_URL)"
+  [ -n "$base_url" ] || base_url="http://127.0.0.1:${COOLIFY_PORT}"
+  if [ "${COOLIFY_AUTO_REDEPLOY:-1}" = "1" ]; then
+    echo "🐳 Redeploying previously-deployed Coolify applications (fresh VM)..."
+  else
+    echo "  ℹ️  auto-redeploy disabled (COOLIFY_AUTO_REDEPLOY=0) — apps stay stopped"
+    return 0
+  fi
+
+  local uuids u
+  uuids="$(docker exec coolify-db psql -U coolify -d coolify -t -A \
+    -c "SELECT uuid FROM applications;" 2>/dev/null || true)"
+  uuids="$(printf '%s\n' "$uuids" | grep -E '^[0-9a-f-]{36}$' || true)"
+  [ -z "$uuids" ] && { echo "  🎯 no applications stored in Coolify yet — nothing to redeploy"; return 0; }
+
+  echo "  🎯 ${base_url%/}/deploy webhook ..."
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -X POST \
+      "${base_url%/}/deploy?uuid=$u" 2>/dev/null || echo 000)"
+    case "$code" in
+      200|201|202|204|302) echo "  ✅ queued redeploy for $u (HTTP $code)" ;;
+      404) echo "  ⏭️  $u has no Deploy Webhook enabled (enable it in the app's settings for auto-redeploy)" ;;
+      *) echo "  ⚠️  deploy webhook for $u returned HTTP $code" ;;
+    esac
+  done <<EOF
+$uuids
+EOF
+}
+
 start() {
   prep
 
@@ -278,6 +318,10 @@ start() {
     "${COMPOSE_CMD[@]}" logs --tail 100 coolify 2>/dev/null | tail -100 || true
     return 1
   fi
+
+  # On a fresh VM, previously-deployed apps exist in the restored Coolify DB but
+  # nothing is running — bring them back via their Deploy Webhooks (best-effort).
+  redeploy_apps || true
 
   local app_url root_pass
   app_url="$(env_value COOLIFY_APP_URL)"
