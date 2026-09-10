@@ -288,22 +288,24 @@ jobs:
       # ── Wire off-site backup creds (Cloudflare KV) into .env ───────────
       # The keepalive loop pushes every state archive to Workers KV after each
       # snapshot (see snapshot-state.sh); the restore step below pulls it back
-      # if the local/cache archive is ever lost. Appended only once (idempotent
-      # across runs); token stays empty if the secret is unset (backup skips).
+      # if the local/cache archive is ever lost. Overwritten on EVERY run so a
+      # token added/changed in secrets takes effect on the next run (an empty
+      # or stale value can never get stuck in .env).
       - name: ☁️ Wire Cloudflare backup creds
         env:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_BACKUP_TOKEN }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          if ! grep -q '^CF_API_TOKEN=' .env 2>/dev/null; then
-            {
-              echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
-              echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
-              echo "CF_API_TOKEN=${CF_API_TOKEN}"
-            } >> .env
-            echo "☁️  Cloudflare backup wired into .env"
+          sed -i -E '/^CF_(ACCOUNT_ID|KV_NAMESPACE_ID|API_TOKEN)=/d' .env 2>/dev/null || true
+          {
+            echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
+            echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
+            echo "CF_API_TOKEN=${CF_API_TOKEN}"
+          } >> .env
+          if [ -n "${CF_API_TOKEN}" ]; then
+            echo "☁️  Cloudflare backup token configured"
           else
-            echo "☁️  Cloudflare backup already configured"
+            echo "☁️  Cloudflare backup NOT configured (secret missing — backups skip)"
           fi
 
       # ── Restore full state (functions, snippets, pgsodium key) ──────────
