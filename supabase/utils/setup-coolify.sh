@@ -339,6 +339,12 @@ start() {
     return 1
   fi
 
+  # The container's bind-mounted dirs (ssh/keys, ssh/mux) are owned by the
+  # container user and unreadable by the runner user — which made the state
+  # archive never rebuild (tar aborts). Normalize perms now that the container
+  # has booted, so snapshots can pack them.
+  sudo -n chmod -R a+rX "$COOLIFY_DIR" 2>/dev/null || chmod -R a+rX "$COOLIFY_DIR" 2>/dev/null || true
+
   # On a fresh VM, previously-deployed apps exist in the restored Coolify DB but
   # nothing is running — bring them back via their Deploy Webhooks (best-effort).
   redeploy_apps || true

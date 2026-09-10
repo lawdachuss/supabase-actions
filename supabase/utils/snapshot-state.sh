@@ -125,9 +125,18 @@ ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -d ./volumes/coolify/databases ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/databases"
 [ -d ./volumes/coolify/services ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/services"
 [ -d ./volumes/coolify/backups ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/backups"
+
+# Coolify's container writes bind-mounted dirs (ssh/keys, ssh/mux) as ITS OWN
+# user, which the runner user cannot read — that makes tar abort and the state
+# archive go permanently stale (users/deployments never persist, KV never
+# updates). Normalize permissions before packing, and never let an unreadable
+# entry abort the archive. The transient ssh/mux sockets are excluded.
+sudo -n chmod -R a+rX ./volumes/coolify 2>/dev/null || chmod -R a+rX ./volumes/coolify 2>/dev/null || true
+
 rm -f ./supabase-state.tar.gz.new
 TAR_LOG=$(mktemp)
-if tar --warning=no-file-changed -czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>"$TAR_LOG" && \
+if tar --warning=no-file-changed --ignore-failed-read --exclude='./volumes/coolify/ssh/mux/*' \
+   -czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>"$TAR_LOG" && \
    mv -f ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
   SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)
   echo "  ✅ state archive updated ($SIZE): $ARCHIVE_FILES"
