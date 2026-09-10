@@ -37,7 +37,11 @@ CF_ENV="$BASE_DIR/.env"
 
 CHUNK_BYTES=$((24 * 1024 * 1024))   # 24 MiB (KV hard limit is 25 MiB)
 KEEP_ARCHIVES=1                      # generations kept under archive/ (oldest pruned)
-MIN_PUSH_BYTES=500000                # refuse to push a suspiciously-tiny "archive"
+MIN_PUSH_BYTES=30000                     # floor: anything this small is an empty/aborted dump
+# (A healthy Supabase DB dump is normally far above this; snapshot-state.sh keeps the last
+# good dump around and guards its own tiny-dump clobbering, so a sub-30KB full archive is
+# near-certainly empty. The 500KB guard we started with wrongly suppressed legitimately
+# small-but-valid databases.)
 
 CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 CF_KV_NAMESPACE_ID="${CF_KV_NAMESPACE_ID:-}"
