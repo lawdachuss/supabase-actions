@@ -291,19 +291,48 @@ jobs:
       # if the local/cache archive is ever lost. Overwritten on EVERY run so a
       # token added/changed in secrets takes effect on the next run (an empty
       # or stale value can never get stuck in .env).
+      #
+      # CLOUDFLARE_BACKUP_TOKEN can be either:
+      #   * a permanent account API token (create in the dashboard, scoped to
+      #     "Workers KV Storage: Edit") — used as-is, or
+      #   * an OAuth refresh token starting with "cfor" (from `wrangler login`)
+      #     — the runner mints a short-lived access token here and the
+      #     keepalive auto-refreshes it again whenever a push gets 401.
       - name: ☁️ Wire Cloudflare backup creds
         env:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_BACKUP_TOKEN }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          sed -i -E '/^CF_(ACCOUNT_ID|KV_NAMESPACE_ID|API_TOKEN)=/d' .env 2>/dev/null || true
-          {
-            echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
-            echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
-            echo "CF_API_TOKEN=${CF_API_TOKEN}"
-          } >> .env
+          sed -i -E '/^CF_(ACCOUNT_ID|KV_NAMESPACE_ID|API_TOKEN|REFRESH_TOKEN)=/d' .env 2>/dev/null || true
           if [ -n "${CF_API_TOKEN}" ]; then
-            echo "☁️  Cloudflare backup token configured"
+            case "${CF_API_TOKEN}" in
+              cfor*)
+                RESP=$(curl -sS --max-time 20 -X POST "https://dash.cloudflare.com/oauth2/token" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  --data "grant_type=refresh_token&refresh_token=${CF_API_TOKEN}&client_id=54d11594-84e4-41aa-b438-e81b8fa78ee7")
+                AT=$(printf '%s' "$RESP" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+                RT=$(printf '%s' "$RESP" | sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p')
+                {
+                  echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
+                  echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
+                  echo "CF_API_TOKEN=${AT}"
+                  [ -n "$RT" ] && echo "CF_REFRESH_TOKEN=${RT}" || true
+                } >> .env
+                if [ -n "$AT" ]; then
+                  echo "☁️  Cloudflare backup creds minted from OAuth refresh token (1h access, auto-refreshes on 401)"
+                else
+                  echo "☁️  Cloudflare refresh attempt failed — Cloudflare backups skip this run"
+                fi
+                ;;
+              *)
+                {
+                  echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
+                  echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
+                  echo "CF_API_TOKEN=${CF_API_TOKEN}"
+                } >> .env
+                echo "☁️  Cloudflare backup token configured"
+                ;;
+            esac
           else
             echo "☁️  Cloudflare backup NOT configured (secret missing — backups skip)"
           fi

@@ -46,6 +46,13 @@ MIN_PUSH_BYTES=30000                     # floor: anything this small is an empt
 CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 CF_KV_NAMESPACE_ID="${CF_KV_NAMESPACE_ID:-}"
 CF_API_TOKEN="${CF_API_TOKEN:-}"
+CF_REFRESH_TOKEN="${CF_REFRESH_TOKEN:-}"
+
+# Wrangler OAuth app (public client, used by `wrangler login`) — lets us renew
+# the short-lived access token from the long-lived refresh token. Cloudflare's
+# token endpoint also accepts Basic auth w/ client_id:client_secret, but this
+# OAuth client is public so body-only is enough (matches wrangler's own code).
+CF_OAUTH_CLIENT_ID="54d11594-84e4-41aa-b438-e81b8fa78ee7"
 
 # ---------------------------------------------------------------------------
 load_cfg() {
@@ -53,7 +60,40 @@ load_cfg() {
     CF_ACCOUNT_ID="$(grep -E '^CF_ACCOUNT_ID=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
     CF_KV_NAMESPACE_ID="$(grep -E '^CF_KV_NAMESPACE_ID=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
     CF_API_TOKEN="$(grep -E '^CF_API_TOKEN=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+    CF_REFRESH_TOKEN="$(grep -E '^CF_REFRESH_TOKEN=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
   fi
+}
+
+# Renew the OAuth access token from CF_REFRESH_TOKEN; rotates the refresh token
+# too (Cloudflare refresh tokens are single-use) and persists both to .env so
+# later snapshots and sibling processes stay in sync.
+cf_refresh_token() {
+  [ -n "$CF_REFRESH_TOKEN" ] || return 1
+  local resp at rt
+  resp="$(curl -sS --max-time 20 -X POST "https://dash.cloudflare.com/oauth2/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data "grant_type=refresh_token&refresh_token=$CF_REFRESH_TOKEN&client_id=$CF_OAUTH_CLIENT_ID")"
+  at="$(printf '%s' "$resp" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')"
+  [ -n "$at" ] || return 1
+  rt="$(printf '%s' "$resp" | sed -n 's/.*"refresh_token":"\([^"]*\)".*/\1/p')"
+  CF_API_TOKEN="$at"
+  if [ -f "$CF_ENV" ]; then
+    sed -i -E '/^CF_API_TOKEN=/d; /^CF_REFRESH_TOKEN=/d' "$CF_ENV" 2>/dev/null || true
+    {
+      echo "CF_API_TOKEN=$at"
+      [ -n "$rt" ] && echo "CF_REFRESH_TOKEN=$rt"
+    } >> "$CF_ENV"
+  fi
+  echo "  ☁️  Cloudflare OAuth access token refreshed (~1h)"
+  return 0
+}
+
+# put with a single 401 → refresh-retry (access tokens only live ~1h).
+put_with_retry() {
+  if put_value "$1" "$2"; then
+    return 0
+  fi
+  cf_refresh_token && put_value "$1" "$2"
 }
 
 cfg_ok() {
@@ -173,7 +213,7 @@ cmd_push() {
   parts=0
   for f in "$tmp"/chunk.*; do
     nn="${f##*.}"
-    if put_value "latest/$base.$nn" "$f" && put_value "archive/$ts/$base.$nn" "$f"; then
+    if put_with_retry "latest/$base.$nn" "$f" && put_with_retry "archive/$ts/$base.$nn" "$f"; then
       parts=$((parts + 1))
     else
       echo "  ⚠️  upload failed for chunk $nn — aborting push (previous latest left intact)"
@@ -184,7 +224,7 @@ cmd_push() {
 
   manifest="{\"file\":\"$base\",\"ts\":$ts,\"parts\":$parts,\"size\":$size,\"sha256\":\"$sha\"}"
   printf '%s' "$manifest" > "$tmp/manifest.json"
-  if put_value "latest/manifest.json" "$tmp/manifest.json" && put_value "archive/$ts/manifest.json" "$tmp/manifest.json"; then
+  if put_with_retry "latest/manifest.json" "$tmp/manifest.json" && put_with_retry "archive/$ts/manifest.json" "$tmp/manifest.json"; then
     echo "  ☁️  backup pushed: $base (${parts}+1 keys, $(du -h "$file" | cut -f1)) → latest/ + archive/$ts/"
     prune_archives
   else

@@ -35,3 +35,4 @@ node_modules/
 derive-key.cjs
 package.json
 package-lock.json
+job_log.txt
