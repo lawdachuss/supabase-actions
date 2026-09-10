@@ -77,7 +77,7 @@ jobs:
     steps:
       # ── Checkout ──────────────────────────────────────────────────────
       - name: 📥 Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # ── Restore caches ────────────────────────────────────────────────
       # NOTE: Docker images are NOT cached anymore — they pull fresh each run
@@ -90,7 +90,7 @@ jobs:
       # end-of-run cache save), falling back to legacy 'supabase-db-*' keys.
       - name: 💾 Restore state cache
         id: cache-db
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.BACKUP_FILE }}
           key: supabase-db-live-${{ github.run_id }}
@@ -225,8 +225,6 @@ jobs:
             'ANON_KEY_ASYMMETRIC=': f'ANON_KEY_ASYMMETRIC={anon_asymmetric}',
             'SERVICE_ROLE_KEY_ASYMMETRIC=': f'SERVICE_ROLE_KEY_ASYMMETRIC={service_asymmetric}',
             'your-redis-password': redis_pass,
-            'REDIS_PASSWORD=Basudevkr123': f'REDIS_PASSWORD={redis_pass}',
-            'REDIS_PASSWORD=sR7kP2mN9xQ4wL6vB3jF8tY5hD1cA0eG': f'REDIS_PASSWORD={redis_pass}',
           }
           # Real SMTP (optional) — replaces the fake inbucket defaults so auth
           # confirmation/reset emails actually deliver. Leave SMTP_HOST unset
@@ -287,10 +285,38 @@ jobs:
           GITHUB_CLIENT_ID: ${{ secrets.GITHUB_CLIENT_ID }}
           GITHUB_SECRET: ${{ secrets.GITHUB_SECRET }}
 
+      # ── Wire off-site backup creds (Cloudflare KV) into .env ───────────
+      # The keepalive loop pushes every state archive to Workers KV after each
+      # snapshot (see snapshot-state.sh); the restore step below pulls it back
+      # if the local/cache archive is ever lost. Appended only once (idempotent
+      # across runs); token stays empty if the secret is unset (backup skips).
+      - name: ☁️ Wire Cloudflare backup creds
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_BACKUP_TOKEN }}
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          if ! grep -q '^CF_API_TOKEN=' .env 2>/dev/null; then
+            {
+              echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
+              echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
+              echo "CF_API_TOKEN=${CF_API_TOKEN}"
+            } >> .env
+            echo "☁️  Cloudflare backup wired into .env"
+          else
+            echo "☁️  Cloudflare backup already configured"
+          fi
+
       # ── Restore full state (functions, snippets, pgsodium key) ──────────
       - name: 📦 Restore full state (functions, snippets, pgsodium key)
         run: |
           cd ${{ env.SUPABASE_DIR }}
+
+          # If the local/cache archive is missing (real disaster recovery), pull
+          # the freshest one back from Cloudflare KV before extraction.
+          if [ ! -f ./supabase-state.tar.gz ] && grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
+            echo "ℹ️  No state archive on disk — attempting Cloudflare restore..."
+            bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz || true
+          fi
 
           if [ -f ./supabase-state.tar.gz ]; then
             echo "✅ State archive found — restoring edge functions, snippets, DB dump, pgsodium key..."
@@ -336,6 +362,12 @@ jobs:
             elif [ -f ./volumes/redis/data/dump.rdb ]; then
               echo "  💾 Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1) — ready for redis container"
               chmod -R 777 volumes/redis/data 2>/dev/null || true
+            fi
+            if [ -s ./coolify_backup.dump ]; then
+              echo "  🐳 Coolify dump: $(du -h ./coolify_backup.dump | cut -f1) — will restore on Coolify start"
+            fi
+            if [ -s ./volumes/coolify/source/.env ]; then
+              echo "  🐳 Coolify secrets restored — APP_KEY stays stable across sessions"
             fi
           else
             echo "ℹ️  No state archive — fresh start"
@@ -392,6 +424,19 @@ jobs:
       # run: steps, so snapshots can only be persisted via actions/cache steps
       # (end-of-run save below). The keepalive loop writes snapshots to disk so
       # that save always has the freshest archive.
+
+      # ── Coolify (companion PaaS): prep + pre-pull images in the background ──
+      # Prepares Coolify's storage, secrets and SSH access, then pre-pulls its
+      # images in the background so they're already local once the main stack
+      # has started. Fully additive — Supabase/Redis are untouched.
+      - name: 🐳 Coolify — prepare + pre-pull images (background)
+        env:
+          CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          bash utils/setup-coolify.sh prep
+          nohup bash -c "bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
 
       # ── Prune stale cache entries (best-effort, keeps newest 3) ──────────
       # Keeps the Actions cache small (end-of-run state archives) so it never
@@ -499,7 +544,7 @@ jobs:
               echo "✅ Database fully restored from backup"
             else
               # Filter out expected drop/cleanup notices (e.g. "does not exist" on fresh tables, "permission denied" on auth schema)
-              REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access" || true)
+              REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access|set_graphql_placeholder|pgrst_drop_watch|pgrst_ddl_watch|grant_pg_net_access|grant_pg_cron_access" || true)
               if [ -n "$REAL_ERRORS" ]; then
                 echo "⚠️  pg_restore warnings:"
                 echo "$REAL_ERRORS" | head -5 | sed 's/^/    /'
@@ -665,6 +710,25 @@ jobs:
           fi
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
+
+      # ── Coolify: start + health check (best-effort — never kills the session)
+      # Starts the Coolify stack and polls its health endpoint. On failure this
+      # emits a warning and exits 0 so the Supabase session continues; Coolify
+      # retries on the next session.
+      - name: 🐳 Coolify — start + health check
+        env:
+          CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          if bash utils/setup-coolify.sh start; then
+            COOLIFY_URL=$(grep -E '^COOLIFY_APP_URL=' .env 2>/dev/null | cut -d= -f2-)
+            COOLIFY_URL="${COOLIFY_URL:-http://localhost:8082}"
+            echo "::notice title=🐳 Coolify is LIVE::$COOLIFY_URL — permanent link (dashboard also at http://localhost:8082)"
+          else
+            echo "::warning title=🐳 Coolify failed to start::Supabase stays up. Check the coolify container logs above; it retries next session."
+          fi
 
       # ── Apply committed migrations (versioned schema changes) ────────────
       # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs
@@ -961,10 +1025,11 @@ jobs:
           cd ${{ env.SUPABASE_DIR }}
           bash utils/snapshot-state.sh || true
           # Safeguard: if archive is suspiciously small (<500KB), remove it so an aborted run never overwrites a real database in cache
-          ARCHIVE_SIZE=$(stat -c%s ${{ env.BACKUP_FILE }} 2>/dev/null || echo 0)
+          # (stat the archive relative to this step's cwd — supabase/ — BACKUP_FILE is workspace-root-relative)
+          ARCHIVE_SIZE=$(stat -c%s ./supabase-state.tar.gz 2>/dev/null || echo 0)
           if [ "$ARCHIVE_SIZE" -lt 500000 ]; then
             echo "⚠️ Archive is suspiciously small (${ARCHIVE_SIZE}B) — refusing to overwrite production cache!"
-            rm -f ${{ env.BACKUP_FILE }}
+            rm -f ./supabase-state.tar.gz
           fi
 
       # ── Stop services ───────────────────────────────────────────────────
@@ -981,7 +1046,7 @@ jobs:
       # Only runs if NOT cancelled and a valid state archive exists on disk.
       - name: 💿 Save final state to GitHub Actions cache
         if: "!cancelled() && hashFiles('supabase/supabase-state.tar.gz') != ''"
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.BACKUP_FILE }}
           key: supabase-db-live-${{ github.run_id }}-${{ github.run_attempt }}-final

@@ -12,6 +12,8 @@ Thumbs.db
 /supabase/volumes/redis/data/
 /supabase/volumes/snippets/
 /supabase/volumes/functions/*
+# Coolify runtime storage (SSH keys, secrets, project configs)
+/supabase/volumes/coolify/
 # The logs and cache edge functions ship with the repo
 !/supabase/volumes/functions/logs/
 !/supabase/volumes/functions/logs/*
