@@ -244,6 +244,26 @@ $uuids
 EOF
 }
 
+ensure_registration_open() {
+  # Coolify turns open registration OFF once the first user exists (and the
+  # setting itself lives in the restored DB), so every previous session can
+  # ship back with it disabled. Force it open after each restore so users can
+  # always self-register. Runs after the app is healthy (schema exists) using
+  # Coolify's own `settings` table. Best-effort; never fails the session.
+  if ! docker exec coolify-db psql -U coolify -d coolify -t -A -c \
+      "SELECT to_regclass('public.settings') IS NOT NULL;" 2>/dev/null | grep -q t; then
+    echo "  ⚠️  settings table not present yet — skipping registration enable"
+    return 0
+  fi
+  if docker exec coolify-db psql -U coolify -d coolify -v ON_ERROR_STOP=1 -q -c \
+      "INSERT INTO settings (key, value) VALUES ('register_enabled', 'true')
+       ON CONFLICT (key) DO UPDATE SET value = 'true';" >/dev/null 2>&1; then
+    echo "  ✅ open registration enabled (register_enabled=true)"
+  else
+    echo "  ⚠️  could not enable registration — check the session log"
+  fi
+}
+
 start() {
   prep
 
@@ -322,6 +342,10 @@ start() {
   # On a fresh VM, previously-deployed apps exist in the restored Coolify DB but
   # nothing is running — bring them back via their Deploy Webhooks (best-effort).
   redeploy_apps || true
+
+  # Coolify disables open registration after the first user; the setting is
+  # stored in the restored DB, so re-allow user signup on every restore.
+  ensure_registration_open || true
 
   local app_url root_pass
   app_url="$(env_value COOLIFY_APP_URL)"
