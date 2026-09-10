@@ -268,11 +268,13 @@ seed_admin() {
   # Deterministic first admin: bootstrapping through the web registration form
   # is rate-limited and easy to flake on, so when the restored DB has no users
   # yet we seed one directly in Postgres (bcrypt via pgcrypto — no php/htpasswd
-  # needed on the runner). Schema is introspected to survive Coolify version
-  # drift; any failure is non-fatal (open registration stays as the fallback).
+  # needed on the runner). Only the `users` table is required; teams/pivot rows
+  # are only created when their tables/columns exist, so Coolify version drift
+  # can't break login. Any failure is non-fatal and logged; open registration
+  # stays as the fallback.
   if ! docker exec coolify-db psql -U coolify -d coolify -t -A -c \
-      "SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('public.teams') IS NOT NULL AND to_regclass('public.team_user') IS NOT NULL;" 2>/dev/null | grep -q t; then
-    echo "  ⚠️  users/teams schema not present yet — admin seeding skipped"
+      "SELECT to_regclass('public.users') IS NOT NULL;" 2>/dev/null | grep -q t; then
+    echo "  ⚠️  users table not present yet — admin seeding skipped"
     return 0
   fi
   local n
@@ -288,17 +290,35 @@ seed_admin() {
   pw="$(env_value COOLIFY_ADMIN_PASSWORD)";    [ -z "$pw" ] && pw="Chuglii.Co!Admin#2026"
 
   local q c
-  local teams_owner="" teams_ownerv="" teams_personal="" teams_personalv=""
-  local tu_role="" tu_rolev=""
+  local has_teams=0 has_team_user=0 has_t_owner=0 has_t_personal=0 has_tu_role=0 has_current_team=0
+  q="SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('teams');"
+  c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
+  [ "$c" = "1" ] && has_teams=1
+  q="SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('team_user');"
+  c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
+  [ "$c" = "1" ] && has_team_user=1
   q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='teams' AND column_name='user_id';"
   c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
-  [ "$c" = "1" ] && { teams_owner=" ,user_id"; teams_ownerv=" ,__UID__"; }
+  [ "$c" = "1" ] && has_t_owner=1
   q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='teams' AND column_name='personal_team';"
   c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
-  [ "$c" = "1" ] && { teams_personal=" ,personal_team"; teams_personalv=" ,true"; }
+  [ "$c" = "1" ] && has_t_personal=1
   q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='team_user' AND column_name='role';"
   c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
-  [ "$c" = "1" ] && { tu_role=" ,role"; tu_rolev=" ,'admin'"; }
+  [ "$c" = "1" ] && has_tu_role=1
+  q="SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='current_team_id';"
+  c="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "$q" 2>/dev/null | head -1 | tr -d ' \r')"
+  [ "$c" = "1" ] && has_current_team=1
+
+  local t_md="" tv_md="" t_exs=""
+  [ "$has_t_owner" = "1" ]     && { t_md="$t_md ,user_id";       tv_md="$tv_md ,u_id"; }
+  [ "$has_t_personal" = "1" ]  && { t_md="$t_md ,personal_team"; tv_md="$tv_md ,true"; }
+  [ "$has_teams" = "1" ]       && t_exs="TRUE" || t_exs="FALSE"
+  local tu_md="" tuv_md="" tu_exs="FALSE"
+  [ "$has_tu_role" = "1" ]     && { tu_md=" ,role"; tuv_md=" ,'admin'"; }
+  [ "$has_team_user" = "1" ]   && tu_exs="TRUE"
+  local cur_set=""
+  [ "$has_current_team" = "1" ] && cur_set="UPDATE users SET current_team_id=t_id WHERE id=u_id;"
 
   local sql
   sql=$(cat <<'SQL'
@@ -311,12 +331,16 @@ BEGIN
   INSERT INTO users (name,email,password,email_verified_at,created_at,updated_at)
     VALUES ('__NAME__','__EMAIL__',crypt('__PW__',gen_salt('bf')),now(),now(),now())
     RETURNING id INTO u_id;
-  INSERT INTO teams (name__T_OWNER____T_PERS__ ,created_at,updated_at)
-    VALUES ('__NAME__'__T_OWNERV____T_PERSV__ ,now(),now())
-    RETURNING id INTO t_id;
-  UPDATE users SET current_team_id=t_id WHERE id=u_id;
-  INSERT INTO team_user (team_id,user_id__TU_ROLE__,created_at,updated_at)
-    VALUES (t_id,u_id__TU_ROLEV__,now(),now());
+  IF __HAS_TEAMS__ THEN
+    INSERT INTO teams (name__T_MD__,created_at,updated_at)
+      VALUES ('__NAME__'__TV_MD__,now(),now())
+      RETURNING id INTO t_id;
+    __SET_CUR__
+    IF __HAS_TEAM_USER__ THEN
+      INSERT INTO team_user (team_id,user_id__TU_MD__,created_at,updated_at)
+        VALUES (t_id,u_id__TUV_MD__,now(),now());
+    END IF;
+  END IF;
   RAISE NOTICE 'Coolify admin seeded (user %)', u_id;
 END
 $do$;
@@ -325,15 +349,17 @@ SQL
   sql="${sql//__NAME__/$name}"
   sql="${sql//__EMAIL__/$email}"
   sql="${sql//__PW__/$pw}"
-  sql="${sql//__T_OWNER__/$teams_owner}";  sql="${sql//__T_OWNERV__/$teams_ownerv}"
-  sql="${sql//__T_PERS__/$teams_personal}"; sql="${sql//__T_PERSV__/$teams_personalv}"
-  sql="${sql//__TU_ROLE__/$tu_role}";       sql="${sql//__TU_ROLEV__/$tu_rolev}"
+  sql="${sql//__T_MD__/$t_md}";      sql="${sql//__TV_MD__/$tv_md}";      sql="${sql//__HAS_TEAMS__/$t_exs}"
+  sql="${sql//__TU_MD__/$tu_md}";    sql="${sql//__TUV_MD__/$tuv_md}";    sql="${sql//__HAS_TEAM_USER__/$tu_exs}"
+  sql="${sql//__SET_CUR__/$cur_set}"
 
-  if docker exec coolify-db psql -U coolify -d coolify -v ON_ERROR_STOP=1 -c "$sql" >/dev/null 2>&1; then
+  local err
+  err="$(docker exec coolify-db psql -U coolify -d coolify -v ON_ERROR_STOP=1 -c "$sql" 2>&1 >/dev/null)"
+  if [ -z "$err" ] || ! printf '%s' "$err" | grep -q "ERROR"; then
     n="$(docker exec coolify-db psql -U coolify -d coolify -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | head -1 | tr -d ' \r')"
     echo "  ✅ admin seeded: $name <$email> ($n user(s) now) — login: $email / $pw"
   else
-    echo "  ⚠️  admin seeding failed (schema drift?) — web registration remains available"
+    echo "  ⚠️  admin seeding failed — ${err//$'\n'/ }"
   fi
 }
 
