@@ -225,7 +225,10 @@ start() {
     sleep 2
   done
   if [ "$COOLIFY_DB_READY" -ne 1 ]; then
-    echo "  ⚠️  coolify-db not accepting connections — starting app without DB restore"
+    echo "  ⚠️  coolify-db not accepting connections after 120s — failing step so the session restarts and retries"
+    echo "  ⚠️  (starting the app against a missing DB would leave Coolify silently broken for hours)"
+    "${COMPOSE_CMD[@]}" logs --tail 30 coolify-postgres 2>/dev/null | tail -30 || true
+    return 1
   elif [ -s ./coolify_backup.dump ]; then
     echo "  🗄️  Restoring Coolify DB from coolify_backup.dump ($(du -h ./coolify_backup.dump | cut -f1))..."
     if docker cp ./coolify_backup.dump coolify-db:/tmp/coolify_backup.dump \

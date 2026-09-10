@@ -17,13 +17,23 @@
 #     -f docker-compose.redis.yml -f docker-compose.coolify.yml up -d
 #
 # Config (all optional, sane defaults):
-#   COOLIFY_VERSION            Coolify image tag            (default: latest)
 #   COOLIFY_REALTIME_VERSION   Realtime image tag           (default: 1.0.19)
 #   COOLIFY_REGISTRY           Image registry               (default: docker.io)
 #   COOLIFY_PORT               Host port for the UI         (default: 8082)
 #   COOLIFY_SOKETI_PORT        Realtime public port         (default: 6001)
 #   COOLIFY_SOKETI_REALTIME_PORT  Realtime websocket port   (default: 6002)
 #   + COOLIFY_DB_PASSWORD / COOLIFY_REDIS_PASSWORD / COOLIFY_PUSHER_* ...
+#
+# Note: the Coolify image is pinned BY DIGEST (not :latest) so a restored DB
+# dump from an earlier session is never replayed against a NEWER Coolify
+# schema, and so image pulls across sessions fetch byte-identical layers.
+# (Edges: redis/postgres remain on major-alias tags; their minor bumps are
+# schema-compatible within the major. To upgrade Coolify deliberately, replace
+# the digest below with a newer one and bump the DB with Coolify's own
+# migration flow — never rely on auto-update.)
+#
+# deps.resources.limits are set so a long Coolify docker build cannot OOM the
+# shared 4-vCPU runner underneath the live Supabase stack.
 #
 # Runtime secrets live in added volumes (never committed):
 #   - volumes/coolify/source/.env  -> the Laravel env, mounted read-only
@@ -34,7 +44,7 @@
 services:
 
   coolify:
-    image: "${COOLIFY_REGISTRY:-docker.io}/coollabsio/coolify:${COOLIFY_VERSION:-latest}"
+    image: "${COOLIFY_REGISTRY:-docker.io}/coollabsio/coolify@sha256:b3a0a02b1938897d295b816317fd6e0a259325d50e8252fca2ce5ecab138e7c2"
     container_name: coolify
     restart: unless-stopped
     working_dir: /var/www/html
@@ -73,6 +83,11 @@ services:
       retries: 24
       start_period: 1m
       timeout: 2s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 768m
     depends_on:
       coolify-postgres:
         condition: service_healthy
@@ -96,6 +111,11 @@ services:
       interval: 5s
       retries: 10
       timeout: 2s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
 
   coolify-redis:
     image: redis:7-alpine
@@ -118,6 +138,11 @@ services:
       interval: 5s
       retries: 10
       timeout: 2s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 160m
 
   coolify-realtime:
     image: "${COOLIFY_REGISTRY:-docker.io}/coollabsio/coolify-realtime:${COOLIFY_REALTIME_VERSION:-1.0.19}"
@@ -142,6 +167,11 @@ services:
       interval: 5s
       retries: 10
       timeout: 2s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256m
 
 volumes:
   coolify-db:
