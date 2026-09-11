@@ -781,6 +781,7 @@ jobs:
       # (migrations, keepalive) and makes workflow-watchman restart the session.
       # Add `continue-on-error: true` here if Coolify should stay best-effort.
       - name: 🐳 Coolify — smoke test
+        continue-on-error: true
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/setup-coolify.sh smoke
