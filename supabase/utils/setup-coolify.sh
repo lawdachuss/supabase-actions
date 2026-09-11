@@ -682,24 +682,38 @@ start() {
   # seed_admin so a user/team exists to mint the deploy token from.
   redeploy_apps || true
 
-  local app_url root_pass pw_display
+  local app_url root_pass login pw_display
   app_url="$(env_value COOLIFY_APP_URL)"
   root_pass="$(env_value COOLIFY_ROOT_PASSWORD)"
+  # Report the identity that actually exists — the root user (id 0) created by
+  # RootUserSeeder, or the fallback admin seed_admin() created. Coolify logs in
+  # with an EMAIL, so the old "Username: coolify" row was never actionable.
+  if [ "$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users WHERE id = 0;" 2>/dev/null | tr -d ' \r')" = "1" ]; then
+    login="$(coolify_psql -t -A -c "SELECT email FROM users WHERE id = 0;" 2>/dev/null | tr -d ' \r')"
+  else
+    login="$(coolify_psql -t -A -c "SELECT email FROM users ORDER BY id LIMIT 1;" 2>/dev/null | tr -d ' \r')"
+    [ -n "$login" ] || login="$(env_value COOLIFY_ADMIN_EMAIL)"
+    # The fallback admin's password is never COOLIFY_PASSWORD.
+    if [ -n "${COOLIFY_ADMIN_PASSWORD:-}" ]; then
+      pw_display='set via the `COOLIFY_ADMIN_PASSWORD` repo secret (not printed)'
+    else
+      pw_display="\`$(env_value ADMIN_PASSWORD "$SOURCE_ENV")\` (generated fallback admin password)"
+    fi
+  fi
+  [ -n "$login" ] || login="coolify"
   # Never print an operator-supplied secret. A generated one is still shown
   # (it is the only way to recover a fresh install); the console never prints it.
-  if [ -n "${COOLIFY_PASSWORD:-}" ]; then
-    pw_display='set via the `COOLIFY_PASSWORD` repo secret (not printed)'
-  else
-    pw_display="\`$root_pass\` (generated — store it somewhere safe)"
+  if [ -z "${pw_display:-}" ]; then
+    if [ -n "${COOLIFY_PASSWORD:-}" ]; then
+      pw_display='set via the `COOLIFY_PASSWORD` repo secret (not printed)'
+    else
+      pw_display="\`$root_pass\` (generated — store it somewhere safe)"
+    fi
   fi
 
   echo ""
   echo "  ✅ Coolify is LIVE on http://127.0.0.1:${COOLIFY_PORT}"
-  if [ -n "${COOLIFY_PASSWORD:-}" ]; then
-    echo "  🔑 login: coolify / \$COOLIFY_PASSWORD (repo secret; not printed)"
-  else
-    echo "  🔑 login: coolify / see run summary (generated password)"
-  fi
+  echo "  🔑 login: $login / password in the run summary (or the COOLIFY_PASSWORD secret)"
   echo "  🌐 public: $app_url (add a hostname for localhost:${COOLIFY_PORT} in your CF Zero-Trust tunnel)"
   echo "  🎯 apps via Coolify: deploy a frontend, then route *.apps.<your-domain> → localhost:80 (Coolify's managed proxy)"
 
@@ -711,7 +725,7 @@ start() {
       echo "|---|---|"
       echo "| **Dashboard** | [http://localhost:${COOLIFY_PORT}](http://localhost:${COOLIFY_PORT}) |"
       echo "| **Public URL** | $app_url |"
-      echo "| **Username** | \`coolify\` |"
+      echo "| **Login** | \`$login\` |"
       echo "| **Password** | $pw_display |"
       echo "| **REST API** | \`curl -H 'Authorization: Bearer <api-token>' ${app_url}/api/v1/...\` |"
       echo ""
