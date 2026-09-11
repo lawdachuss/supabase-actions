@@ -4,8 +4,11 @@
 # Adds a full Coolify stack (app + its own Postgres / Redis / Realtime) on the
 # SAME Docker network as Supabase. Coolify's UI is published on host port 8082
 # (8080 inside the container) so it never clashes with Kong on :8000. Host ports
-# 80/443 are also published (Coolify's internal Traefik proxy) so frontends
-# deployed via Coolify are reachable at *.apps.<domain> -> localhost:80.
+# 80/443 are intentionally left to Coolify's OWN managed proxy container
+# (`coolify-proxy`): the app container only listens on 8080, so publishing
+# 80:80 / 443:443 here would map to a closed port *and* make the proxy fail to
+# start with "port is already allocated". Frontends deployed via Coolify are
+# then reachable at *.apps.<domain> -> localhost:80.
 #
 # The stack must be able to see the running Supabase compose set (base + logs +
 # redis) so `utils/setup-coolify.sh` passes all four files — that keeps the
@@ -61,10 +64,13 @@ services:
       PHP_FPM_PM_MAX_SPARE_SERVERS: 10
     ports:
       - "${COOLIFY_PORT:-8082}:8080"
-      # Coolify's internal Traefik proxy — deployed frontends are served here.
-      # Route *.apps.<your-domain> -> localhost:80 through your CF Zero-Trust tunnel.
-      - "80:80"
-      - "443:443"
+      # NOTE: host ports 80/443 are deliberately NOT published here.
+      # Coolify's own managed proxy (a separate `coolify-proxy` container)
+      # binds 80/443 to serve deployed frontends; this container only listens
+      # on 8080, so a `80:80` / `443:443` mapping here pointed at a closed port
+      # and blocked the proxy from starting. Route *.apps.<your-domain> ->
+      # localhost:80 through your CF Zero-Trust tunnel once a resource with a
+      # domain has been deployed.
     volumes:
       # Docker socket -> lets Coolify manage the host daemon (deploy apps/proxy)
       - /var/run/docker.sock:/var/run/docker.sock

@@ -29,6 +29,12 @@ Thumbs.db
 /supabase/supabase-state.tar.gz
 /supabase/supabase-state.tar.gz.new
 
+# Companion Coolify stack: its own DB dump (projects, encrypted creds) and the
+# Cloudflare-push throttle marker — same rule as the Supabase state above.
+/supabase/coolify_backup.dump
+/supabase/coolify_backup.dump.new
+/supabase/.cf_push_last
+
 # Cloned/test directories (old troubleshooting copies)
 /tmp-supabase/
 node_modules/

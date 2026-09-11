@@ -83,12 +83,18 @@ fi
 
 # ── 3b. Save the companion Coolify stack's own DB (if its postgres is up) ──
 # Coolify keeps its config (projects, apps, servers, private keys) in its own
-# 'coolify' database inside the coolify-db container. We exec into the running
-# container by NAME (not the compose service) so this works regardless of which
-# compose files are currently in scope.
-if docker exec coolify-db pg_isready -U coolify -d coolify > /dev/null 2>&1; then
+# database inside the coolify-db container. We exec into the running container
+# by NAME (not the compose service) so this works regardless of which compose
+# files are currently in scope. The DB user/name are read from .env (written by
+# setup-coolify.sh prep) so a non-default COOLIFY_DB_USERNAME / COOLIFY_DB_NAME
+# still dumps correctly.
+COOLIFY_DB_USER="$(grep -E '^COOLIFY_DB_USERNAME=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+COOLIFY_DB_NAME="$(grep -E '^COOLIFY_DB_NAME=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+COOLIFY_DB_USER="${COOLIFY_DB_USER:-coolify}"
+COOLIFY_DB_NAME="${COOLIFY_DB_NAME:-coolify}"
+if docker exec coolify-db pg_isready -U "$COOLIFY_DB_USER" -d "$COOLIFY_DB_NAME" > /dev/null 2>&1; then
   echo "  🗄️  pg_dump coolify-db..."
-  if docker exec coolify-db sh -c "pg_dump -U coolify -d coolify -F c -Z 6 -f /tmp/coolify_backup.dump.new" \
+  if docker exec coolify-db sh -c "pg_dump -U '$COOLIFY_DB_USER' -d '$COOLIFY_DB_NAME' -F c -Z 6 -f /tmp/coolify_backup.dump.new" \
      && docker cp coolify-db:/tmp/coolify_backup.dump.new ./coolify_backup.dump.new; then
     NEW_SIZE=$(stat -c%s ./coolify_backup.dump.new 2>/dev/null || echo 0)
     OLD_SIZE=$(stat -c%s ./coolify_backup.dump 2>/dev/null || echo 0)

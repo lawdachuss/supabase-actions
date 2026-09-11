@@ -33,6 +33,13 @@
 #   SMTP_PASS          the provider's SMTP password / API key
 #   SMTP_ADMIN_EMAIL   verified From address (must be allowed by the provider)
 #   SMTP_SENDER_NAME   display name shown as the sender
+#
+# Optional Coolify secrets (companion PaaS started alongside Supabase):
+#   COOLIFY_PASSWORD        - Coolify dashboard (root user) password. If unset,
+#                             one is generated once and kept in the state archive.
+#   COOLIFY_ADMIN_PASSWORD  - password for the fallback admin created when the
+#                             restored Coolify DB has no users.
+#   COOLIFY_AUTO_REDEPLOY   - set to 0 to stop re-deploying stored apps each run
 # =============================================================================
 
 name: 🚀 Full Supabase Self-Hosted
@@ -751,6 +758,7 @@ jobs:
           CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
+          COOLIFY_ADMIN_PASSWORD: ${{ secrets.COOLIFY_ADMIN_PASSWORD }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
           if bash utils/setup-coolify.sh start; then
