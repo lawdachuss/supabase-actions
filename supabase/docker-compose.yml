@@ -470,7 +470,7 @@ services:
       - ${INBUCKET_WEB_PORT:-9000}:9000   # Web UI
       - ${INBUCKET_SMTP_PORT:-2500}:2500  # SMTP
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/health"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9000/api/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -499,7 +499,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
     depends_on:
       db:
         condition: service_healthy
@@ -531,4 +531,5 @@ services:
 
 volumes:
   db-config:
+    external: true
   deno-cache:
