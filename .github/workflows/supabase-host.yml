@@ -35,8 +35,10 @@
 #   SMTP_SENDER_NAME   display name shown as the sender
 #
 # Optional Coolify secrets (companion PaaS started alongside Supabase):
-#   COOLIFY_PASSWORD        - Coolify dashboard (root user) password. If unset,
-#                             one is generated once and kept in the state archive.
+#   COOLIFY_PASSWORD        - Coolify dashboard (root user) password. When set it
+#                             is authoritative (re-hashed onto the root user every
+#                             session) and is never printed in the run summary.
+#                             If unset, one is generated and shown once instead.
 #   COOLIFY_ADMIN_PASSWORD  - password for the fallback admin created when the
 #                             restored Coolify DB has no users.
 #   COOLIFY_AUTO_REDEPLOY   - set to 0 to stop re-deploying stored apps each run
@@ -471,6 +473,7 @@ jobs:
         env:
           CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/setup-coolify.sh prep
@@ -768,6 +771,19 @@ jobs:
           else
             echo "::warning title=🐳 Coolify failed to start::Supabase stays up. Check the coolify container logs above; it retries next session."
           fi
+
+      # ── Coolify smoke test ───────────────────────────────────────────────
+      # Asserts the three things that used to fail silently: a usable admin,
+      # open registration, and an authenticated deploy API. Exits non-zero on
+      # regression, so a broken dashboard shows up as a red step instead of
+      # hours of a quietly unusable Coolify.
+      # NOTE: this step FAILS the run, which skips the Supabase steps below
+      # (migrations, keepalive) and makes workflow-watchman restart the session.
+      # Add `continue-on-error: true` here if Coolify should stay best-effort.
+      - name: 🐳 Coolify — smoke test
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          bash utils/setup-coolify.sh smoke
 
       # ── Apply committed migrations (versioned schema changes) ────────────
       # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs

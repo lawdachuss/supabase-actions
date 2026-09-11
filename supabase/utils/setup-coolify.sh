@@ -109,6 +109,130 @@ coolify_psql() {
   docker exec coolify-db psql -U "$user" -d "$name" "$@"
 }
 
+# Enable Coolify's API (disabled by default since migration
+# 2024_09_26_083441_disable_api_by_default — the deploy webhook sits behind it)
+# and mint a fresh deploy-scoped token for the first admin/owner. Sanctum stores
+# sha256(plaintext) in personal_access_tokens.token, so inserting the hash here
+# is exactly what the UI's "Create token" does. Echoes the plaintext token on
+# success; returns 1 (printing nothing) when there is no user/team yet.
+mint_deploy_token() {
+  local token token_hash count
+  token="coolify-autodeploy-$(rand_hex 16)"
+  token_hash="$(printf '%s' "$token" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$token_hash" ] || return 1
+  coolify_psql -q -c "UPDATE instance_settings SET is_api_enabled = true, updated_at = now();" \
+    >/dev/null 2>&1 || true
+  coolify_psql -v ON_ERROR_STOP=1 -q -c "
+      DELETE FROM personal_access_tokens WHERE name = 'coolify-autodeploy';
+      INSERT INTO personal_access_tokens
+        (tokenable_type, tokenable_id, name, token, abilities, team_id, created_at, updated_at)
+      SELECT 'App\Models\User', u.id, 'coolify-autodeploy', '$token_hash',
+             '["deploy"]'::json, t.team_id, now(), now()
+      FROM users u
+      JOIN team_user t ON t.user_id = u.id
+      ORDER BY u.id, t.team_id
+      LIMIT 1;" >/dev/null 2>&1 || return 1
+  count="$(coolify_psql -t -A -c \
+    "SELECT COUNT(*) FROM personal_access_tokens WHERE token = '$token_hash';" \
+    2>/dev/null | tr -d ' \r')"
+  [ "$count" = "1" ] || return 1
+  printf '%s' "$token"
+}
+
+# RootUserSeeder creates the root user (id 0) exactly once, so a
+# COOLIFY_PASSWORD secret added or changed later would never reach the database
+# while the run summary still claimed it was the password. When the secret is
+# present, make it authoritative by re-hashing it onto the root user.
+sync_root_password() {
+  [ -n "${COOLIFY_PASSWORD:-}" ] || return 0
+  if ! coolify_psql -t -A -c "SELECT to_regclass('public.users') IS NOT NULL;" 2>/dev/null | grep -q t; then
+    echo "  ⚠️  users table not present yet — root password sync skipped"
+    return 0
+  fi
+  local n pw_q
+  n="$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users WHERE id = 0;" 2>/dev/null | tr -d ' \r')"
+  if [ "$n" != "1" ]; then
+    echo "  ℹ️  no root user (id 0) yet — COOLIFY_PASSWORD applies at first boot"
+    return 0
+  fi
+  pw_q="${COOLIFY_PASSWORD//\'/\'\'}"
+  if coolify_psql -v ON_ERROR_STOP=1 -q -c \
+      "CREATE EXTENSION IF NOT EXISTS pgcrypto;
+       UPDATE users SET password = crypt('$pw_q', gen_salt('bf')), updated_at = now()
+       WHERE id = 0;" >/dev/null 2>&1; then
+    echo "  🔑 root password synced to the COOLIFY_PASSWORD secret"
+  else
+    echo "  ⚠️  could not sync the root password to COOLIFY_PASSWORD"
+  fi
+}
+
+# Post-start assertions for the paths that used to fail silently: a usable
+# admin, open registration and an authenticated deploy API. Exits non-zero when
+# any check fails so a broken dashboard shows up as a red step, not as hours of
+# a quietly unusable Coolify.
+smoke() {
+  local fails=0 n reg token code
+  echo "🐳 Coolify smoke test"
+
+  if curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:${COOLIFY_PORT}/api/health"; then
+    echo "  ✅ /api/health"
+  else
+    echo "  ❌ /api/health unreachable on port ${COOLIFY_PORT}"
+    fails=$((fails + 1))
+  fi
+
+  # 1. an admin exists — without one, dashboard login is impossible
+  n="$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | tr -d ' \r')"
+  if [ -n "$n" ] && [ "$n" -ge 1 ] 2>/dev/null; then
+    echo "  ✅ users present ($n)"
+  else
+    echo "  ❌ no users in Coolify — dashboard login impossible"
+    fails=$((fails + 1))
+  fi
+
+  # 2. open registration
+  reg="$(coolify_psql -t -A -c \
+    "SELECT is_registration_enabled FROM instance_settings ORDER BY id LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  case "$reg" in
+    t|true)
+      echo "  ✅ open registration enabled" ;;
+    *)
+      echo "  ❌ registration not enabled (instance_settings.is_registration_enabled='${reg:-<missing>}')"
+      fails=$((fails + 1)) ;;
+  esac
+
+  # 3. the deploy API answers an authenticated call. A bogus uuid is expected to
+  #    4xx because the resource doesn't exist; 401/403 means auth or the API
+  #    gate (instance_settings.is_api_enabled) is broken.
+  if token="$(mint_deploy_token)"; then
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
+      -H "Authorization: Bearer $token" \
+      "http://127.0.0.1:${COOLIFY_PORT}/api/v1/deploy?uuid=00000000-0000-0000-0000-000000000000" \
+      2>/dev/null || echo 000)"
+    case "$code" in
+      200|201|202|204|400|404|422)
+        echo "  ✅ deploy API reachable and authenticated (HTTP $code)" ;;
+      401|403)
+        echo "  ❌ deploy API rejected the token (HTTP $code) — API gate or token ability broken"
+        fails=$((fails + 1)) ;;
+      *)
+        echo "  ❌ deploy API unexpected response (HTTP $code)"
+        fails=$((fails + 1)) ;;
+    esac
+  else
+    echo "  ❌ could not mint a deploy token (no user/team, or API gate)"
+    fails=$((fails + 1))
+  fi
+
+  if [ "$fails" -eq 0 ]; then
+    echo "✅ Coolify smoke test passed"
+    return 0
+  fi
+  echo "❌ Coolify smoke test failed ($fails check(s))"
+  return 1
+}
+
 prep() {
   echo "🐳 [1/4] Preparing Coolify storage layout..."
   mkdir -p "$COOLIFY_DIR"/{source,ssh/keys,ssh/mux,applications,databases,services,backups,images/avatars,images/project-icons,proxy,sentinel}
@@ -291,38 +415,10 @@ redeploy_apps() {
   uuids="$(printf '%s\n' "$uuids" | grep -E '^[0-9a-f-]{36}$' || true)"
   [ -z "$uuids" ] && { echo "  🎯 no applications stored in Coolify yet — nothing to redeploy"; return 0; }
 
-  # Coolify disables its API by default on self-hosted instances (migration
-  # 2024_09_26_083441_disable_api_by_default) — the deploy webhook lives behind
-  # that gate, so switch it on before calling it.
-  coolify_psql -q -c "UPDATE instance_settings SET is_api_enabled = true, updated_at = now();" \
-    >/dev/null 2>&1 || true
-
-  # ── Mint a deploy token (idempotent: one row named 'coolify-autodeploy') ──
-  local token token_hash
-  token="coolify-autodeploy-$(rand_hex 16)"
-  token_hash="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
-  if [ -z "$token_hash" ]; then
-    echo "  ⚠️  could not hash the deploy token — skipping redeploy"
-    return 0
-  fi
-  if ! coolify_psql -v ON_ERROR_STOP=1 -q -c "
-      DELETE FROM personal_access_tokens WHERE name = 'coolify-autodeploy';
-      INSERT INTO personal_access_tokens
-        (tokenable_type, tokenable_id, name, token, abilities, team_id, created_at, updated_at)
-      SELECT 'App\Models\User', u.id, 'coolify-autodeploy', '$token_hash',
-             '["deploy"]'::json, t.team_id, now(), now()
-      FROM users u
-      JOIN team_user t ON t.user_id = u.id
-      ORDER BY u.id, t.team_id
-      LIMIT 1;" >/tmp/coolify-token.log 2>&1; then
-    echo "  ⚠️  could not mint a deploy token — skipping redeploy"
-    [ -s /tmp/coolify-token.log ] && sed 's/^/      /' /tmp/coolify-token.log | head -5
-    rm -f /tmp/coolify-token.log
-    return 0
-  fi
-  rm -f /tmp/coolify-token.log
-  if [ "$(coolify_psql -t -A -c "SELECT COUNT(*) FROM personal_access_tokens WHERE name = 'coolify-autodeploy';" 2>/dev/null | tr -d ' \r')" != "1" ]; then
-    echo "  ⚠️  no user/team in Coolify yet — skipping redeploy"
+  # Turn on the API gate and mint a deploy-scoped token (shared with `smoke`).
+  local token
+  if ! token="$(mint_deploy_token)"; then
+    echo "  ⚠️  could not mint a deploy token (no user/team, or API gate) — skipping redeploy"
     return 0
   fi
 
@@ -577,18 +673,33 @@ start() {
   # First admin (web registration is rate-limited): seed when no users exist.
   seed_admin || true
 
+  # A COOLIFY_PASSWORD secret must actually be the dashboard password (the
+  # seeder only sets it at first boot), so re-hash it onto the root user.
+  sync_root_password || true
+
   # On a fresh VM, previously-deployed apps exist in the restored Coolify DB but
   # nothing is running — bring them back via the API (best-effort). Runs AFTER
   # seed_admin so a user/team exists to mint the deploy token from.
   redeploy_apps || true
 
-  local app_url root_pass
+  local app_url root_pass pw_display
   app_url="$(env_value COOLIFY_APP_URL)"
   root_pass="$(env_value COOLIFY_ROOT_PASSWORD)"
+  # Never print an operator-supplied secret. A generated one is still shown
+  # (it is the only way to recover a fresh install); the console never prints it.
+  if [ -n "${COOLIFY_PASSWORD:-}" ]; then
+    pw_display='set via the `COOLIFY_PASSWORD` repo secret (not printed)'
+  else
+    pw_display="\`$root_pass\` (generated — store it somewhere safe)"
+  fi
 
   echo ""
   echo "  ✅ Coolify is LIVE on http://127.0.0.1:${COOLIFY_PORT}"
-  echo "  🔑 login: coolify / <Coolify root password> (secrets.COOLIFY_PASSWORD or persisted/random, see run summary)"
+  if [ -n "${COOLIFY_PASSWORD:-}" ]; then
+    echo "  🔑 login: coolify / \$COOLIFY_PASSWORD (repo secret; not printed)"
+  else
+    echo "  🔑 login: coolify / see run summary (generated password)"
+  fi
   echo "  🌐 public: $app_url (add a hostname for localhost:${COOLIFY_PORT} in your CF Zero-Trust tunnel)"
   echo "  🎯 apps via Coolify: deploy a frontend, then route *.apps.<your-domain> → localhost:80 (Coolify's managed proxy)"
 
@@ -601,7 +712,7 @@ start() {
       echo "| **Dashboard** | [http://localhost:${COOLIFY_PORT}](http://localhost:${COOLIFY_PORT}) |"
       echo "| **Public URL** | $app_url |"
       echo "| **Username** | \`coolify\` |"
-      echo "| **Password** | \`$root_pass\` (or the \`COOLIFY_PASSWORD\` secret) |"
+      echo "| **Password** | $pw_display |"
       echo "| **REST API** | \`curl -H 'Authorization: Bearer <api-token>' ${app_url}/api/v1/...\` |"
       echo ""
       echo "> Add a hostname for \`localhost:${COOLIFY_PORT}\` in your Cloudflare Zero-Trust tunnel ingress for public access. Route deployed apps via \`*.<apps-domain> → localhost:80\`."
@@ -621,5 +732,6 @@ case "$ACTION" in
   pull)    pull ;;
   start)   start ;;
   status)  status ;;
-  *) echo "usage: $0 {prep|pull|start|status}"; exit 1 ;;
+  smoke)   smoke ;;
+  *) echo "usage: $0 {prep|pull|start|status|smoke}"; exit 1 ;;
 esac
