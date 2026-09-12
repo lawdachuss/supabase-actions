@@ -155,6 +155,12 @@ sync_root_password() {
     echo "  ℹ️  no root user (id 0) yet — COOLIFY_PASSWORD applies at first boot"
     return 0
   fi
+  # Ensure COOLIFY_PASSWORD meets Coolify's policy before attempting to sync
+  # (Coolify rejects passwords without 8+ chars, upper, lower, digit, symbol)
+  if ! password_ok "$COOLIFY_PASSWORD"; then
+    echo "  ⚠️  COOLIFY_PASSWORD does not meet Coolify's requirements"
+    echo "     (needs: 8+ chars, upper, lower, digit, symbol) — login may fail"
+  fi
   pw_q="${COOLIFY_PASSWORD//\'/\'\'}"
   if coolify_psql -v ON_ERROR_STOP=1 -q -c \
       "CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -185,6 +191,11 @@ smoke() {
   n="$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | tr -d ' \r')"
   if [ -n "$n" ] && [ "$n" -ge 1 ] 2>/dev/null; then
     echo "  ✅ users present ($n)"
+    # Show the root user (id 0) login info if it exists
+    root_email="$(coolify_psql -t -A -c "SELECT email FROM users WHERE id = 0;" 2>/dev/null | tr -d ' \r')"
+    if [ -n "$root_email" ]; then
+      echo "  🔑 Root user login: $root_email (use COOLIFY_PASSWORD secret)"
+    fi
   else
     echo "  ❌ no users in Coolify — dashboard login impossible"
     fails=$((fails + 1))
@@ -618,24 +629,41 @@ start() {
             /tmp/coolify_backup.dump > /tmp/coolify-restore.log 2>&1; then
       echo "  ✅ Coolify DB restored"
     else
-      REAL_ERRORS=$(grep -iE "error:" /tmp/coolify-restore.log 2>/dev/null | grep -viE "does not exist|already exists|must be owner of" | head -5 || true)
+      REAL_ERRORS=$(grep -iE "error:" /tmp/coolify-restore.log 2>/dev/null | grep -viE "does not exist|already exists|must be owner of" | head -10 || true)
       if [ -n "$REAL_ERRORS" ]; then
-        echo "  ⚠️  Coolify DB restore warnings:"
+        echo "  ⚠️  Coolify DB restore had errors (check logs):"
         echo "$REAL_ERRORS" | sed 's/^/      /'
       else
         echo "  ✅ Coolify DB restored (drop/create notices are harmless)"
       fi
+      echo "  📋 Full restore log (last 30 lines):"
+      tail -30 /tmp/coolify-restore.log 2>/dev/null | sed 's/^/      /' || true
     fi
     rm -f /tmp/coolify-restore.log
     TABLES=$(coolify_psql -t -A -c \
       "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE';" 2>/dev/null || echo 0)
     echo "  📊 Coolify user tables (public schema): $TABLES"
+    # Verify users table has data (not just exists)
+    if [ -n "$TABLES" ] && [ "$TABLES" -gt 0 ]; then
+      USERS COUNT=$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | tr -d ' \r')
+      echo "  👤 Users in database: ${USERS_COUNT:-0}"
+      if [ -n "${USERS_COUNT:-}" ] && [ "$USERS_COUNT" -gt 0 ]; then
+        echo "  ✅ User data persisted across sessions"
+        # Show first user for reference
+        FIRST_USER=$(coolify_psql -t -A -c "SELECT id, email FROM users ORDER BY id LIMIT 1;" 2>/dev/null | tr -d ' \r')
+        if [ -n "$FIRST_USER" ]; then
+          echo "  ℹ️  First user: $FIRST_USER"
+        fi
+      fi
+    fi
   else
     echo "  ℹ️  No coolify_backup.dump — fresh Coolify database"
   fi
 
   # ── Phase 2: the app ──
-  echo "🐳 Starting the Coolify app..."
+  echo ""
+  echo "🐳 Phase 2: Starting the Coolify app..."
+  echo "   (APP_KEY that will be used: ${app_key:0:30}...)"
   if ! "${COMPOSE_CMD[@]}" up -d coolify 2>&1 | tail -10; then
     echo "  ⚠️  compose up failed — latest coolify logs:"
     "${COMPOSE_CMD[@]}" logs --tail 80 coolify 2>/dev/null | tail -80 || true
@@ -677,6 +705,27 @@ start() {
   # seeder only sets it at first boot), so re-hash it onto the root user.
   sync_root_password || true
 
+  # ── Verify at least one user can log in ──
+  # After a DB restore, the users table might exist but contain corrupted rows
+  # (e.g., partial restore, schema mismatch). Verify we have at least one user
+  # with a valid password hash, otherwise report it clearly.
+  echo ""
+  echo "🔍 Verifying user authentication capability..."
+  local usable_users
+  usable_users="$(coolify_psql -t -A -c "
+    SELECT COUNT(*) FROM users
+    WHERE email IS NOT NULL
+    AND password IS NOT NULL
+    AND LENGTH(password) > 0;
+  " 2>/dev/null | tr -d ' \r')"
+  if [ -z "$usable_users" ] || [ "$usable_users" -eq 0 ]; then
+    echo "  ⚠️  No users with passwords found in database"
+    echo "  ⚠️  Dashboard login will fail — check the restore logs above"
+    echo "  ℹ️  Open registration is enabled, so you can create a new account"
+  else
+    echo "  ✅ $usable_users user(s) with passwords ready for login"
+  fi
+
   # On a fresh VM, previously-deployed apps exist in the restored Coolify DB but
   # nothing is running — bring them back via the API (best-effort). Runs AFTER
   # seed_admin so a user/team exists to mint the deploy token from.
@@ -717,17 +766,17 @@ start() {
   echo "  🌐 public: $app_url (add a hostname for localhost:${COOLIFY_PORT} in your CF Zero-Trust tunnel)"
   echo "  🎯 apps via Coolify: deploy a frontend, then route *.apps.<your-domain> → localhost:80 (Coolify's managed proxy)"
 
-  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    {
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then    {
       echo "### 🐳 Coolify is LIVE"
       echo ""
       echo "| Item | Value |"
       echo "|---|---|"
-      echo "| **Dashboard** | [http://localhost:${COOLIFY_PORT}](http://localhost:${COOLIFY_PORT}) |"
+      echo "| **Dashboard** | [http://localhost:${COOLIFY_PORT}](http://localhost:${COOLIFY_PORT})|"
       echo "| **Public URL** | $app_url |"
       echo "| **Login** | \`$login\` |"
       echo "| **Password** | $pw_display |"
       echo "| **REST API** | \`curl -H 'Authorization: Bearer <api-token>' ${app_url}/api/v1/...\` |"
+      echo "| **APP_KEY** | \`${app_key:0:20}...\` (stable across sessions if persisted) |"
       echo ""
       echo "> Add a hostname for \`localhost:${COOLIFY_PORT}\` in your Cloudflare Zero-Trust tunnel ingress for public access. Route deployed apps via \`*.<apps-domain> → localhost:80\`."
     } >> "$GITHUB_STEP_SUMMARY"
