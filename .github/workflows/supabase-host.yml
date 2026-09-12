@@ -132,7 +132,18 @@ jobs:
           # No image cache anymore — images are re-pullable and pull quickly.
           echo "⏳ Pulling Docker images in background..."
           docker compose pull 2>&1 | tail -3 &
+
+          # Ensure the named volume used by Postgres for pgsodium key persist exists.
+          # On a fresh runner, or after a cache miss, this volume can be missing and
+          # `docker compose up` will fail with: external volume "db-config" not found.
+          docker volume create supabase_db-config >/dev/null 2>&1 || true
+
           wait
+
+          # Guard: the compose file declares db-config as external: true, so docker
+          # compose up will hard-fail if a Docker volume named exactly "db-config"
+          # does not exist on the runner (fresh runner or after a cache miss).
+          docker volume create db-config >/dev/null 2>&1 || true
           
           # ══════════════════════════════════════════════════════════════
           # PHASE 2: Configure .env (fast — ~3s)
