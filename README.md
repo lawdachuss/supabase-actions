@@ -25,7 +25,7 @@
 | Feature | Included |
 |---|---|
 | **PostgreSQL database** | ✅ Full Supabase Postgres |
-| **Redis 7 In-Memory Cache** | ✅ Cache + Kong rate-limiting backend + RDB persistence |
+| **Redis 7 In-Memory Cache** | ✅ Cache + Kong rate-limiting backend + RDB persistence + [permanent remote link](#-permanent-redis-link-free--no-card) |
 | **PostgREST API** | ✅ Auto-generated REST API |
 | **Auth (GoTrue)** | ✅ Login, signup, JWT, OAuth |
 | **Realtime subscriptions** | ✅ WebSocket-based live queries |
@@ -104,6 +104,24 @@ You need a domain managed by Cloudflare (free):
 
 Your permanent URL will be: **`https://supabase.yourdomain.com`**
 
+#### Every public hostname this stack can use
+
+Only the first is required. Each one is a **separate Public Hostname entry on the
+same tunnel** — none of them come for free:
+
+| Subdomain | Type | Origin URL | Serves | Required? |
+|---|---|---|---|---|
+| `supabase.<domain>` | HTTP | `localhost:8000` | Studio API, Auth, REST, Realtime — the whole public surface | ✅ |
+| `redis.<domain>` | HTTP | `localhost:8081` | Redis Commander web console (see [🔗 Permanent Redis link](#-permanent-redis-link-free--no-card)) | ⬜ |
+| `coolify.<domain>` | HTTP | `localhost:8082` | The companion Coolify dashboard | ⬜ |
+| `db.<domain>` | **TCP** (not HTTP) | `localhost:5432` | `./pg-tunnel.sh` — a real Postgres connection. Also needs a **Service Auth** Access policy | ⬜ |
+| `*.<apps-domain>` | HTTP | `localhost:80` | Frontends deployed *by* Coolify, via its own managed proxy | ⬜ |
+
+Two things worth knowing before debugging a 404 or 502:
+
+- **There is no wildcard record.** Cloudflare zones don't get a `*.domain` entry by default, so a subdomain you haven't added resolves to nothing at all (`NXDOMAIN`). Every hostname above must be created explicitly — including the `*.<apps-domain>` one, which needs its own wildcard DNS record first.
+- **A DNS record is not a route.** A hostname that answers Cloudflare's **502** has a record *and* a proxy, but nothing on the runner is reachable at the configured origin (e.g. Coolify isn't up) — or the ingress rule points somewhere else. A **404** usually means no ingress rule matches the hostname. `setup-coolify.sh` probes `coolify.<domain>/api/health` at the end of each session and reports which of these it is, so you don't have to guess.
+
 ### Step 4: Generate Secrets
 
 Run these commands locally to generate secure values for your GitHub Secrets:
@@ -172,6 +190,8 @@ Go to **Settings → Secrets and variables → Actions → New repository secret
 | `POSTGRES_PASSWORD` | ✅ Required | Output from `openssl rand -hex 32` |
 | `JWT_SECRET` | ✅ Required | Output from `openssl rand -base64 32` |
 | `DASHBOARD_PASSWORD` | ✅ Required | Your secure Supabase Studio password |
+| `NGROK_AUTHTOKEN` | ⬜ Optional | ngrok **agent authtoken** (dashboard → Your Authtoken). Publishes a permanent link to the Redis web console. Not the API key. |
+| `NGROK_DOMAIN` | ⬜ Optional | ngrok static dev domain to bind, e.g. `uncompiled-tinkly-laronda.ngrok-free.dev`. Omit to let ngrok use the account's assigned domain. |
 
 #### Secrets Reference
 
@@ -209,7 +229,11 @@ The workflow automatically generates all these keys from `JWT_SECRET` — no man
 | `PG_META_CRYPTO_KEY` | `JWT_SECRET` (HMAC-SHA512) | Studio metadata encryption |
 | `LOGFLARE_PUBLIC_TOKEN` / `LOGFLARE_PRIVATE_TOKEN` | `JWT_SECRET` (HMAC-SHA512) | Logflare logging |
 
-> **💡 All keys are deterministic** — same `JWT_SECRET` always produces the same keys. Find them in workflow logs under the "Super-fast startup" step.
+> **💡 All keys are deterministic** — the same `JWT_SECRET` always produces the same keys. To get the **current public keys**, open the latest workflow run and read the **🔑 Current public API keys** table in its summary (or the "Run summary" panel of the run page).
+>
+> Only `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_PUBLISHABLE_KEY` are published — the `service_role` / secret keys are root on the database and are never written to a summary or log. For those, use `remote.env` with `./remote.sh`.
+>
+> ⚠️ A key copied from an old `.env`, an old run, or a tutorial will **not** work: the keys are derived from `JWT_SECRET`, so changing that secret (or the run that generated your copy) silently invalidates every copy. Symptoms are a plain `401` from every endpoint — see the troubleshooting table.
 
 #### 📧 Real auth emails (optional)
 
@@ -312,7 +336,9 @@ A lightweight Redis 7 instance (`redis:7-alpine`) runs alongside the Supabase st
 ### Key Capabilities
 - **Kong Rate-Limiting Backend**: Kong route rate limiting is backed by Redis instead of in-memory local policy, keeping accurate rate-limit counts.
 - **Application Cache**: Accessible on the Docker internal network by all services, Edge Functions, and backend containers.
-- **Cross-Session Persistence**: Redis `SAVE` snapshots (`dump.rdb`) are archived into `supabase-state.tar.gz` and restored automatically across GitHub Actions sessions.
+- **AOF durability**: `--appendonly yes --appendfsync everysec` — every write is appended, so a hard runner kill or container restart loses at most ~1s of writes (RDB alone could lose up to a minute). `--aof-load-truncated yes` keeps a half-written tail from blocking startup.
+- **Cross-Session Persistence**: both the AOF (`appendonlydir/`) and a compact RDB (`dump.rdb`) are archived into `supabase-state.tar.gz` and restored automatically across GitHub Actions sessions. The archive is refreshed every 5 minutes with a **non-blocking** `BGSAVE` + `BGREWRITEAOF` (the old blocking `SAVE` stalled every client for seconds each time).
+- **Health endpoint**: [`/functions/v1/health`](#-redis--tunnel-health) reports Redis and tunnel reachability, including AOF/RDB status.
 - **Interactive Shell**:
   ```bash
   ./run.sh redis-cli
@@ -322,6 +348,39 @@ A lightweight Redis 7 instance (`redis:7-alpine`) runs alongside the Supabase st
   - Port: `6379`
   - Password: `${REDIS_PASSWORD}` (configured in `.env`)
   - Connection URI: `redis://default:${REDIS_PASSWORD}@redis:6379`
+
+### 🔗 Permanent Redis link (free — no card)
+
+The internal `redis://redis:6379` address only resolves inside the Docker network. For an address you can hardcode in an app that runs anywhere, use your **existing Cloudflare Tunnel** — it's already permanent and free:
+
+1. **One-time dashboard step** — Zero Trust → Networks → Tunnels → your tunnel → **Public Hostname** → Add:
+
+   | Field | Value |
+   |---|---|
+   | Subdomain | `redis` |
+   | Domain | your domain (e.g. `chuglii.in`) |
+   | Type | **TCP** |
+   | URL | `localhost:6379` |
+
+   Recommended: add an Access application with a service token so the port isn't open to the world (Redis's password is the only other lock).
+
+2. **Connect** — `cloudflared` is the client half of a TCP tunnel, so run the bundled helper once and leave it up:
+
+   ```bash
+   ./redis-tunnel.sh                 # → redis://127.0.0.1:6379, stays valid forever
+   redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD"
+   ```
+
+   It reads `remote.env` (`REMOTE_URL`/`REDIS_TUNNEL_HOSTNAME`, plus `CF_ACCESS_CLIENT_ID`/`CF_ACCESS_CLIENT_SECRET` if you set an Access token) and prints the ready-to-paste URI.
+
+**Already-permanent alternatives with zero setup:**
+
+- **HTTP cache API** — `https://<your-domain>/functions/v1/cache` (see below); no client software, just `fetch`.
+- **Web console** — if `NGROK_AUTHTOKEN` is set, the workflow publishes the redis-commander UI on your ngrok **free permanent dev domain** and prints the link in the run summary.
+
+> ⚠️ **Why not ngrok for the raw link?** ngrok's free plan includes only a permanent *HTTPS* dev domain. A permanent `redis://host:port` needs a **reserved TCP address**, which ngrok restricts to paid plans — `ngrok tcp 6379` on free prints a **new random `N.tcp.ngrok.io:PORT` every session**, exactly the problem it's meant to solve (and TCP needs a card on file). The Cloudflare route above gets you the same permanence for free.
+>
+> The `bore.pub` relay in the workflow prints an **ephemeral** `bore.pub:<random port>` each session. It's kept as a convenience for quick `redis-cli` access, but never hardcode it.
 
 ### 🌐 Frontend HTTP Cache API (`/functions/v1/cache`)
 
@@ -351,6 +410,122 @@ await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=user:123", {
 });
 ```
 
+#### ⏳ Surviving the session gap
+
+Redis disappears for ~1-2 minutes whenever the runner is replaced. The bridge handles the reconnect itself (it retries forever with backoff), and while it's disconnected it answers **`503` with a `Retry-After` header** instead of hanging. Treat cache reads as optional and writes as best-effort:
+
+```javascript
+async function cacheFetch(url, init) {
+  const res = await fetch(url, init);
+  if (res.status === 503) {
+    // Between sessions — back off for as long as the server asked, then retry.
+    const wait = Number(res.headers.get("Retry-After") || 5) * 1000;
+    throw Object.assign(new Error("redis unavailable"), { retryable: true, wait });
+  }
+  return res;
+}
+
+// Never let a cache miss break the request — fall back to Postgres.
+async function getUser(id) {
+  try {
+    const res = await cacheFetch(`/functions/v1/cache?key=user:${id}`, {
+      headers: { apikey: SUPABASE_ANON_KEY },
+    });
+    if (res.ok) return (await res.json()).value;
+  } catch {
+    /* gap or miss — fall through */
+  }
+  return fetchUserFromPostgres(id);
+}
+```
+
+### 🩺 Redis + tunnel health (`/functions/v1/health`)
+
+One public endpoint tells you whether Redis and the tunnel are actually reachable — useful because this stack is *expected* to have 1-2 minute gaps between sessions:
+
+```bash
+curl https://supabase.yourdomain.com/functions/v1/health
+```
+
+```jsonc
+{
+  "ok": true,
+  "checked_at": "2026-09-21T10:04:11.482Z",
+  "redis": {
+    "ok": true, "status": "ready", "ping": "PONG", "latency_ms": 1, "keys": 42,
+    "persistence": {
+      "aof_enabled": "1",
+      "aof_last_write_status": "ok",
+      "rdb_last_bgsave_status": "ok",
+      "rdb_last_save_iso": "2026-09-21T10:00:07Z"
+    }
+  },
+  "tunnel": {
+    "ok": true, "mode": "cloudflare",
+    "public_url": "https://supabase.yourdomain.com",
+    "status": 200, "latency_ms": 143, "end_to_end": true
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `redis.ok` | A `PING` was answered right now (short timeout, no retries — it reports, it doesn't heal) |
+| `redis.persistence.aof_enabled` | `1` when AOF durability is active. `0` means RDB-only |
+| `tunnel.ok` | The public hostname answered through Cloudflare → Kong |
+| `tunnel.end_to_end` | The whole path answered — tunnel **and** Kong **and** the edge function **and** Redis |
+| `tunnel.mode` | `cloudflare`, or `local` when no `CF_TUNNEL_DOMAIN` is set (nothing to probe, not a failure) |
+
+**Status codes:** `200` when both are up, `503` when either is down — and the `503` carries a `Retry-After` header, so a client that polls this endpoint during a session handover knows to back off and retry instead of treating the gap as a hard failure.
+
+> Internal error strings (which can contain cluster addresses) are omitted by default; add `?verbose=true` to see them.
+
+### 🐘 Connecting to Postgres from outside (`pg-tunnel.sh`)
+
+A plain connection URL against your tunnel domain **cannot work**:
+
+```bash
+postgresql://postgres:PASSWORD@supabase.yourdomain.com:5432/postgres   # ✗ times out
+```
+
+`supabase.yourdomain.com` resolves to Cloudflare's HTTP proxy, which only forwards 80/443 — port 5432 is dropped **at Cloudflare's edge**, so the packets never reach the runner. `supabase-db` also publishes no host port, and the tunnel's only ingress is HTTP to `kong:8000`. Publishing a raw public TCP port needs Cloudflare Spectrum (paid), so the connection is dialled through the tunnel instead:
+
+**1. One-time dashboard setup**
+
+| Step | Where | Value |
+|---|---|---|
+| Add a public hostname | Zero Trust → Networks → Tunnels → your tunnel | Subdomain `db`, Type **TCP**, URL `localhost:5432` (Supavisor, session mode) |
+| Protect it | Zero Trust → Access → Applications → Add → Self-hosted | Domain `db.yourdomain.com`, policy action **Service Auth** |
+| Create the token | Access → Service Auth → Service Tokens | Put the id/secret in `remote.env` |
+
+> 🔓 **The Access policy is not optional.** This repo is public and the Postgres password is in its git history, so the password alone protects nothing — the service token is the only thing between the internet and your database. `pg-tunnel.sh` refuses to start without one (override with `--i-know-what-im-doing` only on a trusted network).
+
+**2. Connect**
+
+```bash
+cat >> remote.env <<'EOF'
+PG_TUNNEL_HOSTNAME=db.yourdomain.com
+CF_ACCESS_CLIENT_ID=<service-token-id>
+CF_ACCESS_CLIENT_SECRET=<service-token-secret>
+EOF
+
+./pg-tunnel.sh          # leave running → opens 127.0.0.1:5432
+# then, in another shell:
+psql "postgresql://postgres.$POOLER_TENANT_ID:***@127.0.0.1:5432/postgres"
+```
+
+**3. Internal URLs (no tunnel needed)**
+
+| From | URL |
+|---|---|
+| Any container on the Docker network | `postgresql://postgres:PASSWORD@db:5432/postgres` |
+| Pooled, session mode (prepared statements OK) | `postgresql://postgres.<POOLER_TENANT_ID>:PASSWORD@supavisor:5432/postgres` |
+| Pooled, transaction mode | `…@supavisor:6543/postgres` |
+
+> ⚠️ Two gotchas: the pooler wants the username `postgres.<POOLER_TENANT_ID>` (bare `postgres` fails auth; the tenant is in `.env`), and **Supavisor crash-loops for ~60s** when a session starts — connection refusals right after a runner boots are expected, not a config error.
+
+**Remember this is still an ephemeral database.** The URL is stable but the server is down 1-2 minutes per session handover, and everything is lost if the Actions cache is evicted. For an app that needs a database that is *always* up, use a managed Postgres and keep this stack for dev/auth/realtime.
+
 ### Step 6: Push & Run
 
 ```bash
@@ -371,6 +546,7 @@ Then go to **Actions → Supabase Self-Hosted → Run workflow** (or wait for th
 | **Auth** | `https://supabase.yourdomain.com/auth/v1/` |
 | **Realtime** | `wss://supabase.yourdomain.com/realtime/v1/` |
 | **ANON KEY** | Visible in Studio settings or from workflow logs |
+| **Redis + tunnel health** | `https://supabase.yourdomain.com/functions/v1/health` |
 | **System Logs** | `https://supabase.yourdomain.com/api/logs` (requires service role key) |
 | **Remote DB / Migrations** | `./remote.sh` (see [🌍 Remote control](#-remote-control--apply-migrations--run-sql-from-anywhere)) |
 
@@ -487,8 +663,16 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 | Port already in use | Runner resets between runs, should be fresh |
 | Rate limited (429) | Open auth routes limited to 30 req/min; SSO ACS to 10 req/min |
 | `supabase-pooler` restarting | Fixed automatically: the workflow restarts supavisor once the DB restore completes. If it still crash-loops, check the start step output for SMTP/.env config errors. |
+| **Can't connect to Postgres — `…:5432` times out** | Expected, not a bug: Cloudflare's proxy drops port 5432 at the edge. Use `./remote.sh` for SQL, or `./pg-tunnel.sh` for a real connection (see [🐘 Connecting to Postgres](#-connecting-to-postgres-from-outside-pg-tunnelsh)) |
+| `password authentication failed` on the pooler | Username must be `postgres.<POOLER_TENANT_ID>` (from `.env`), not bare `postgres` |
+| DB refuses connections right after a session starts | Supavisor crash-loops for ~60s at boot; the workflow restarts it. Retry after a minute. |
+| `cannot find an appropriate entrypoint` from an edge function | The function directory doesn't exist on the runner — commit it (the restore step runs `git checkout -- volumes/functions/`) and make sure it's whitelisted in `.gitignore` |
 | Kong returning errors | Check workflow logs; `KONG_PROXY_ERROR_LOG` is output to stdout |
 | Want object storage? | Add `storage` and `imgproxy` services back to `docker-compose.yml` and mount `storage` SQL init |
+| **Coolify image pre-pull failed** | Not fatal — `docker compose up` re-pulls what's missing. The `🐳 Coolify — pre-pull result` step names the failing image and prints the log tail (full log: `/tmp/coolify-pull.log` on the runner). Usually a registry blip or an image tag/digest that no longer exists. |
+| **Coolify didn't start / smoke test failed** | The `🐳 Coolify — diagnosis (auto)` step runs `utils/coolify-diagnose.sh` and attaches its output to the run summary (collapsed under *Coolify auto-diagnosis*). Normally `coolify-redis` or `coolify-db` never became healthy, which blocks `coolify` via `depends_on`. |
+| Coolify root login rejected | The password must satisfy Coolify's policy: 8+ chars with upper, lower, digit **and** symbol. Set a conforming `COOLIFY_PASSWORD` secret; the workflow re-hashes it onto the root user each session. |
+| Need to inspect Coolify by hand | On the runner: `cd supabase && bash utils/coolify-diagnose.sh` — same script the auto-diagnosis runs, safe to run any time (read-only). |
 
 ---
 

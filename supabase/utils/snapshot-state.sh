@@ -7,6 +7,8 @@
 #   pgsodium_root.key    - Vault encryption key (from the db-config volume)
 #   volumes/functions    - edge functions managed via Studio
 #   volumes/snippets     - SQL snippets managed via Studio
+#   dump.rdb             - Redis RDB (compact, secondary/fallback)
+#   appendonlydir/       - Redis AOF (primary: written on every change)
 #   coolify_backup.dump  - pg_dump of the companion Coolify stack's own DB
 #   volumes/coolify/...  - Coolify secrets + SSH keys (kept stable across
 #                          sessions so APP_KEY still decrypts stored creds)
@@ -62,22 +64,88 @@ else
 fi
 
 # ── 3. Save Redis data (if redis container is running) ──────────────────
+# Redis persists in two formats and BOTH are archived:
+#   appendonlydir/  AOF — primary. Appended on every write, so it captures
+#                   everything up to the last second (durable across in-session
+#                   container restarts and hard kills).
+#   dump.rdb        RDB — compact secondary and fallback if the AOF is ever
+#                   missing/unreadable on restore.
 if docker compose ps --services --filter "status=running" 2>/dev/null | grep -q "^redis$"; then
   echo "  💾 saving Redis data..."
   REDIS_AUTH_FLAG=""
   if [ -n "${REDIS_PASSWORD:-}" ]; then
     REDIS_AUTH_FLAG="-a ${REDIS_PASSWORD}"
   fi
-  docker compose exec -T redis redis-cli $REDIS_AUTH_FLAG save > /dev/null 2>&1 || true
-  # Safely copy dump.rdb via docker cp (daemon level, avoids directory lock/race)
-  if docker compose cp redis:/data/dump.rdb ./dump.rdb.new 2>/dev/null && [ -s ./dump.rdb.new ]; then
+  redis_cli() { docker compose exec -T redis redis-cli $REDIS_AUTH_FLAG "$@" 2>/dev/null; }
+
+  # Poll until ALL named background-persistence flags report 0. Redis only
+  # renames a completed dump/rewrite into place at the very end, so copying
+  # while one is in flight (or merely scheduled) would capture a partial file —
+  # and a broken RDB/AOF makes Redis refuse to boot on the next session.
+  # `aof_rewrite_scheduled` matters too: a rewrite that is queued but not yet
+  # started would otherwise kick off halfway through our copy.
+  wait_persistence() {
+    local tries="${1:-30}"; shift
+    for _ in $(seq 1 "$tries"); do
+      local info busy=0
+      info=$(redis_cli info persistence || true)
+      for field in "$@"; do
+        if echo "$info" | grep -q "${field}:1"; then busy=1; fi
+      done
+      if [ "$busy" -eq 0 ]; then return 0; fi
+      sleep 1
+    done
+    return 1
+  }
+
+  # BGSAVE/BGREWRITEAOF instead of SAVE: a plain SAVE BLOCKS the server for the
+  # whole dump, stalling every client (and Kong's rate limiting) for seconds
+  # every 5 minutes. The background variants let Redis keep serving.
+  redis_cli bgsave > /dev/null 2>&1 || true
+  wait_persistence 30 rdb_bgsave_in_progress rdb_bgsave_scheduled || echo "  ⚠️  BGSAVE still running after 30s"
+
+  # Compact the AOF so the archived copy stays small. Also async.
+  AOF_ENABLED=$(redis_cli config get appendonly | tail -1 || true)
+  if [ "$AOF_ENABLED" = "yes" ]; then
+    redis_cli bgrewriteaof > /dev/null 2>&1 || true
+    wait_persistence 30 aof_rewrite_scheduled aof_rewrite_in_progress || \
+      echo "  ⚠️  BGREWRITEAOF still running after 30s"
+  fi
+
+  # Copy dump.rdb via docker cp (daemon level, avoids directory lock/race).
+  # Validate the RDB magic header before publishing it — a half-written file
+  # would be worse than a stale one, because Redis would fail to start.
+  if docker compose cp redis:/data/dump.rdb ./dump.rdb.new 2>/dev/null && \
+     [ -s ./dump.rdb.new ] && [ "$(head -c 5 ./dump.rdb.new 2>/dev/null)" = "REDIS" ]; then
     mv -f ./dump.rdb.new ./dump.rdb
     chmod 644 ./dump.rdb 2>/dev/null || true
-    echo "  ✅ Redis dump saved ($(du -h ./dump.rdb | cut -f1))"
-  elif [ -s ./volumes/redis/data/dump.rdb ]; then
-    cp -f ./volumes/redis/data/dump.rdb ./dump.rdb 2>/dev/null || true
-    chmod 644 ./dump.rdb 2>/dev/null || true
-    echo "  ✅ Redis dump copied ($(du -h ./dump.rdb | cut -f1))"
+    echo "  ✅ Redis RDB saved ($(du -h ./dump.rdb | cut -f1))"
+  else
+    rm -f ./dump.rdb.new
+    if [ -s ./volumes/redis/data/dump.rdb ]; then
+      cp -f ./volumes/redis/data/dump.rdb ./dump.rdb 2>/dev/null || true
+      chmod 644 ./dump.rdb 2>/dev/null || true
+      echo "  ✅ Redis RDB copied ($(du -h ./dump.rdb | cut -f1))"
+    fi
+  fi
+
+  # AOF (Redis 7 multi-part: appendonlydir/ + .manifest). Only published when
+  # the manifest AND at least one .aof file are present: a partial directory
+  # would stop Redis from starting on restore, which is worse than losing a tail.
+  if [ "$AOF_ENABLED" = "yes" ]; then
+    rm -rf ./appendonlydir.new
+    mkdir -p ./appendonlydir.new
+    if docker compose cp redis:/data/appendonlydir/. ./appendonlydir.new/ 2>/dev/null && \
+       [ -s ./appendonlydir.new/appendonly.aof.manifest ] && \
+       ls ./appendonlydir.new/*.aof > /dev/null 2>&1; then
+      rm -rf ./appendonlydir
+      mv -f ./appendonlydir.new ./appendonlydir
+      chmod -R a+rX ./appendonlydir 2>/dev/null || true
+      echo "  ✅ Redis AOF saved ($(du -sh ./appendonlydir | cut -f1))"
+    else
+      rm -rf ./appendonlydir.new
+      echo "  ⚠️  Redis AOF incomplete — keeping previous copy (RDB still archived)"
+    fi
   fi
 fi
 
@@ -122,6 +190,7 @@ ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -s ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
 [ -s ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
 [ -s ./dump.rdb ] && ARCHIVE_FILES="$ARCHIVE_FILES dump.rdb"
+[ -d ./appendonlydir ] && ARCHIVE_FILES="$ARCHIVE_FILES appendonlydir"
 [ -s ./coolify_backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES coolify_backup.dump"
 [ -s ./volumes/coolify/source/.env ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/source/.env"
 [ -d ./volumes/coolify/ssh ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/ssh"
@@ -141,7 +210,14 @@ sudo -n chmod -R a+rX ./volumes/coolify 2>/dev/null || chmod -R a+rX ./volumes/c
 
 rm -f ./supabase-state.tar.gz.new
 TAR_LOG=$(mktemp)
-if tar --warning=no-file-changed --ignore-failed-read --exclude='./volumes/coolify/ssh/mux/*' \
+# NOTE: the exclude pattern must match the stored member names, which are
+# built by `-C .` + relative paths and therefore have NO './' prefix. The old
+# './volumes/coolify/ssh/mux/*' pattern never matched anything, so the
+# transient SSH mux sockets (owned by the container user, unreadable by the
+# runner) were packed anyway — exactly what this exclude exists to prevent.
+if tar --warning=no-file-changed --ignore-failed-read \
+   --exclude='volumes/coolify/ssh/mux' \
+   --exclude='./volumes/coolify/ssh/mux' \
    -czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>"$TAR_LOG" && \
    mv -f ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
   SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)

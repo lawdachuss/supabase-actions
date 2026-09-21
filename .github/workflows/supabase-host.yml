@@ -42,6 +42,14 @@
 #   COOLIFY_ADMIN_PASSWORD  - password for the fallback admin created when the
 #                             restored Coolify DB has no users.
 #   COOLIFY_AUTO_REDEPLOY   - set to 0 to stop re-deploying stored apps each run
+#
+# Permanent Redis link (see README § "Permanent Redis link"):
+#   Raw redis:// is served by the EXISTING Cloudflare Tunnel over a free TCP
+#   public hostname (redis.<your-domain> → localhost:6379); clients run
+#   ./redis-tunnel.sh. ngrok's free plan cannot reserve a TCP address, so it is
+#   used only for the permanent Redis web console:
+#   NGROK_AUTHTOKEN         - ngrok agent authtoken (optional, console only)
+#   NGROK_DOMAIN            - ngrok static dev domain to bind (optional)
 # =============================================================================
 
 name: 🚀 Full Supabase Self-Hosted
@@ -117,12 +125,14 @@ jobs:
           # PHASE 1: Prepare dependencies (parallel background jobs)
           # ══════════════════════════════════════════════════════════════
           (
-            # Download cloudflared & bore (TCP tunnel for Redis)
+            # Download cloudflared, bore, and ngrok (TCP tunnels for Redis)
             curl -sL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
               -o /usr/local/bin/cloudflared &&
             chmod +x /usr/local/bin/cloudflared &&
             curl -sL --retry 3 https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /usr/local/bin &&
             chmod +x /usr/local/bin/bore &&
+            curl -sL --retry 3 https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | tar -xz -C /usr/local/bin &&
+            chmod +x /usr/local/bin/ngrok &&
             cloudflared version
           ) &
           pip install 'ecdsa>=0.19.0' -q &
@@ -286,6 +296,22 @@ jobs:
               print(f"All {len(reps)} replacements applied")
           with open('.env','w') as f: f.write(env_content)
           print(".env configured")
+
+          # ── Publish the PUBLIC keys ────────────────────────────────────────
+          # The keys are derived from JWT_SECRET, which is a write-only GitHub
+          # secret — so without this there is NO way to obtain a current anon
+          # key for a client app (the stale copy in a committed/old .env is
+          # signed by whatever secret was in use back then).
+          #
+          # Only the PUBLIC keys are exported. The service_role / secret keys are
+          # root on the database and are deliberately NOT published: run
+          # summaries are readable by anyone who can read the repo.
+          gh_env = os.environ.get('GITHUB_ENV')
+          if gh_env:
+              with open(gh_env, 'a') as f:
+                  f.write(f'PUBLIC_ANON_KEY={anon_key}\n')
+                  f.write(f'PUBLIC_PUBLISHABLE_KEY={pub_k}\n')
+              print("Public API keys exported for the run summary")
           PYEOF
         env:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -405,14 +431,29 @@ jobs:
               echo "  🗄️  DB dump: absent (fresh database)"
             fi
             if [ -f ./dump.rdb ]; then
-              echo "  💾 Redis dump: $(du -h ./dump.rdb | cut -f1) — restoring to volumes/redis/data"
+              echo "  💾 Redis RDB: $(du -h ./dump.rdb | cut -f1) — restoring to volumes/redis/data"
               mkdir -p volumes/redis/data
               cp -f ./dump.rdb volumes/redis/data/dump.rdb
               chmod -R 777 volumes/redis/data
               rm -f ./dump.rdb
             elif [ -f ./volumes/redis/data/dump.rdb ]; then
-              echo "  💾 Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1) — ready for redis container"
+              echo "  💾 Redis RDB: $(du -h ./volumes/redis/data/dump.rdb | cut -f1) — ready for redis container"
               chmod -R 777 volumes/redis/data 2>/dev/null || true
+            fi
+            # AOF is Redis's primary store, so it's restored last — when both are
+            # present Redis loads the AOF and ignores the RDB. Only a COMPLETE
+            # directory (manifest + at least one .aof file) is restored: a partial
+            # copy would make Redis refuse to start, which is worse than falling
+            # back to the RDB.
+            if [ -s ./appendonlydir/appendonly.aof.manifest ] && ls ./appendonlydir/*.aof >/dev/null 2>&1; then
+              echo "  💾 Redis AOF: $(du -sh ./appendonlydir | cut -f1) — restoring to volumes/redis/data/appendonlydir"
+              mkdir -p volumes/redis/data
+              rm -rf volumes/redis/data/appendonlydir
+              mv -f ./appendonlydir volumes/redis/data/appendonlydir
+              chmod -R 777 volumes/redis/data
+            elif [ -d ./appendonlydir ]; then
+              echo "  ⚠️  Redis AOF in archive is incomplete — ignoring it (RDB fallback will be used)"
+              rm -rf ./appendonlydir
             fi
             if [ -s ./coolify_backup.dump ]; then
               echo "  🐳 Coolify dump: $(du -h ./coolify_backup.dump | cut -f1) — will restore on Coolify start"
@@ -488,7 +529,13 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/setup-coolify.sh prep
-          nohup bash -c "bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
+          # Pre-pull in the background. The full log AND the exit status are kept
+          # in /tmp so the "pre-pull result" step below can announce a failure,
+          # instead of it disappearing into a file nobody reads (a failed pull
+          # used to resurface later only as a slow or broken Coolify start).
+          rm -f /tmp/coolify-pull.log /tmp/coolify-pull.status
+          nohup bash -c 'bash utils/setup-coolify.sh pull; echo $? > /tmp/coolify-pull.status' \
+            > /tmp/coolify-pull.log 2>&1 &
 
       # ── Prune stale cache entries (best-effort, keeps newest 3) ──────────
       # Keeps the Actions cache small (end-of-run state archives) so it never
@@ -721,7 +768,45 @@ jobs:
               if [ -n "$BORE_PORT" ]; then
                 echo "REDIS_TCP_PORT=$BORE_PORT" >> $GITHUB_ENV
                 echo "REDIS_TCP_HOST=bore.pub" >> $GITHUB_ENV
-                echo "Redis TCP tunnel active at bore.pub:$BORE_PORT"
+                echo "Redis TCP tunnel active at bore.pub:$BORE_PORT (EPHEMERAL — port changes next session)"
+              fi
+            fi
+
+            # ── Permanent Redis web console via ngrok (free plan) ────────────
+            # ngrok's FREE plan cannot reserve a TCP address, so it cannot give a
+            # permanent raw redis://host:port — `ngrok tcp 6379` prints a NEW
+            # random N.tcp.ngrok.io:PORT every session, i.e. no better than bore
+            # (and TCP needs a card on file). What the free plan DOES include is
+            # one permanent HTTPS dev domain, so we use ngrok for the thing it
+            # can actually keep stable: a permanent browser/HTTP link to Redis
+            # (redis-commander on :8081). Default is the account's assigned dev
+            # domain; override with the NGROK_DOMAIN var/secret.
+            # Permanent RAW TCP is served by Cloudflare instead — free, no card.
+            # See README § "Permanent Redis link".
+            if [ -n "${{ secrets.NGROK_AUTHTOKEN }}" ] && command -v ngrok >/dev/null 2>&1; then
+              ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}" >/dev/null 2>&1 || true
+              NGROK_DOMAIN="${{ vars.NGROK_DOMAIN || secrets.NGROK_DOMAIN }}"
+              NGROK_ARGS=(http 8081 --log stdout --log-format json)
+              if [ -n "$NGROK_DOMAIN" ]; then
+                NGROK_ARGS+=(--url "https://$NGROK_DOMAIN")
+              fi
+              nohup ngrok "${NGROK_ARGS[@]}" > /tmp/ngrok.log 2>&1 &
+              NGROK_PID=$!
+              for i in $(seq 1 12); do
+                sleep 1
+                if grep -q '"url":"https://' /tmp/ngrok.log 2>/dev/null; then break; fi
+                if ! kill -0 "$NGROK_PID" 2>/dev/null; then
+                  echo "  ⚠️  ngrok exited early:"
+                  tail -5 /tmp/ngrok.log 2>/dev/null || true
+                  break
+                fi
+              done
+              NGROK_HOST=$(grep -oP '"url":"https://\K[^"]+' /tmp/ngrok.log 2>/dev/null | head -1)
+              if [ -n "$NGROK_HOST" ]; then
+                echo "REDIS_NGROK_HOST=$NGROK_HOST" >> $GITHUB_ENV
+                echo "Redis web console (permanent): https://$NGROK_HOST"
+              else
+                echo "  ⚠️  ngrok reported no public URL — Redis console stays on the Cloudflare route"
               fi
             fi
           }
@@ -763,7 +848,53 @@ jobs:
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
 
-      # ── Coolify: start + health check (best-effort — never kills the session)
+      # ── Coolify: surface the background image pre-pull ────────────────────
+      # The pre-pull is launched detached by the "prepare" step, so without this
+      # its outcome is invisible — a failed pull only shows up later as a slow
+      # (or failed) Coolify start. Wait briefly for the recorded exit status,
+      # report it, and print the log tail so the cause is visible in the run.
+      # Purely informational: `docker compose up` pulls anything still missing,
+      # so this step never fails the session.
+      - name: 🐳 Coolify — pre-pull result
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          LOG=/tmp/coolify-pull.log
+          STATUS=/tmp/coolify-pull.status
+
+          # Wait for the background job to record its exit status, but don't
+          # stall for the full timeout if it was never launched at all.
+          waited=0
+          while [ ! -f "$STATUS" ] && [ "$waited" -lt 120 ]; do
+            if [ ! -f "$LOG" ] && [ "$waited" -ge 10 ]; then break; fi
+            sleep 2
+            waited=$((waited + 2))
+          done
+
+          rc="$(cat "$STATUS" 2>/dev/null || true)"
+          if [ ! -f "$STATUS" ] && [ ! -f "$LOG" ]; then
+            echo "::warning title=🐳 Coolify pre-pull did not run::No log or status file — the prepare step failed before launching it."
+            { echo "### 🐳 Coolify image pre-pull"; echo "";
+              echo "⚠️ Did not run — the prepare step failed before launching it."; } >> "$GITHUB_STEP_SUMMARY"
+          elif [ ! -f "$STATUS" ]; then
+            echo "::warning title=🐳 Coolify pre-pull still running::No exit status after ${waited}s — 'docker compose up' will pull any missing image itself."
+            { echo "### 🐳 Coolify image pre-pull"; echo "";
+              echo "⏳ Still running after ${waited}s — \`up\` pulls whatever is missing."; } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$rc" = "0" ]; then
+            echo "✅ Coolify image pre-pull finished — images are cached locally, so the Coolify start won't spend its time pulling them."
+            { echo "### 🐳 Coolify image pre-pull"; echo "";
+              echo "✅ Finished — images cached locally."; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=🐳 Coolify pre-pull FAILED::compose pull exited ${rc} — Coolify retries the pull during 'up'. Log tail below."
+            { echo "### 🐳 Coolify image pre-pull"; echo "";
+              echo "⚠️ **Failed (exit ${rc})** — Coolify retries the pull during \`up\`."; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -s "$LOG" ]; then
+            echo ""
+            echo "──── pre-pull log (last 30 lines) ────"
+            tail -30 "$LOG"
+            echo "──────────────────────────────────────"
+          fi
       # Starts the Coolify stack and polls its health endpoint. On failure this
       # emits a warning and exits 0 so the Supabase session continues; Coolify
       # retries on the next session.
@@ -775,27 +906,88 @@ jobs:
           COOLIFY_ADMIN_PASSWORD: ${{ secrets.COOLIFY_ADMIN_PASSWORD }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
+          rm -f /tmp/coolify-failed
           if bash utils/setup-coolify.sh start; then
             COOLIFY_URL=$(grep -E '^COOLIFY_APP_URL=' .env 2>/dev/null | cut -d= -f2-)
             COOLIFY_URL="${COOLIFY_URL:-http://localhost:8082}"
-            echo "::notice title=🐳 Coolify is LIVE::$COOLIFY_URL — permanent link (dashboard also at http://localhost:8082)"
+            # Only the runner-local dashboard is certain here. setup-coolify.sh
+            # probes the public subdomain itself and emits its own ::notice or
+            # ::warning for it, so this step must not announce that URL as a
+            # "permanent link" — doing so previously claimed a URL that answers
+            # 502 until a matching Zero-Trust ingress rule exists.
+            echo "::notice title=🐳 Coolify dashboard is up::http://localhost:8082 (public URL, if configured: $COOLIFY_URL)"
           else
+            # Marker for the auto-diagnosis step below. This step must still exit
+            # 0 (Coolify is best-effort and must never kill the Supabase session),
+            # so the failure is handed forward out-of-band instead.
+            echo "start (exit 1) — Coolify did not come up" >> /tmp/coolify-failed
             echo "::warning title=🐳 Coolify failed to start::Supabase stays up. Check the coolify container logs above; it retries next session."
           fi
 
       # ── Coolify smoke test ───────────────────────────────────────────────
       # Asserts the three things that used to fail silently: a usable admin,
       # open registration, and an authenticated deploy API. Exits non-zero on
-      # regression, so a broken dashboard shows up as a red step instead of
-      # hours of a quietly unusable Coolify.
-      # NOTE: this step FAILS the run, which skips the Supabase steps below
-      # (migrations, keepalive) and makes workflow-watchman restart the session.
-      # Add `continue-on-error: true` here if Coolify should stay best-effort.
+      # regression, so a broken dashboard is visibly flagged instead of being
+      # followed by hours of a quietly unusable Coolify.
+      # `continue-on-error: true` keeps Coolify best-effort: a failed smoke test
+      # is reported but never fails the run, so the Supabase steps below
+      # (migrations, keepalive) and the live session are unaffected.
+      # Remove it if a broken Coolify SHOULD fail the session.
       - name: 🐳 Coolify — smoke test
         continue-on-error: true
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          bash utils/setup-coolify.sh smoke
+          if bash utils/setup-coolify.sh smoke; then
+            echo "✅ Coolify smoke test passed"
+          else
+            # Marker for the auto-diagnosis step below. The step's own red X is
+            # preserved through continue-on-error, which keeps the job alive.
+            echo "smoke test (exit 1) — Coolify started but its checks failed" >> /tmp/coolify-failed
+            echo "::warning title=🐳 Coolify smoke test failed::Auto-diagnosis runs in the next step."
+            exit 1
+          fi
+
+      # ── Coolify: auto-diagnosis (only when something failed) ──────────────
+      # The start and smoke steps are best-effort and must exit 0, so they record
+      # their failure in /tmp/coolify-failed instead of failing the job. This step
+      # turns that marker into an actual diagnosis: it runs utils/coolify-diagnose.sh
+      # and mirrors the output into the run summary, so the reason is attached to
+      # the run rather than left buried in a step log nobody scrolls back to.
+      - name: 🐳 Coolify — diagnosis (auto)
+        if: ${{ !cancelled() }}
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          FLAG=/tmp/coolify-failed
+          if [ ! -s "$FLAG" ]; then
+            echo "✅ No Coolify failure recorded this session — skipping auto-diagnosis."
+            exit 0
+          fi
+
+          # Join the recorded reasons with "; " (not a bare ";", which would
+          # run them together as "...come up;smoke test...").
+          REASON="$(awk 'NR>1{printf "; "} {printf "%s", $0}' "$FLAG")"
+          echo "🐳 Coolify failed this session — running utils/coolify-diagnose.sh"
+          echo "   reason: $REASON"
+          echo ""
+
+          DIAG_LOG=/tmp/coolify-diagnose.log
+          # `|| true`: a diagnosis must never become its own failure. Also keeps
+          # the step safe under `bash -e`.
+          bash utils/coolify-diagnose.sh 2>&1 | tee "$DIAG_LOG" || true
+
+          {
+            echo "### 🐳 Coolify auto-diagnosis"
+            echo ""
+            echo "**Why it ran:** $REASON"
+            echo ""
+            echo "<details><summary><code>utils/coolify-diagnose.sh</code> output</summary>"
+            echo ""
+            echo '```'
+            cat "$DIAG_LOG" 2>/dev/null || echo "(diagnosis produced no output)"
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ── Apply committed migrations (versioned schema changes) ────────────
       # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs
@@ -937,7 +1129,6 @@ jobs:
           export REDIS_PASSWORD  # must be exported so snapshot-state.sh subprocess can use it for redis-cli auth
 
           BASE_DOMAIN=$(echo "$DOMAIN" | sed 's/^supabase\.//')
-          REDIS_SUBDOMAIN="redis.$BASE_DOMAIN"
 
           echo ""
           echo "+=============================================================+"
@@ -948,13 +1139,15 @@ jobs:
           echo "|  Tunnel:        Connected via Cloudflare                    |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "|  Studio Domain: https://$DOMAIN                               |"
-            echo "|  Redis Web UI:  https://$REDIS_SUBDOMAIN (port 8081)           |"
+            echo "|  Redis Raw TCP: redis.$BASE_DOMAIN (./redis-tunnel.sh)    |"
+            echo "|  Redis Web UI:  https://redis-ui.$BASE_DOMAIN (port 8081)      |"
             echo "|  Cache API:     https://$DOMAIN/functions/v1/cache         |"
           fi
+          if [ -n "${REDIS_NGROK_HOST:-}" ]; then
+            echo "|  Redis console: https://$REDIS_NGROK_HOST   |"
+          fi
           if [ -n "${REDIS_TCP_PORT:-}" ]; then
-            echo "|  Redis TCP:     ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT} (or $REDIS_SUBDOMAIN)     |"
-          else
-            echo "|  Redis:         redis:6379 (Docker internal network)        |"
+            echo "|  Redis now:     ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT} (ephemeral)       |"
           fi
           echo "|  Snapshots:     every 5 min → saved at shutdown             |"
           echo "|                                                             |"
@@ -976,31 +1169,53 @@ jobs:
               echo "| Service | Link / Endpoint |"
               echo "|---|---|"
               echo "| 🖥️ **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
-              echo "| ⚡ **Redis Web Dashboard** | [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) *(route to \`localhost:8081\` in CF Zero Trust)* |"
-              if [ -n "${REDIS_TCP_PORT:-}" ]; then
-                echo "| ⚡ **Redis Direct TCP** | \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@$REDIS_SUBDOMAIN:${REDIS_TCP_PORT}\` |"
+              if [ -n "${REDIS_NGROK_HOST:-}" ]; then
+                echo "| ⚡ **Redis web console (permanent)** | [https://$REDIS_NGROK_HOST](https://$REDIS_NGROK_HOST) *(ngrok dev domain — zero config)* |"
               fi
               echo "| ⚡ **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
+              echo "| 🩺 **Redis + tunnel health** | [https://$DOMAIN/functions/v1/health](https://$DOMAIN/functions/v1/health) |"
               echo "| 📡 **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
               echo "| 🔒 **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
               echo ""
-              if [ -n "${REDIS_TCP_PORT:-}" ]; then
-                echo "#### ⚡ Connect to Redis from Anywhere:"
-                echo "- **Permanent URI**: \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@$REDIS_SUBDOMAIN:${REDIS_TCP_PORT}\` *(requires CNAME \`$REDIS_SUBDOMAIN\` → \`bore.pub\` in DNS)*"
-                echo "- **Direct Relay URI**: \`redis://default:${REDIS_PASSWORD:-Basudevkr123}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\`"
-                echo "- **CLI Command**: \`redis-cli -h ${REDIS_TCP_HOST:-bore.pub} -p ${REDIS_TCP_PORT} -a ${REDIS_PASSWORD:-Basudevkr123}\`"
+              if [ -n "${PUBLIC_ANON_KEY:-}" ]; then
+                echo "#### 🔑 Current public API keys (copy these into your app)"
+                echo ""
+                echo "These change whenever \`JWT_SECRET\` changes — always take them from the newest run. They are public by design (they ship in browser bundles and are enforced by RLS), unlike the service_role key."
+                echo ""
+                echo "| Key | Value |"
+                echo "|---|---|"
+                echo "| \`SUPABASE_URL\` | \`https://$DOMAIN\` |"
+                echo "| \`SUPABASE_ANON_KEY\` | \`$PUBLIC_ANON_KEY\` |"
+                if [ -n "${PUBLIC_PUBLISHABLE_KEY:-}" ]; then
+                  echo "| \`SUPABASE_PUBLISHABLE_KEY\` | \`$PUBLIC_PUBLISHABLE_KEY\` |"
+                fi
+                echo ""
+                echo "_The \`service_role\` / secret keys are intentionally omitted — they are root on the database. Get them from \`./remote.sh\`'s \`remote.env\`, never from here._"
                 echo ""
               fi
-              echo "- **Redis Web GUI**: [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) (credentials: \`redis\` / \`redis\`)"
+              echo "#### ⚡ Connect to Redis from Anywhere"
+              echo ""
+              echo "**Permanent (free, no card, no new provider)** — raw Redis over your existing Cloudflare Tunnel; the hostname never changes:"
+              echo '```bash'
+              echo "./redis-tunnel.sh                 # opens redis://127.0.0.1:6379  →  redis.$BASE_DOMAIN"
+              echo "redis-cli -h 127.0.0.1 -p 6379 -a '$REDIS_PASSWORD'"
+              echo '```'
+              echo "Needs a one-time \`TCP\` public hostname in Zero Trust → Tunnels (README § Permanent Redis link)."
+              echo ""
+              echo "**Permanent HTTP cache API** (already live, no client software): \`https://$DOMAIN/functions/v1/cache\`"
+              echo "**Health probe** (Redis + tunnel, 503 + Retry-After during session gaps): \`https://$DOMAIN/functions/v1/health\`"
+              if [ -n "${REDIS_TCP_PORT:-}" ]; then
+                echo ""
+                echo "_Ephemeral fallback this session — the port changes every session, do not hardcode it:_"
+                echo "- \`redis://default:${REDIS_PASSWORD}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\`"
+              fi
+              echo ""
+              echo "- **Redis Web GUI**: [https://redis-ui.$BASE_DOMAIN](https://redis-ui.$BASE_DOMAIN) *(route to \`localhost:8081\` in CF Zero Trust)*"
               echo "- **Redis Internal**: \`redis:6379\` (Docker network)"
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ -n "${REDIS_TCP_PORT:-}" ]; then
-            echo "::notice title=🚀 Supabase & Redis Live::Studio: https://$DOMAIN | Redis Web: https://$REDIS_SUBDOMAIN | TCP: ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}"
-          else
-            echo "::notice title=🚀 Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
-          fi
+          echo "::notice title=🚀 Supabase & Redis Live::Studio: https://$DOMAIN | Redis permanent TCP: redis.$BASE_DOMAIN (./redis-tunnel.sh) | Redis HTTP API: https://$DOMAIN/functions/v1/cache${REDIS_NGROK_HOST:+ | Redis console: https://$REDIS_NGROK_HOST}"
 
           # ── Keepalive loop + health checks + 5-min on-disk snapshots ──
           # (run_id/run_attempt are used by the final cache-save step's key)

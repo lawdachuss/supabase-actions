@@ -99,6 +99,55 @@ password_ok() {
   return 0
 }
 
+# Verify that the public subdomain actually serves Coolify.
+#
+# COOLIFY_APP_URL is DERIVED from CF_TUNNEL_DOMAIN (https://coolify.<base>), so
+# its presence in .env proves nothing — the Cloudflare side needs a manual
+# ingress rule. A hostname can have a DNS record and be proxied by Cloudflare
+# yet still answer 502 when no working route to an origin exists. Probe it and
+# report what is true at the edge, because advertising a "permanent link" that
+# does not resolve is worse than admitting it is not configured.
+#
+#  200/301/302   the route works end-to-end           -> success
+#  502           proxied, but no reachable origin      -> ingress points nowhere
+#  404           cloudflared's catch-all               -> no ingress rule at all
+#  000           DNS/route missing entirely
+check_public_url() { # url -> prints a verdict, returns 0 only when it serves
+  local url="$1" code
+  if [ -z "$url" ]; then
+    echo "⚠️  no public URL configured (CF_TUNNEL_DOMAIN unset) — dashboard is runner-local only"
+    return 1
+  fi
+  # curl prints 000 ITSELF when there is no response, so never append another
+  # one: the old `|| echo 000` produced the unmatchable string "000000", which
+  # fell through to the generic branch instead of the intended 000 case.
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "${url}/api/health" 2>/dev/null)" || true
+  [ -n "$code" ] || code="000"
+  case "$code" in
+    200|204|301|302)
+      echo "✅ public subdomain verified (HTTP $code on ${url}/api/health)"
+      return 0 ;;
+    502)
+      echo "⚠️  ${url}/api/health returns HTTP 502 — the DNS record and Cloudflare proxy exist,"
+      echo "     but the tunnel could not reach an origin for this hostname on this runner."
+      echo "     Fix: Zero Trust → Tunnels → your tunnel → Public Hostname → add"
+      echo "     subdomain 'coolify', type HTTP, URL 'localhost:${COOLIFY_PORT}'."
+      return 1 ;;
+    404)
+      echo "⚠️  ${url}/api/health returns HTTP 404 — no tunnel ingress rule matches this hostname."
+      echo "     Fix: Zero Trust → Tunnels → your tunnel → Public Hostname → add"
+      echo "     subdomain 'coolify', type HTTP, URL 'localhost:${COOLIFY_PORT}'."
+      return 1 ;;
+    000)
+      echo "⚠️  ${url} is unreachable (DNS record missing or no route) — add a Public"
+      echo "     Hostname for 'coolify' → HTTP://localhost:${COOLIFY_PORT} in Zero Trust."
+      return 1 ;;
+    *)
+      echo "⚠️  ${url}/api/health returned HTTP $code (expected 200 from the Coolify API)."
+      return 1 ;;
+  esac
+}
+
 # psql against the companion Coolify DB. Uses the CONFIGURED user/name (written
 # to .env by prep) so a non-default COOLIFY_DB_USERNAME / COOLIFY_DB_NAME keeps
 # working; falls back to the Coolify defaults.
@@ -217,10 +266,12 @@ smoke() {
   #    4xx because the resource doesn't exist; 401/403 means auth or the API
   #    gate (instance_settings.is_api_enabled) is broken.
   if token="$(mint_deploy_token)"; then
+    # curl already emits 000 when there is no response — see check_public_url.
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
       -H "Authorization: Bearer $token" \
       "http://127.0.0.1:${COOLIFY_PORT}/api/v1/deploy?uuid=00000000-0000-0000-0000-000000000000" \
-      2>/dev/null || echo 000)"
+      2>/dev/null)" || true
+    [ -n "$code" ] || code="000"
     case "$code" in
       200|201|202|204|400|404|422)
         echo "  ✅ deploy API reachable and authenticated (HTTP $code)" ;;
@@ -395,9 +446,18 @@ pull() {
   # Assumes prep already ran (the workflow runs it synchronously first) so the
   # env_file + .env interpolation exist. pull() itself only reads, never writes,
   # so it can run in the background without racing the later start() prep.
+  #
+  # Output is deliberately NOT truncated: the workflow redirects this whole job
+  # to /tmp/coolify-pull.log and surfaces the tail afterwards, and the useful
+  # lines on a failure are the compose errors — which `| tail -5` would keep
+  # only if the failure happened to be the last thing printed.
   echo "🐳 Pre-pulling Coolify images (coolify, postgres, redis, realtime)..."
-  "${COMPOSE_CMD[@]}" pull coolify coolify-postgres coolify-redis coolify-realtime 2>&1 | tail -5
-  echo "🐳 Image pull finished."
+  if "${COMPOSE_CMD[@]}" pull coolify coolify-postgres coolify-redis coolify-realtime; then
+    echo "🎯 image pull finished"
+    return 0
+  fi
+  echo "⚠️  image pull FAILED — 'docker compose up' retries it for each missing image"
+  return 1
 }
 
 redeploy_apps() {
@@ -441,9 +501,11 @@ redeploy_apps() {
   local queued=0 failed=0 code
   while IFS= read -r u; do
     [ -z "$u" ] && continue
+    # curl already emits 000 when there is no response — see check_public_url.
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 -X POST \
       -H "Authorization: Bearer $token" \
-      "$api_url?uuid=$u&force=false" 2>/dev/null || echo 000)"
+      "$api_url?uuid=$u&force=false" 2>/dev/null)" || true
+    [ -n "$code" ] || code="000"
     case "$code" in
       200|201|202|204|302) echo "  ✅ queued deploy for $u (HTTP $code)"; queued=$((queued + 1)) ;;
       401|403) echo "  ⚠️  deploy for $u denied (HTTP $code) — API access or token ability rejected"; failed=$((failed + 1)) ;;
@@ -583,11 +645,21 @@ SQL
   sql="${sql//__TU_MD__/$tu_md}";    sql="${sql//__TUV_MD__/$tuv_md}";    sql="${sql//__HAS_TEAM_USER__/$tu_exs}"
   sql="${sql//__SET_CUR__/$cur_set}"
 
+  # Never echo an operator-supplied secret. GitHub masks *registered* secrets in
+  # logs, but a password read back from the persisted Coolify env is not
+  # registered and would be printed verbatim — so gate on where it came from.
+  local pw_display
+  if [ -n "${COOLIFY_ADMIN_PASSWORD:-}" ]; then
+    pw_display='set via the `COOLIFY_ADMIN_PASSWORD` repo secret (not printed)'
+  else
+    pw_display="$pw"
+  fi
+
   local err
   err="$(coolify_psql -v ON_ERROR_STOP=1 -c "$sql" 2>&1 >/dev/null)"
   if [ -z "$err" ] || ! printf '%s' "$err" | grep -q "ERROR"; then
     n="$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | head -1 | tr -d ' \r')"
-    echo "  ✅ admin seeded: $name <$email> ($n user(s) now) — login: $email / $pw"
+    echo "  ✅ admin seeded: $name <$email> ($n user(s) now) — login: $email / $pw_display"
   else
     echo "  ⚠️  admin seeding failed — ${err//$'\n'/ }"
   fi
@@ -595,6 +667,14 @@ SQL
 
 start() {
   prep
+
+  # prep() computes APP_KEY as a *function-local*, so it does not exist here.
+  # Referencing ${app_key} directly (as this used to) aborts the whole script
+  # under `set -u` — and it happened BEFORE `compose up -d coolify`, so the app
+  # container was never started and Coolify could never come up at all. Read it
+  # back from the Coolify env that prep() just wrote.
+  local app_key
+  app_key="$(env_value APP_KEY "$SOURCE_ENV")"
 
   # ── Phase 1: infra only (db, redis, realtime) — no app yet ──
   echo "🐳 Starting Coolify infrastructure (postgres, redis, realtime)..."
@@ -645,7 +725,7 @@ start() {
     echo "  📊 Coolify user tables (public schema): $TABLES"
     # Verify users table has data (not just exists)
     if [ -n "$TABLES" ] && [ "$TABLES" -gt 0 ]; then
-      USERS COUNT=$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | tr -d ' \r')
+      USERS_COUNT=$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | tr -d ' \r')
       echo "  👤 Users in database: ${USERS_COUNT:-0}"
       if [ -n "${USERS_COUNT:-}" ] && [ "$USERS_COUNT" -gt 0 ]; then
         echo "  ✅ User data persisted across sessions"
@@ -760,34 +840,56 @@ start() {
     fi
   fi
 
+  # The public subdomain is a separate, manual Cloudflare-side step, so probe it
+  # instead of claiming it works (see check_public_url for the status codes).
+  local public_ok=0 public_msg public_badge
+  if public_msg="$(check_public_url "$app_url")"; then public_ok=1; fi
+  if [ "$public_ok" -eq 1 ]; then public_badge="✅ verified"; else public_badge="⚠️ not serving"; fi
+
   echo ""
   echo "  ✅ Coolify is LIVE on http://127.0.0.1:${COOLIFY_PORT}"
   echo "  🔑 login: $login / password in the run summary (or the COOLIFY_PASSWORD secret)"
-  echo "  🌐 public: $app_url (add a hostname for localhost:${COOLIFY_PORT} in your CF Zero-Trust tunnel)"
-  echo "  🎯 apps via Coolify: deploy a frontend, then route *.apps.<your-domain> → localhost:80 (Coolify's managed proxy)"
+  echo "  🌐 public URL: ${app_url:-<none>} [$public_badge]"
+  printf '%s\n' "$public_msg" | sed 's/^/     /'
+  echo "  🎯 apps via Coolify: deploy a frontend, then route a wildcard hostname → localhost:80 (Coolify's managed proxy)"
+
+  # Surface the public-URL verdict as a step annotation: a 502 here previously
+  # went unnoticed while the run advertised the URL as a working permanent link.
+  if [ "$public_ok" -eq 1 ]; then
+    echo "::notice title=🐳 Coolify is publicly reachable::$app_url"
+  else
+    echo "::warning title=🐳 Coolify public URL is not serving::$app_url — the dashboard still works on the runner at http://localhost:${COOLIFY_PORT}; see the ingress instructions above."
+  fi
 
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then    {
       echo "### 🐳 Coolify is LIVE"
       echo ""
       echo "| Item | Value |"
       echo "|---|---|"
-      echo "| **Dashboard** | [http://localhost:${COOLIFY_PORT}](http://localhost:${COOLIFY_PORT})|"
-      echo "| **Public URL** | $app_url |"
+      echo "| **Dashboard (runner)** | [http://localhost:${COOLIFY_PORT}](http://localhost:${COOLIFY_PORT})|"
+      echo "| **Public URL** | ${app_url:-<none>} $public_badge |"
       echo "| **Login** | \`$login\` |"
       echo "| **Password** | $pw_display |"
       echo "| **REST API** | \`curl -H 'Authorization: Bearer <api-token>' ${app_url}/api/v1/...\` |"
       echo "| **APP_KEY** | \`${app_key:0:20}...\` (stable across sessions if persisted) |"
       echo ""
-      echo "> Add a hostname for \`localhost:${COOLIFY_PORT}\` in your Cloudflare Zero-Trust tunnel ingress for public access. Route deployed apps via \`*.<apps-domain> → localhost:80\`."
+      echo "$(printf '%s\n' "$public_msg" | head -1)"
+      echo ""
+      echo "> Deployed apps need their own ingress too. A wildcard DNS record and a \`*.apps.<your-domain> → localhost:80\`\n> hostname are both required — a wildcard record usually does not exist on the zone."
     } >> "$GITHUB_STEP_SUMMARY"
   fi
+
+  return 0
 }
 
 status() {
   "${COMPOSE_CMD[@]}" ps coolify coolify-postgres coolify-redis coolify-realtime
   echo ""
   echo "Coolify UI:        http://127.0.0.1:${COOLIFY_PORT}"
-  echo "Public URL:        $(env_value COOLIFY_APP_URL)"
+  local u
+  u="$(env_value COOLIFY_APP_URL)"
+  echo "Public URL:        ${u:-<none>}"
+  check_public_url "$u" | sed 's/^/                   /' || true
 }
 
 case "$ACTION" in

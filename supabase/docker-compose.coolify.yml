@@ -127,10 +127,18 @@ services:
     image: redis:7-alpine
     container_name: coolify-redis
     restart: unless-stopped
+    # NOTE: `--save` must be followed by TWO separate argv entries. Redis
+    # builds its config from argv as `save <token>`, and its save parser
+    # rejects an odd number of parameters ("Invalid save parameters") — so a
+    # single quoted `"20 1"` token makes redis-server exit immediately. That
+    # used to stop coolify-redis from ever becoming healthy, and since the
+    # coolify service gates on `condition: service_healthy`, Coolify itself
+    # could never start.
     command:
       - redis-server
       - --save
-      - "20 1"
+      - "20"
+      - "1"
       - --loglevel
       - warning
       - --requirepass

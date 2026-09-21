@@ -27,14 +27,30 @@ services:
       retries: 5
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
+    # ── Durability ─────────────────────────────────────────────────────────
+    # AOF (appendonly) is the primary safety net: every write is appended, so a
+    # hard runner kill or a container restart loses at most ~1s of writes
+    # (everysec) instead of everything back to the last RDB point.
+    #   --aof-use-rdb-preamble : compacts each rewrite (smaller, faster load)
+    #   --aof-load-truncated   : a half-written tail must never stop Redis from
+    #                            booting after a hard kill
+    # RDB stays enabled as a compact secondary + fallback, and now fires as soon
+    # as there's a SINGLE change within 60s (was: 100 changes / 60s, and 5 min).
+    # Both formats are captured in the state archive by utils/snapshot-state.sh.
     command:
       [
         "redis-server",
         "--requirepass", "${REDIS_PASSWORD}",
         "--maxmemory", "${REDIS_MAXMEMORY:-128mb}",
         "--maxmemory-policy", "${REDIS_MAXMEMORY_POLICY:-allkeys-lru}",
-        "--save", "300", "1",
-        "--save", "60", "100",
+        "--appendonly", "${REDIS_APPENDONLY:-yes}",
+        "--appendfsync", "${REDIS_APPENDFSYNC:-everysec}",
+        "--aof-use-rdb-preamble", "yes",
+        "--aof-load-truncated", "yes",
+        "--auto-aof-rewrite-percentage", "${REDIS_AOF_REWRITE_PERCENT:-100}",
+        "--auto-aof-rewrite-min-size", "${REDIS_AOF_REWRITE_MIN_SIZE:-64mb}",
+        "--save", "${REDIS_SAVE_SECONDS:-60}", "1",
+        "--save", "300", "10",
         "--dir", "/data"
       ]
 

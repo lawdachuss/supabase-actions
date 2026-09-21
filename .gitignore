@@ -25,12 +25,17 @@ Thumbs.db
 !/supabase/volumes/functions/cache/*
 !/supabase/volumes/functions/migrate/
 !/supabase/volumes/functions/migrate/*
+!/supabase/volumes/functions/health/
+!/supabase/volumes/functions/health/*
 
 # State archives (database dumps — contain data, never commit)
 /supabase/backup.dump
 /supabase/backup.dump.new
 /supabase/dump.rdb
 /supabase/dump.rdb.new
+# Redis AOF (multi-part appendonly dir) captured by snapshot-state.sh
+/supabase/appendonlydir
+/supabase/appendonlydir.new
 /supabase/pgsodium_root.key
 /supabase/supabase-state.tar.gz
 /supabase/supabase-state.tar.gz.new

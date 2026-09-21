@@ -30,12 +30,12 @@ If you registered an account in a previous session:
 
 The root user is created automatically:
 
-- **Email**: Check the workflow logs for `ROOT_USER_EMAIL` (default: `coolify@<your-domain>`)
+- **Email**: Shown as the **Login** row of the "🐳 Coolify is LIVE" table in the run summary; also stored as `ROOT_USER_EMAIL` in `volumes/coolify/source/.env` (default: `coolify@<your-domain>`)
 - **Password**: Set via `COOLIFY_PASSWORD` GitHub secret, or auto-generated
 
-The workflow will display:
+The `🐳 Coolify — start + health check` step logs:
 ```
-🔑 login: coolify@yourdomain.com / password in the run summary
+  🔑 login: coolify@yourdomain.com / password in the run summary (or the COOLIFY_PASSWORD secret)
 ```
 
 ### Option 3: Register a New Account

@@ -6,7 +6,7 @@
 # =============================================================================
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]})/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 COMPOSE_CMD=(docker compose -f docker-compose.yml -f docker-compose.logs.yml -f docker-compose.redis.yml -f docker-compose.coolify.yml)
 
@@ -15,7 +15,7 @@ echo ""
 
 # Check if containers are running
 echo "📦 Container status:"
-COMPOSE_CMD[@] ps coolify coolify-postgres coolify-redis coolify-realtime 2>/dev/null || echo "  (containers not running)"
+"${COMPOSE_CMD[@]}" ps coolify coolify-postgres coolify-redis coolify-realtime 2>/dev/null || echo "  (containers not running)"
 echo ""
 
 # Check Coolify DB
@@ -68,7 +68,13 @@ if [ -f "volumes/coolify/source/.env" ]; then
   echo "  ✅ Found volumes/coolify/source/.env"
   echo "  APP_KEY: $(grep '^APP_KEY=' volumes/coolify/source/.env 2>/dev/null | cut -d= -f2- | head -c 20)..."
   echo "  ROOT_USER_EMAIL: $(grep '^ROOT_USER_EMAIL=' volumes/coolify/source/.env 2>/dev/null | cut -d= -f2-)"
-  echo "  ROOT_USER_PASSWORD: $(grep '^ROOT_USER_PASSWORD=' volumes/coolify/source/.env 2>/dev/null | cut -d= -f2- | head -c 10)..."
+  # Report only whether it exists — printing a prefix of a live credential into
+  # a (public, for this repo) run log is a needless leak.
+  if grep -q '^ROOT_USER_PASSWORD=.' volumes/coolify/source/.env 2>/dev/null; then
+    echo "  ROOT_USER_PASSWORD: set (not printed)"
+  else
+    echo "  ROOT_USER_PASSWORD: MISSING — the root user may not be able to log in"
+  fi
 else
   echo "  ❌ volumes/coolify/source/.env NOT FOUND"
 fi
