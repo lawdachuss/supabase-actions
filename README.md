@@ -282,7 +282,7 @@ It calls a built-in edge function (`/api/migrate` or `/functions/v1/migrate`, se
 
 > ⚠️ Migration SQL must be **pure SQL** — psql meta-commands (`\c`, `\set`) don't exist over HTTPS. The service_role key is effectively root on this database: keep it secret (it's the same key Studio / the REST API use). Want read-only mode? Set `MIGRATE_READONLY=true` on the `functions` service in `supabase/docker-compose.yml`.
 >
-> On Windows run `bash remote.sh ...` from Git Bash or WSL. `remote.env` is gitignored.
+> On Windows run `bash remote.sh ...` from Git Bash or WSL. `remote.env` is gitignored. `remote.sh` needs `curl` and either `python3` or `node`.
 
 ## 🔑 Personal Access Tokens
 
