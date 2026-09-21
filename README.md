@@ -36,6 +36,7 @@
 | **pg_cron (scheduled jobs)** | ✅ |
 | **Custom access token hook** | ✅ (opt-in) |
 | **Versioned migrations** | ✅ (`supabase/migrations/`) |
+| **Remote migrations / DB admin** | ✅ (`./remote.sh` — push & run SQL over HTTPS) |
 | **Permanent URL** | ✅ Cloudflare Tunnel (static domain) |
 | **Data persistence** | ✅ Full state backed up at shutdown → restored next run |
 | **Object Storage** | ❌ Not included |
@@ -254,6 +255,35 @@ git add supabase/migrations/002-avatar-url.sql && git commit && git push
 
 Failed migrations are left unapplied and retry next session. See `supabase/migrations/README.md`. A ready-to-use **custom access token hook** (`001-custom-access-token-hook.sql`) is included — flip `ENABLE_CUSTOM_ACCESS_TOKEN_HOOK=true` to turn it on and edit the function to add claims.
 
+### 🌍 Remote control — apply migrations & run SQL from anywhere
+
+Committed migrations only apply at the *next* session. When a session is LIVE and the tunnel is up, you can push schema changes **instantly over HTTPS** with the bundled `remote.sh` — no SSH, no TCP exposure, no waiting for the 6-hour restart:
+
+```bash
+# 1. Configure once (either keep secrets out of git)
+cat > remote.env <<EOF
+REMOTE_URL=https://supabase.yourdomain.com
+REMOTE_SERVICE_KEY=<your service_role key>
+EOF
+
+# 2. Use it — same commands work from any machine
+./remote.sh status                     # list applied migrations + DB info
+./remote.sh run "CREATE TABLE public.notes (id bigserial primary key, body text);"
+./remote.sh run < schema.sql           # one-off SQL from a file/stdin
+./remote.sh push                       # apply supabase/migrations/*.sql (idempotent)
+./remote.sh push supabase/migrations/003-foo.sql
+./remote.sh untrack 002-backfill-user-emails.sql   # make it re-apply on next push
+```
+
+It calls a built-in edge function (`/api/migrate` or `/functions/v1/migrate`, service-role key required) that executes SQL as the postgres superuser and records each applied migration in `public._schema_migrations` — **the same table** the session-start step uses, so:
+- remote pushes and committed migrations share one idempotent source of truth (never double-apply),
+- a migration you push remotely rides the 5-minute state snapshot into the next session's backup,
+- the next session sees it already applied and skips it.
+
+> ⚠️ Migration SQL must be **pure SQL** — psql meta-commands (`\c`, `\set`) don't exist over HTTPS. The service_role key is effectively root on this database: keep it secret (it's the same key Studio / the REST API use). Want read-only mode? Set `MIGRATE_READONLY=true` on the `functions` service in `supabase/docker-compose.yml`.
+>
+> On Windows run `bash remote.sh ...` from Git Bash or WSL. `remote.env` is gitignored.
+
 ## 🔑 Personal Access Tokens
 
 Generate `sbp_` personal access tokens just like Supabase Cloud:
@@ -342,6 +372,7 @@ Then go to **Actions → Supabase Self-Hosted → Run workflow** (or wait for th
 | **Realtime** | `wss://supabase.yourdomain.com/realtime/v1/` |
 | **ANON KEY** | Visible in Studio settings or from workflow logs |
 | **System Logs** | `https://supabase.yourdomain.com/api/logs` (requires service role key) |
+| **Remote DB / Migrations** | `./remote.sh` (see [🌍 Remote control](#-remote-control--apply-migrations--run-sql-from-anywhere)) |
 
 ---
 

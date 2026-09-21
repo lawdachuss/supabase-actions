@@ -27,6 +27,14 @@ echo "ALTER TABLE public.users ADD COLUMN IF NOT EXISTS avatar_url text;" > supa
 - Destructive statements run too — that's the point of versioned migrations, but
   review before committing.
 
+### Apply instantly from anywhere (no commit needed)
+
+While a session is LIVE, the repo-root [`remote.sh`](../../remote.sh) pushes SQL
+over HTTPS to the running instance; see the README's "Remote control" section.
+Remote pushes and committed files share the same `public._schema_migrations`
+tracking table, so they never double-apply, and both survive the 6-hour session
+restarts.
+
 ## Included example
 
 - `001-custom-access-token-hook.sql` — pass-through `public.custom_access_token_hook`

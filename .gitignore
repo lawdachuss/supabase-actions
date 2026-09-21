@@ -1,5 +1,9 @@
 # Supabase local environment (contains secrets!)
 .env
+/supabase/.env
+
+# Remote control credentials for ./remote.sh (contains the service_role key!)
+/remote.env
 
 # OS files
 .DS_Store
@@ -14,11 +18,13 @@ Thumbs.db
 /supabase/volumes/functions/*
 # Coolify runtime storage (SSH keys, secrets, project configs)
 /supabase/volumes/coolify/
-# The logs and cache edge functions ship with the repo
+# The logs, cache and migrate edge functions ship with the repo
 !/supabase/volumes/functions/logs/
 !/supabase/volumes/functions/logs/*
 !/supabase/volumes/functions/cache/
 !/supabase/volumes/functions/cache/*
+!/supabase/volumes/functions/migrate/
+!/supabase/volumes/functions/migrate/*
 
 # State archives (database dumps — contain data, never commit)
 /supabase/backup.dump

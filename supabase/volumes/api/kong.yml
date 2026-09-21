@@ -405,6 +405,38 @@ services:
           allow:
             - admin
 
+  ## Remote DB Admin + Migrations API — /api/migrate* -> edge function 'migrate' (admin only)
+  ## Applies migrations / runs one-off SQL on the remote database over HTTPS.
+  ## Requires the service_role key (key-auth + admin ACL). The function re-verifies
+  ## the key itself, so the public /functions/v1/migrate route is just as safe.
+  - name: migrate-api
+    _comment: 'Migrations: /api/migrate* -> http://functions:9000/migrate/*'
+    url: http://functions:9000/migrate
+    read_timeout: 120000
+    routes:
+      - name: migrate-api-all
+        strip_path: true
+        paths:
+          - /api/migrate
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - "Authorization: $LUA_AUTH_EXPR"
+          replace:
+            headers:
+              - "Authorization: $LUA_AUTH_EXPR"
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+
   ## OAuth 2.0 Authorization Server Metadata (RFC 8414)
   - name: well-known-oauth
     _comment: 'Auth: /.well-known/oauth-authorization-server -> http://auth:9999/.well-known/oauth-authorization-server'
