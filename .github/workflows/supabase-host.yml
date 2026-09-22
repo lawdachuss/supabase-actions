@@ -799,6 +799,7 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
           COOLIFY_ADMIN_PASSWORD: ${{ secrets.COOLIFY_ADMIN_PASSWORD }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
           if bash utils/setup-coolify.sh start; then

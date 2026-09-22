@@ -164,28 +164,73 @@ coolify_psql() {
 # sha256(plaintext) in personal_access_tokens.token, so inserting the hash here
 # is exactly what the UI's "Create token" does. Echoes the plaintext token on
 # success; returns 1 (printing nothing) when there is no user/team yet.
+#
+# When the operator's own API token (COOLIFY_API_TOKEN secret, value format
+# "<id>|<40-char-secret>") is available, the deploy token is minted for THAT
+# exact row (tokenable + team). This keeps the deploy ability on the SAME team
+# as the applications the operator creates through their token — otherwise a
+# UI-created token (team N) combined with a minted token for the first user's
+# first team (team M) makes POST /api/v1/deploy 404 for those apps. Falls back
+# to the first user's first team when the value is unavailable/unmatched.
 mint_deploy_token() {
+  # Team (and tokenable) of the operator's API token, if known — see below.
+  local operator_tk
+  operator_tk="$(resolve_api_token)"
   local token token_hash count
   token="coolify-autodeploy-$(rand_hex 16)"
   token_hash="$(printf '%s' "$token" | sha256sum 2>/dev/null | cut -d' ' -f1)"
   [ -n "$token_hash" ] || return 1
   coolify_psql -q -c "UPDATE instance_settings SET is_api_enabled = true, updated_at = now();" \
     >/dev/null 2>&1 || true
-  coolify_psql -v ON_ERROR_STOP=1 -q -c "
+  local op_hash op_team op_tokenable
+  op_hash="$(printf '%s' "$operator_tk" | cut -d'|' -f2)"
+  op_team="$(printf '%s' "$operator_tk" | cut -d'|' -f3)"
+  op_tokenable="$(printf '%s' "$operator_tk" | cut -d'|' -f4)"
+  if [ -n "$op_hash" ] && [ -n "$op_team" ] && [ -n "$op_tokenable" ] \
+     && printf '%s' "$op_hash" | grep -qE '^[0-9a-f]{64}$'; then
+    coolify_psql -v ON_ERROR_STOP=1 -q -c "
+      DELETE FROM personal_access_tokens WHERE name = 'coolify-autodeploy';
+      INSERT INTO personal_access_tokens
+        (tokenable_type, tokenable_id, name, token, abilities, team_id, created_at, updated_at)
+      SELECT 'App\Models\User', $op_tokenable, 'coolify-autodeploy', '$token_hash',
+             '[\"deploy\"]'::json, $op_team, now(), now()
+      WHERE EXISTS (SELECT 1 FROM users WHERE id = $op_tokenable);" >/dev/null 2>&1 || return 1
+  else
+    coolify_psql -v ON_ERROR_STOP=1 -q -c "
       DELETE FROM personal_access_tokens WHERE name = 'coolify-autodeploy';
       INSERT INTO personal_access_tokens
         (tokenable_type, tokenable_id, name, token, abilities, team_id, created_at, updated_at)
       SELECT 'App\Models\User', u.id, 'coolify-autodeploy', '$token_hash',
-             '["deploy"]'::json, t.team_id, now(), now()
+             '[\"deploy\"]'::json, t.team_id, now(), now()
       FROM users u
       JOIN team_user t ON t.user_id = u.id
       ORDER BY u.id, t.team_id
       LIMIT 1;" >/dev/null 2>&1 || return 1
+  fi
   count="$(coolify_psql -t -A -c \
     "SELECT COUNT(*) FROM personal_access_tokens WHERE token = '$token_hash';" \
     2>/dev/null | tr -d ' \r')"
   [ "$count" = "1" ] || return 1
   printf '%s' "$token"
+}
+
+# Identity of the operator's API token inside Coolify's DB, used to pin teams.
+# The COOLIFY_API_TOKEN secret has the form "<id>|<40-char-secret>"; Sanctum
+# stores sha256 of the part after the '|' in personal_access_tokens.token.
+# Echoes "hash|team_id|tokenable_id" (empty hash when unavailable), so callers
+# can align the deploy token and the localhost server with the SAME team the
+# operator's apps will be created in.
+resolve_api_token() {
+  local val hash row
+  val="${COOLIFY_API_TOKEN:-}"
+  printf '%s' "$val" | grep -q '|' || { return 0; }
+  hash="$(printf '%s' "${val#*|}" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$hash" ] || return 0
+  row="$(coolify_psql -t -A -c \
+    "SELECT team_id || '|' || tokenable_id FROM personal_access_tokens WHERE token = '$hash' LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  [ -n "$row" ] || return 0
+  printf '%s|%s' "$hash" "$row"
 }
 
 # RootUserSeeder creates the root user (id 0) exactly once, so a
@@ -218,6 +263,55 @@ sync_root_password() {
     echo "  🔑 root password synced to the COOLIFY_PASSWORD secret"
   else
     echo "  ⚠️  could not sync the root password to COOLIFY_PASSWORD"
+  fi
+}
+
+# Re-home the built-in 'localhost' server to the operator's API-token team.
+#
+# COOLIFY_API_TOKEN comes from the UI, whose API surface resolves applications
+# with Server::whereTeamId($this->teamId)->whereUuid($serverUuid) — every
+# POST /api/v1/applications/* therefore needs the target server OWned by the
+# token's team. But the 'localhost' / 'host.docker.internal' row is created at
+# first boot under whatever team seed_admin or the seeder happened to use, and
+# headless installs never complete the wizard that would re-attribute it to the
+# operator's own team. The result is a reliable
+# 404 "Server not found." on app creation (the server exists, just not in the
+# token's team), which the UI avoids only because the onboarding wizard re-creates
+# the row under the logged-in user's team. We do the equivalent re-homing in SQL,
+# pinned to the exact team of the token whose hash matches COOLIFY_API_TOKEN
+# (falling back to the first user's first team). Idempotent; best-effort.
+ensure_localhost_server() {
+  local srv
+  srv="$(coolify_psql -t -A -c \
+    "SELECT uuid || '|' || team_id FROM servers WHERE ip = 'host.docker.internal' LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  [ -n "$srv" ] || { echo "  ℹ️  no localhost server row yet — nothing to re-home"; return 0; }
+
+  local op target_team now_team
+  op="$(resolve_api_token)"
+  # resolve_api_token echoes "<sha256>|<team_id>|<tokenable_id>"
+  target_team="$(printf '%s' "$op" | cut -d'|' -f2)"
+  if [ -z "$target_team" ]; then
+    target_team="$(coolify_psql -t -A -c \
+      "SELECT t.team_id FROM team_user t JOIN users u ON u.id = t.user_id ORDER BY u.id, t.team_id LIMIT 1;" \
+      2>/dev/null | tr -d ' \r')"
+  fi
+  [ -n "$target_team" ] || { echo "  ⚠️  could not determine a team for the localhost server — skipping"; return 0; }
+
+  local srv_uuid
+  srv_uuid="${srv%%|*}"
+  now_team="$(coolify_psql -t -A -c \
+    "SELECT team_id FROM servers WHERE uuid = '$srv_uuid';" 2>/dev/null | tr -d ' \r')"
+  if [ "$now_team" = "$target_team" ]; then
+    echo "  ✅ localhost server $srv_uuid already owned by team $target_team"
+    return 0
+  fi
+  if coolify_psql -v ON_ERROR_STOP=1 -q -c \
+      "UPDATE servers SET team_id = $target_team, updated_at = now() WHERE uuid = '$srv_uuid';" \
+      >/dev/null 2>&1; then
+    echo "  🗄️  localhost server $srv_uuid re-homed to team $target_team (API app-creation will now find it)"
+  else
+    echo "  ⚠️  could not re-home the localhost server (check the session log)"
   fi
 }
 
@@ -809,6 +903,9 @@ start() {
   # On a fresh VM, previously-deployed apps exist in the restored Coolify DB but
   # nothing is running — bring them back via the API (best-effort). Runs AFTER
   # seed_admin so a user/team exists to mint the deploy token from.
+  # The built-in localhost server is pinned to this team first, so the API can
+  # attach new applications to it (see ensure_localhost_server).
+  ensure_localhost_server || true
   redeploy_apps || true
 
   local app_url root_pass login pw_display
