@@ -27,6 +27,8 @@ Thumbs.db
 !/supabase/volumes/functions/migrate/*
 !/supabase/volumes/functions/health/
 !/supabase/volumes/functions/health/*
+!/supabase/volumes/functions/redis-http/
+!/supabase/volumes/functions/redis-http/*
 
 # State archives (database dumps — contain data, never commit)
 /supabase/backup.dump

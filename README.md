@@ -375,6 +375,7 @@ The internal `redis://redis:6379` address only resolves inside the Docker networ
 
 **Already-permanent alternatives with zero setup:**
 
+- **General-purpose Redis HTTPS bridge** — `POST https://<your-domain>/functions/v1/redis-http` with `{ "cmd": "get", "args": [...] }` (or `pipeline`). Auth: `apikey: <SUPABASE_SERVICE_ROLE_KEY>` (or `REDIS_LINK_TOKEN`). This is the permanent Redis endpoint used by the frontend API on Vercel, where `cloudflared` can't run. Works from any HTTP client, no software. See `supabase/volumes/functions/redis-http/index.ts`.
 - **HTTP cache API** — `https://<your-domain>/functions/v1/cache` (see below); no client software, just `fetch`.
 - **Web console** — if `NGROK_AUTHTOKEN` is set, the workflow publishes the redis-commander UI on your ngrok **free permanent dev domain** and prints the link in the run summary.
 
