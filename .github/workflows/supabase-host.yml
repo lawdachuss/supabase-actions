@@ -824,6 +824,32 @@ jobs:
           cd ${{ env.SUPABASE_DIR }}
           bash utils/setup-coolify.sh smoke
 
+      # ── Coolify: publish a session API token as a short-lived artifact ───
+      # The operator's dashboard token can be absent from a restored DB, and
+      # Coolify's own mints are not observable from outside the runner. Mint a
+      # fresh full-access token each session so external automation (app
+      # provisioning via the API) has working credentials, and hand it out as a
+      # 1-day artifact. The row is deleted at the next session's start, so a
+      # leaked value dies with the session.
+      - name: 🐳 Coolify — publish session API token (artifact)
+        run: |
+          cd ${{ env.SUPABASE_DIR }}
+          if ! bash utils/setup-coolify.sh api-token > /tmp/coolify-session-token.txt 2>/tmp/coolify-session-diag.txt; then
+            echo "::warning title=🐳 session API token mint failed::$(tail -1 /tmp/coolify-session-diag.txt)"
+            exit 1
+          fi
+          echo "session API token: $(stat -c%s /tmp/coolify-session-token.txt) bytes on stdout"
+          cat /tmp/coolify-session-diag.txt
+      - name: 🔖 Upload Coolify session token artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: coolify-session-token
+          path: /tmp/coolify-session-token.txt
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: true
+
       # ── Apply committed migrations (versioned schema changes) ────────────
       # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs
       # already get the volumes/db/*.sql init scripts at first boot). Files are

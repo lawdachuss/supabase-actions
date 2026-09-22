@@ -315,6 +315,52 @@ ensure_localhost_server() {
   fi
 }
 
+# Mint a fresh full-access API token for THIS session so external automation
+# (e.g. a workflow artifact consumed by an operator CLI) always has working
+# credentials — the operator's dashboard-created token may not exist in the
+# restored DB, and relying on a long-lived stored token is fragile.
+#   - deletes any previous 'coolify-session-api' row, so a leaked previous
+#     value is dead the moment the next session starts,
+#   - pinned to the SAME team ensure_localhost_server uses (first user's first
+#     team) so app-creation works out of the box,
+#   - echoes ONLY the plaintext token on stdout (redirected into the artifact);
+#     all diagnostics go to stderr.
+api_token() {
+  local team user_id token token_hash count
+  coolify_psql -q -c "UPDATE instance_settings SET is_api_enabled = true, updated_at = now();" \
+    >/dev/null 2>&1 || true
+  team="$(coolify_psql -t -A -c \
+    "SELECT t.team_id FROM team_user t JOIN users u ON u.id = t.user_id ORDER BY u.id, t.team_id LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  [ -n "$team" ] || { echo "api-token: no team found" >&2; return 1; }
+  user_id="$(coolify_psql -t -A -c \
+    "SELECT u.id FROM users u JOIN team_user t ON t.user_id = u.id AND t.team_id = $team ORDER BY u.id LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  [ -n "$user_id" ] || { echo "api-token: no user for team $team" >&2; return 1; }
+  token="coolify-session-api-$(rand_hex 20)"
+  token_hash="$(printf '%s' "$token" | sha256sum 2>/dev/null | cut -d' ' -f1)"
+  [ -n "$token_hash" ] || { echo "api-token: hash failed" >&2; return 1; }
+  if ! coolify_psql -v ON_ERROR_STOP=1 -q -c "
+      DELETE FROM personal_access_tokens WHERE name = 'coolify-session-api';
+      INSERT INTO personal_access_tokens
+        (tokenable_type, tokenable_id, name, token, abilities, team_id, created_at, updated_at)
+      VALUES ('App\Models\User', $user_id, 'coolify-session-api', '$token_hash',
+              '[\"*\"]'::json, $team, now(), now());" >/dev/null 2>&1; then
+    echo "api-token: insert failed" >&2; return 1
+  fi
+  count="$(coolify_psql -t -A -c \
+    "SELECT COUNT(*) FROM personal_access_tokens WHERE token = '$token_hash';" \
+    2>/dev/null | tr -d ' \r')"
+  [ "$count" = "1" ] || { echo "api-token: verify failed" >&2; return 1; }
+  local n_users n_servers server_team
+  n_users="$(coolify_psql -t -A -c "SELECT COUNT(*) FROM users;" 2>/dev/null | tr -d ' \r')"
+  n_servers="$(coolify_psql -t -A -c "SELECT COUNT(*) FROM servers;" 2>/dev/null | tr -d ' \r')"
+  server_team="$(coolify_psql -t -A -c \
+    "SELECT team_id FROM servers WHERE ip = 'host.docker.internal' LIMIT 1;" 2>/dev/null | tr -d ' \r')"
+  echo "api-token: minted for team=$team user=$user_id (users=$n_users servers=$n_servers localhostTeam=${server_team:-none})" >&2
+  printf '%s' "$token"
+}
+
 # Post-start assertions for the paths that used to fail silently: a usable
 # admin, open registration and an authenticated deploy API. Exits non-zero when
 # any check fails so a broken dashboard shows up as a red step, not as hours of
@@ -995,5 +1041,6 @@ case "$ACTION" in
   start)   start ;;
   status)  status ;;
   smoke)   smoke ;;
-  *) echo "usage: $0 {prep|pull|start|status|smoke}"; exit 1 ;;
+  api-token) api_token ;;
+  *) echo "usage: $0 {prep|pull|start|status|smoke|api-token}"; exit 1 ;;
 esac
