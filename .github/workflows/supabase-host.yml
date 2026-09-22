@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # ðŸš€ Full Supabase Self-Hosted on GitHub Actions
 # =============================================================================
 # What this does:
@@ -511,9 +511,9 @@ jobs:
           CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
-run: |
-bash utils/setup-coolify.sh prep
-nohup bash -c "bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
+        run: |
+          bash utils/setup-coolify.sh prep
+          nohup bash -c "bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
 
       # â”€â”€ Prune stale cache entries (best-effort, keeps newest 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       # Keeps the Actions cache small (end-of-run state archives) so it never
