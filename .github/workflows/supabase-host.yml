@@ -1129,6 +1129,22 @@ jobs:
             fi
             sleep 10
             TICK=$((TICK + 1))
+
+            # ------------------------------------------------------------------
+            # Graceful operator-triggered shutdown: if the file `.session-stop`
+            # exists in the repo root, exit the keepalive loop (~30s latency).
+            # The run then completes NORMALLY (not cancelled), so the if-always
+            # final-backup and end-of-run cache-save steps still run and the
+            # freshest state archive (incl. the Coolify DB dump + app rows) is
+            # persisted to the GitHub Actions cache for the next session.
+            # Remove the marker (git rm) once the desired session has saved.
+            # ------------------------------------------------------------------
+            if [ $(( TICK % 3 )) -eq 0 ] && curl -sf --max-time 10 -o /dev/null \
+                 "https://raw.githubusercontent.com/${{ github.repository }}/master/.session-stop"; then
+              echo "  End-session marker (.session-stop) detected — ending session gracefully; state will be saved to cache"
+              break
+            fi
+
             if [ $(( TICK % 6 )) -eq 0 ]; then printf "."; fi
           done
           echo ""
