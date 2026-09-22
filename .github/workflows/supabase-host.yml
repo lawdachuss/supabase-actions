@@ -512,8 +512,9 @@ jobs:
           JWT_SECRET: ${{ secrets.JWT_SECRET }}
           COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
         run: |
+          cd ${{ env.SUPABASE_DIR }}
           bash utils/setup-coolify.sh prep
-          nohup bash -c "bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
+          nohup bash -c "cd ${{ env.SUPABASE_DIR }} && bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
 
       #  Prune stale cache entries (best-effort, keeps newest 3) 
       # Keeps the Actions cache small (end-of-run state archives) so it never
@@ -800,6 +801,7 @@ jobs:
           COOLIFY_ADMIN_PASSWORD: ${{ secrets.COOLIFY_ADMIN_PASSWORD }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
         run: |
+          cd ${{ env.SUPABASE_DIR }}
           if bash utils/setup-coolify.sh start; then
             COOLIFY_URL=$(grep -E '^COOLIFY_APP_URL=' .env 2>/dev/null | cut -d= -f2-)
             COOLIFY_URL="${COOLIFY_URL:-http://localhost:8082}"
@@ -819,6 +821,7 @@ jobs:
       - name:  Coolify  smoke test
         continue-on-error: true
         run: |
+          cd ${{ env.SUPABASE_DIR }}
           bash utils/setup-coolify.sh smoke
 
       #  Coolify: publish a session API token as a short-lived artifact 
@@ -830,6 +833,7 @@ jobs:
       # leaked value dies with the session.
       - name:  Coolify  publish session API token (artifact)
         run: |
+          cd ${{ env.SUPABASE_DIR }}
           if ! bash utils/setup-coolify.sh api-token > /tmp/coolify-session-token.txt 2>/tmp/coolify-session-diag.txt; then
             echo "::warning title= session API token mint failed::$(tail -1 /tmp/coolify-session-diag.txt)"
             exit 1
