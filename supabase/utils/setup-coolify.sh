@@ -315,6 +315,98 @@ ensure_localhost_server() {
   fi
 }
 
+# After a DB restore, the localhost server's SSH key (saved in an earlier dump)
+# rarely matches the ephemeral runner's authorized_keys (a fresh key is generated
+# every run), so every Coolify->host SSH command dies with
+# "Permission denied (publickey)". Re-point the DB key row to the host's CURRENT
+# key (same uuid, new material) so restored sessions can deploy again. Idempotent;
+# the refreshed material is exactly what the end-of-run dump persists for good.
+reconcile_localhost_key() {
+  [ -f "$KEY_FILE" ] || { echo "  ℹ️  no host key ($KEY_FILE) — skipping key reconcile"; return 0; }
+  local host_key_pub
+  host_key_pub="$(ssh-keygen -y -f "$KEY_FILE" 2>/dev/null | tr -d '\r\n')"
+  [ -n "$host_key_pub" ] || { echo "  ⚠️  could not read the public part of the host key — skipping"; return 0; }
+
+  local srv_uuid cur_uuid cur_priv file_priv
+  srv_uuid="$(coolify_psql -t -A -c \
+    "SELECT uuid FROM servers WHERE ip = 'host.docker.internal' ORDER BY id LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  [ -n "$srv_uuid" ] || { echo "  ⚠️  no localhost server row — skipping key reconcile"; return 0; }
+
+  cur_uuid="$(coolify_psql -t -A -c \
+    "SELECT private_key_uuid FROM servers WHERE uuid = '$srv_uuid';" 2>/dev/null | tr -d ' \r')"
+  file_priv="$(tr -d '\r\n' < "$KEY_FILE")"
+  if [ -n "$cur_uuid" ] && [ "$cur_uuid" != "null" ]; then
+    cur_priv="$(coolify_psql -t -A -c \
+      "SELECT private_key FROM private_keys WHERE uuid = '$cur_uuid';" 2>/dev/null | tr -d ' \r\n')"
+    if [ -n "$cur_priv" ] && [ "$cur_priv" = "$file_priv" ]; then
+      echo "  ✅  localhost SSH key already matches the host key ($cur_uuid)"
+      return 0
+    fi
+  fi
+
+  local team_id fp b64_priv b64_pub new_uuid
+  team_id="$(coolify_psql -t -A -c \
+    "SELECT team_id FROM servers WHERE uuid = '$srv_uuid';" 2>/dev/null | tr -d ' \r')"
+  [ -n "$team_id" ] || team_id="$(coolify_psql -t -A -c \
+    "SELECT t.team_id FROM team_user t JOIN users u ON u.id = t.user_id ORDER BY u.id, t.team_id LIMIT 1;" \
+    2>/dev/null | tr -d ' \r')"
+  [ -n "$team_id" ] || { echo "  ⚠️  no team to pin the key to — skipping"; return 0; }
+
+  fp="$(ssh-keygen -lf "$KEY_FILE" 2>/dev/null | awk '{print $2}')"
+  b64_priv="$(base64 -w0 "$KEY_FILE" 2>/dev/null)"
+  b64_pub="$(printf '%s' "$host_key_pub" | base64 -w0 2>/dev/null)"
+
+  if [ -n "$cur_uuid" ] && [ "$cur_uuid" != "null" ]; then
+    if coolify_psql -v ON_ERROR_STOP=1 -q -c "
+        UPDATE private_keys SET
+          private_key = convert_from(decode('$b64_priv','base64'),'UTF8'),
+          public_key  = convert_from(decode('$b64_pub','base64'),'UTF8'),
+          fingerprint = '$fp',
+          team_id     = $team_id,
+          updated_at  = now()
+        WHERE uuid = '$cur_uuid';" >/dev/null 2>&1; then
+      echo "  🔄  localhost SSH key updated to the host key ($cur_uuid)"
+    else
+      echo "  ⚠️  could not update the localhost SSH key (check the session log)"
+      return 1
+    fi
+  else
+    new_uuid="$(coolify_psql -t -A -c \
+      "SELECT gen_random_uuid()::text;" 2>/dev/null | tr -d ' \r')"
+    [ -n "$new_uuid" ] || new_uuid="localhost-key-$(rand_hex 8)"
+    if coolify_psql -v ON_ERROR_STOP=1 -q -c "
+        INSERT INTO private_keys
+          (uuid, name, description, private_key, public_key, fingerprint,
+           is_git_related, team_id, created_at, updated_at)
+        VALUES
+          ('$new_uuid', 'localhost''s key',
+           'The private key for the Coolify host machine (localhost).',
+           convert_from(decode('$b64_priv','base64'),'UTF8'),
+           convert_from(decode('$b64_pub','base64'),'UTF8'),
+           '$fp', false, $team_id, now(), now())
+        ON CONFLICT (uuid) DO UPDATE SET
+          private_key = EXCLUDED.private_key, public_key = EXCLUDED.public_key,
+          team_id = EXCLUDED.team_id, updated_at = now();" \
+      && coolify_psql -v ON_ERROR_STOP=1 -q -c \
+        "UPDATE servers SET private_key_uuid = '$new_uuid', updated_at = now() WHERE uuid = '$srv_uuid';" \
+        >/dev/null 2>&1; then
+      echo "  🔗  localhost SSH key created and linked to the host key ($new_uuid)"
+    else
+      echo "  ⚠️  could not create/link the localhost SSH key (check the session log)"
+      return 1
+    fi
+  fi
+
+  # Make sure the host authorizes the current public key (idempotent).
+  touch "$HOME/.ssh/authorized_keys" 2>/dev/null || true
+  if ! grep -qxF "$host_key_pub" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+    printf '%s\n' "$host_key_pub" >> "$HOME/.ssh/authorized_keys" 2>/dev/null || true
+    echo "  🔑  public key (re)added to authorized_keys"
+  fi
+  return 0
+}
+
 # Mint a fresh full-access API token for THIS session so external automation
 # (e.g. a workflow artifact consumed by an operator CLI) always has working
 # credentials — the operator's dashboard-created token may not exist in the
@@ -952,6 +1044,9 @@ start() {
   # The built-in localhost server is pinned to this team first, so the API can
   # attach new applications to it (see ensure_localhost_server).
   ensure_localhost_server || true
+  # Restored sessions reference an SSH key from an older dump; re-point it to
+  # this host's current key BEFORE redeploying so SSH commands succeed again.
+  reconcile_localhost_key || true
   redeploy_apps || true
 
   local app_url root_pass login pw_display
