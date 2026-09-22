@@ -24,7 +24,15 @@
 # Usage:
 #   cloudflare-backup.sh push <file>            # upload + prune oldest
 #   cloudflare-backup.sh restore <outfile>      # pull latest and reassemble
+#   cloudflare-backup.sh verify                 # confirm 'latest' is restorable (size+sha256)
+#   cloudflare-backup.sh refresh                # renew access token from the .env refresh token
 #   cloudflare-backup.sh list                   # show keys + retention state
+#
+# NOTE on OAuth tokens: Cloudflare 'cfor*' refresh tokens are SINGLE-USE and
+# rotate on every mint. The workflow keeps the rotated token in supabase/.env so
+# the chain survives on a persistent runner; a fresh runner needs either a
+# permanent API token (preferred — set CLOUDFLARE_BACKUP_TOKEN to it) or a
+# re-seeded refresh token.
 #
 # Config (read from supabase/.env, or from the environment):
 #   CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID, CF_API_TOKEN
@@ -192,7 +200,7 @@ cmd_push() {
   local file="${2:-}"
   load_cfg
   if ! cfg_ok; then
-    echo "  ☁️  Cloudflare backup SKIPPED — CF_API_TOKEN/CF_KV_NAMESPACE_ID not configured"
+    echo "  ::warning::Cloudflare backup SKIPPED — CF_API_TOKEN/CF_KV_NAMESPACE_ID not configured"
     return 0
   fi
   [ -n "$file" ] || { echo "  ⚠️  usage: cloudflare-backup.sh push <file>"; return 1; }
@@ -216,7 +224,7 @@ cmd_push() {
     if put_with_retry "latest/$base.$nn" "$f" && put_with_retry "archive/$ts/$base.$nn" "$f"; then
       parts=$((parts + 1))
     else
-      echo "  ⚠️  upload failed for chunk $nn — aborting push (previous latest left intact)"
+      echo "  ::warning::Cloudflare backup: chunk $nn upload failed — previous latest left intact"
       rm -rf "$tmp"
       return 1
     fi
@@ -292,6 +300,39 @@ cmd_restore() {
   rm -rf "$tmp"
 }
 
+cmd_refresh() {
+  load_cfg
+  if [ -z "$CF_REFRESH_TOKEN" ]; then
+    echo "  ⚠️  no refresh token in .env — nothing to refresh"
+    return 1
+  fi
+  if cf_refresh_token; then
+    echo "  ☁️  access token renewed from the .env refresh token"
+    return 0
+  fi
+  echo "  ⚠️  refresh from .env failed (token expired/revoked)"
+  return 1
+}
+
+cmd_verify() {
+  local tmp rc=0
+  load_cfg
+  if ! cfg_ok; then
+    echo "  ⚠️  Cloudflare verify SKIPPED — CF_API_TOKEN/CF_KV_NAMESPACE_ID not configured"
+    return 0
+  fi
+  tmp="$(mktemp -d)"
+  cmd_restore "$tmp/candidate.tar.gz" || rc=1
+  if [ "$rc" = 0 ] && [ -s "$tmp/candidate.tar.gz" ]; then
+    echo "  ☁️  verify OK — latest backup is restorable ($(du -h "$tmp/candidate.tar.gz" | cut -f1))"
+  else
+    echo "  ::warning::Cloudflare verify FAILED — latest backup is NOT restorable"
+    rc=1
+  fi
+  rm -rf "$tmp"
+  return $rc
+}
+
 cmd_list() {
   load_cfg
   if ! cfg_ok; then
@@ -312,6 +353,8 @@ cmd_list() {
 case "${1:-}" in
   push)    cmd_push "$@" ;;
   restore) cmd_restore "$@" ;;
+  verify)  cmd_verify "$@" ;;
+  refresh) cmd_refresh "$@" ;;
   list)    cmd_list ;;
-  *) echo "usage: cloudflare-backup.sh {push <file> | restore <outfile> | list}"; exit 1 ;;
+  *) echo "usage: cloudflare-backup.sh {push <file> | restore <outfile> | verify | refresh | list}"; exit 1 ;;
 esac

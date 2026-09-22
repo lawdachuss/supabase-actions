@@ -249,6 +249,7 @@ if [ -s ./supabase-state.tar.gz ]; then
   if [ "$DO_PUSH" = 1 ]; then
     echo "  ☁️  pushing to Cloudflare..."
     bash utils/cloudflare-backup.sh push ./supabase-state.tar.gz || true
+    bash utils/cloudflare-backup.sh verify || true
     date +%s > "$CF_MARKER"
   else
     echo "  ℹ️  Cloudflare push skipped (last push < ${PUSH_INTERVAL}s ago)"
