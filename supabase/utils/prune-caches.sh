@@ -20,6 +20,20 @@
 # =============================================================================
 set -uo pipefail
 
+# The workflow steps export GH_TOKEN (what `gh` reads) but this script has
+# always read GITHUB_TOKEN — under `set -u` that aborted with
+# "GITHUB_TOKEN: unbound variable" and NOTHING was ever pruned (32 stale
+# state-cache entries piled up toward GitHub's 10GB eviction cap). Accept
+# either name, and fail LOUDLY instead of silently doing nothing.
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+  GITHUB_TOKEN="${GH_TOKEN:-}"
+fi
+export GITHUB_TOKEN
+if [ -z "${GITHUB_TOKEN}" ]; then
+  echo "::warning::prune-caches: no GITHUB_TOKEN/GH_TOKEN in env — cache pruning SKIPPED"
+  exit 0
+fi
+
 export KEEP="${KEEP:-3}"
 export DOCKER_KEEP="${DOCKER_KEEP:-2}"
 API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/caches"

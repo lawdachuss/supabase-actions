@@ -48,6 +48,15 @@ Thumbs.db
 /supabase/coolify_backup.dump.new
 /supabase/.cf_push_last
 
+# Rotated Cloudflare OAuth refresh token (SECRET — archived with the state so
+# the off-site backup chain survives restarts; never commit it) and the
+# snapshot timestamp packed into the state archive for freshness comparison.
+/supabase/.cf-creds
+/supabase/state-ts
+# Transient files used by the restore step's off-site recovery paths
+/supabase/supabase-state.tar.gz.kv
+/supabase/supabase-state.tar.gz.offsite
+
 # Cloned/test directories (old troubleshooting copies)
 /tmp-supabase/
 node_modules/

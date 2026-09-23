@@ -24,6 +24,7 @@
 # Usage:
 #   cloudflare-backup.sh push <file>            # upload + prune oldest
 #   cloudflare-backup.sh restore <outfile>      # pull latest and reassemble
+#   cloudflare-backup.sh manifest               # print latest backup's unix ts
 #   cloudflare-backup.sh verify                 # confirm 'latest' is restorable (size+sha256)
 #   cloudflare-backup.sh refresh                # renew access token from the .env refresh token
 #   cloudflare-backup.sh list                   # show keys + retention state
@@ -74,7 +75,10 @@ load_cfg() {
 
 # Renew the OAuth access token from CF_REFRESH_TOKEN; rotates the refresh token
 # too (Cloudflare refresh tokens are single-use) and persists both to .env so
-# later snapshots and sibling processes stay in sync.
+# later snapshots and sibling processes stay in sync. The rotated token is also
+# written to .cf-creds, which is archived with the state — without that, a
+# rotation mid-session left the NEXT session holding an already-consumed token
+# and the off-site backup chain died after one session.
 cf_refresh_token() {
   [ -n "$CF_REFRESH_TOKEN" ] || return 1
   local resp at rt
@@ -91,6 +95,12 @@ cf_refresh_token() {
       echo "CF_API_TOKEN=$at"
       [ -n "$rt" ] && echo "CF_REFRESH_TOKEN=$rt"
     } >> "$CF_ENV"
+  fi
+  # Archive-visible copy of the (single-use) refresh token — only overwrite
+  # when Cloudflare actually handed back a rotation.
+  if [ -n "$rt" ]; then
+    printf 'CF_REFRESH_TOKEN=%s\n' "$rt" > "$BASE_DIR/.cf-creds" 2>/dev/null || true
+    chmod 600 "$BASE_DIR/.cf-creds" 2>/dev/null || true
   fi
   echo "  ☁️  Cloudflare OAuth access token refreshed (~1h)"
   return 0
@@ -300,6 +310,25 @@ cmd_restore() {
   rm -rf "$tmp"
 }
 
+# Print the unix ts of the freshest off-site backup (stdout only, nothing on
+# failure). The restore step compares this against the cached archive's
+# embedded state-ts and adopts whichever is NEWER — a cancelled session never
+# reaches the end-of-run cache save, so the KV mirror can be the only recent
+# copy of the state.
+cmd_manifest() {
+  local ts=""
+  load_cfg
+  cfg_ok || return 0
+  local tmp
+  tmp="$(mktemp)"
+  if get_value "latest/manifest.json" "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    ts="$(sed -n 's/.*"ts":\([0-9][0-9]*\).*/\1/p' "$tmp" | head -1)"
+  fi
+  rm -f "$tmp"
+  printf '%s' "$ts"
+  return 0
+}
+
 cmd_refresh() {
   load_cfg
   if [ -z "$CF_REFRESH_TOKEN" ]; then
@@ -353,8 +382,9 @@ cmd_list() {
 case "${1:-}" in
   push)    cmd_push "$@" ;;
   restore) cmd_restore "$@" ;;
+  manifest) cmd_manifest "$@" ;;
   verify)  cmd_verify "$@" ;;
   refresh) cmd_refresh "$@" ;;
   list)    cmd_list ;;
-  *) echo "usage: cloudflare-backup.sh {push <file> | restore <outfile> | verify | refresh | list}"; exit 1 ;;
+  *) echo "usage: cloudflare-backup.sh {push <file> | restore <outfile> | manifest | verify | refresh | list}"; exit 1 ;;
 esac

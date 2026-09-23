@@ -318,14 +318,17 @@ jobs:
       # snapshot (see snapshot-state.sh); the restore step below pulls it back
       # if the local/cache archive is ever lost. ACCOUNT/NAMESPACE/API_TOKEN
       # are rewritten EVERY run so a token added/changed in secrets always takes
-      # effect; the rotated OAuth refresh token is deliberately PRESERVED.
+      # effect.
       #
-      # Why preserve it: Cloudflare 'cfor*' refresh tokens are single-use and
-      # rotate on every mint. The old step deleted CF_REFRESH_TOKEN from .env
-      # each run, so after the FIRST mint the GH secret's token was consumed and
-      # every later session re-minted from it and FAILED ("backups skip this
-      # run")  off-site KV backups silently never ran. Keeping the rotated token
-      # in .env lets the chain continue on this persistent runner.
+      # Why .cf-creds: Cloudflare 'cfor*' refresh tokens are single-use and
+      # rotate on every mint. The old design kept the rotated token in .env —
+      # but 'Super-fast startup' recreates .env from .env.example EVERY run and
+      # .env is not archived, so after the FIRST session the secret's token was
+      # already consumed, there was no rotated token to fall back to, and every
+      # later session logged "Cloudflare backup NOT configured"  off-site KV
+      # backups silently never ran. The rotated refresh token now lives in
+      # .cf-creds, which IS part of the state archive (snapshot-state.sh), so
+      # the OAuth chain survives restarts and even cancelled sessions.
       #
       # CLOUDFLARE_BACKUP_TOKEN can be either:
       #   * a permanent account API token (dashboard, scoped to "Workers KV
@@ -333,17 +336,21 @@ jobs:
       #     runners too), or
       #   * an OAuth refresh token starting with "cfor" (from `wrangler login`)
       #      minted once for the first session; continuity thereafter relies on
-      #     the rotated token the script keeps in .env.
+      #     the rotated token persisted in .cf-creds.
       - name:  Wire Cloudflare backup creds
         env:
           CF_API_TOKEN: ${{ secrets.CLOUDFLARE_BACKUP_TOKEN }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          sed -i -E '/^CF_(ACCOUNT_ID|KV_NAMESPACE_ID|API_TOKEN)=/d' .env 2>/dev/null || true
+          sed -i -E '/^CF_(ACCOUNT_ID|KV_NAMESPACE_ID|API_TOKEN|REFRESH_TOKEN)=/d' .env 2>/dev/null || true
           {
             echo "CF_ACCOUNT_ID=fb944101733d9b14aa29e5be59073eb2"
             echo "CF_KV_NAMESPACE_ID=f7ad38b06543440a94b4c073a04b4bf3"
           } >> .env
+
+          # (The archived rotated refresh token is loaded further down, only
+          # when it is actually needed  avoids a second CF_REFRESH_TOKEN line
+          # shadowing a freshly minted one.)
 
           if [ -n "${CF_API_TOKEN}" ]; then
             case "${CF_API_TOKEN}" in
@@ -358,7 +365,7 @@ jobs:
                   [ -n "$RT" ] && echo "CF_REFRESH_TOKEN=${RT}" >> .env
                   echo "  Cloudflare creds minted from OAuth refresh token (chain continues via rotated token)"
                 else
-                  echo "  Secret refresh token already consumed  falling back to last session's rotated token..."
+                  echo "  Secret refresh token already consumed  falling back to the archived .cf-creds token..."
                 fi
                 ;;
               *)
@@ -367,13 +374,32 @@ jobs:
                 ;;
             esac
           else
-            echo "  Cloudflare secret not set  reusing any previous session's creds still in .env"
+            echo "  Cloudflare secret not set  relying on the archived .cf-creds token (if any)"
           fi
 
-          # Continuity: if the access token is missing but a rotated refresh token
-          # from a previous session survives in .env, renew the access token from it.
-          if ! grep -q '^CF_API_TOKEN=.' .env 2>/dev/null && grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null; then
-            bash utils/cloudflare-backup.sh refresh || true
+          # Continuity: if no access token could be minted from the secret,
+          # renew one from a rotated refresh token  first whatever survived in
+          # .env, otherwise the ARCHIVED .cf-creds fallback (state archive ->
+          # restored by the step below). This is what keeps the single-use
+          # cfor* chain alive across sessions. cloudflare-backup.sh refresh
+          # re-persists the newly rotated token into .cf-creds as well.
+          if ! grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
+            if ! grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null && [ -f ./.cf-creds ] \
+               && grep -q '^CF_REFRESH_TOKEN=.' ./.cf-creds 2>/dev/null; then
+              grep -E '^CF_REFRESH_TOKEN=' ./.cf-creds | head -1 >> .env
+              echo "  Cloudflare rotated refresh token restored from .cf-creds (state archive)"
+            fi
+            if grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null; then
+              bash utils/cloudflare-backup.sh refresh || true
+            fi
+          fi
+
+          # Persist whatever refresh token we ended up with for the next session.
+          # Only overwrite .cf-creds when a real token exists — never clobber a
+          # working archived token with an empty file when minting fails.
+          if grep -q '^CF_REFRESH_TOKEN=.' .env 2>/dev/null; then
+            grep -E '^CF_REFRESH_TOKEN=' .env | head -1 > ./.cf-creds \
+              && chmod 600 ./.cf-creds 2>/dev/null || true
           fi
 
           if ! grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
@@ -397,7 +423,42 @@ jobs:
 
           if [ -f ./supabase-state.tar.gz ]; then
             echo " State archive found  restoring edge functions, snippets, DB dump, pgsodium key..."
-            tar xzf ./supabase-state.tar.gz -C . 2>/dev/null || echo "  Failed to extract state archive"
+
+            # Prefer the OFF-SITE Cloudflare copy when it is fresher than the
+            # cached one. A cancelled run never reaches the end-of-run cache
+            # save, so the KV mirror (pushed every ~25 min by snapshot-state.sh
+            # and stamped with its own state-ts) can be hours newer than the
+            # cache entry. Adopt whichever backup has the higher timestamp.
+            LOCAL_TS="$(tar xzf ./supabase-state.tar.gz -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
+            KV_TS="$(bash utils/cloudflare-backup.sh manifest 2>/dev/null | tr -dc '0-9' | head -1)"
+            LOCAL_TS="${LOCAL_TS:-0}"; KV_TS="${KV_TS:-0}"
+            if [ "$KV_TS" -gt "$LOCAL_TS" ] 2>/dev/null; then
+              echo "  ☁️  off-site backup is fresher (kv ts $KV_TS > cached ts $LOCAL_TS) — using it"
+              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.kv; then
+                mv -f ./supabase-state.tar.gz.kv ./supabase-state.tar.gz
+                echo "  ☁️  freshest state adopted from Cloudflare KV"
+              else
+                rm -f ./supabase-state.tar.gz.kv
+                echo "::warning::fresher off-site backup exists but could not be fetched — falling back to the cached copy"
+              fi
+            fi
+
+            # Extraction must NOT fail silently: continuing without the archive
+            # is what regenerated a fresh APP_KEY every session and made old
+            # encrypted Coolify credentials undecryptable (the reported bug).
+            if ! tar xzf ./supabase-state.tar.gz -C . 2>/dev/null; then
+              echo "::warning::cached state archive is unreadable — attempting off-site recovery"
+              if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.offsite \
+                 && [ -s ./supabase-state.tar.gz.offsite ] \
+                 && tar xzf ./supabase-state.tar.gz.offsite -C . 2>/dev/null; then
+                mv -f ./supabase-state.tar.gz.offsite ./supabase-state.tar.gz
+                echo "  ✅ state recovered from the off-site Cloudflare backup"
+              else
+                rm -f ./supabase-state.tar.gz.offsite
+                echo "::error::state archive is corrupt and no off-site copy could be restored. Refusing to continue as a silent fresh start (that is exactly what wipes Coolify's stored credentials). Delete the bad supabase-db-* cache entries or restore from Cloudflare KV, then re-run."
+                exit 1
+              fi
+            fi
             # Inject the pgsodium root key into the db-config named volume BEFORE the
             # DB boots, so the same encryption key is used and Vault data stays decryptable.
             if [ -f ./pgsodium_root.key ]; then
@@ -448,6 +509,7 @@ jobs:
             fi
           else
             echo "  No state archive  fresh start"
+            echo "::warning::No state archive found anywhere (cache miss or first run) — starting FRESH. Coolify credentials/data from previous sessions will be missing unless they are reprovisioned."
           fi
 
           # Ensure the 'main' edge function exists BEFORE containers start.
@@ -524,6 +586,9 @@ jobs:
       - name:  Prune stale snapshot cache entries
         env:
           GH_TOKEN: ${{ github.token }}
+          # prune-caches.sh reads GITHUB_TOKEN — without it the script aborted
+          # with "unbound variable" and never pruned a single entry.
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/prune-caches.sh || true
@@ -832,6 +897,11 @@ jobs:
       # 1-day artifact. The row is deleted at the next session's start, so a
       # leaked value dies with the session.
       - name:  Coolify  publish session API token (artifact)
+        # Best-effort: a failed mint must NOT fail the job — a failed step
+        # skips everything guarded by if: "!cancelled()" (implicit success()),
+        # including the final snapshot and the end-of-run cache save, i.e. it
+        # would silently discard the session's entire state.
+        continue-on-error: true
         run: |
           cd ${{ env.SUPABASE_DIR }}
           if ! bash utils/setup-coolify.sh api-token > /tmp/coolify-session-token.txt 2>/tmp/coolify-session-diag.txt; then
@@ -976,6 +1046,7 @@ jobs:
         env:
           TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}   # hourly prune-caches.sh needs it too
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
@@ -1164,6 +1235,7 @@ jobs:
           # (stat the archive relative to this step's cwd  supabase/  BACKUP_FILE is workspace-root-relative)
           ARCHIVE_SIZE=$(stat -c%s ./supabase-state.tar.gz 2>/dev/null || echo 0)
           if [ "$ARCHIVE_SIZE" -lt 500000 ]; then
+            echo "::warning::state archive is suspiciously small (${ARCHIVE_SIZE}B) — refusing to overwrite the production cache entry with it (the previous good archive stays authoritative; check the off-site Cloudflare mirror too)"
             echo " Archive is suspiciously small (${ARCHIVE_SIZE}B)  refusing to overwrite production cache!"
             rm -f ./supabase-state.tar.gz
           fi

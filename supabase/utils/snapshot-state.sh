@@ -185,7 +185,36 @@ else
   echo "  ℹ️  Coolify db not ready — skipping its dump"
 fi
 
-# ── 4. Pack the full-state archive (tolerates missing pieces) ───────────
+# ── 4. Off-site mirror to Cloudflare KV (best-effort, throttled) ────────
+# Runs BEFORE the archive is (re)packed below: a push can force an OAuth
+# refresh-token rotation, and packing afterwards means the freshly rotated
+# token inside .cf-creds is what ends up in the archive — otherwise the next
+# session would hold an already-consumed token and the chain would die.
+# cloudflare-backup.sh keeps 'latest/' fresh, stamps the same bytes under
+# archive/<ts>/ and prunes the OLDEST generations — remote storage never
+# grows, and the freshest backup survives even if the GitHub cache/artifacts
+# are wiped for any reason. (KV gets the PREVIOUS snapshot's bytes — at most
+# one 5-min cycle older; the restore step picks whichever copy is newer.)
+PUSH_INTERVAL=1500   # push at most once per ~25 min (KV free: 1k writes/day)
+CF_MARKER=./.cf_push_last
+if [ -s ./supabase-state.tar.gz ]; then
+  DO_PUSH=1
+  if [ -f "$CF_MARKER" ]; then
+    LAST_PUSH=$(cat "$CF_MARKER" 2>/dev/null || echo 0)
+    NOW=$(date +%s)
+    if [ $(( NOW - LAST_PUSH )) -lt $PUSH_INTERVAL ]; then DO_PUSH=0; fi
+  fi
+  if [ "$DO_PUSH" = 1 ]; then
+    echo "  ☁️  pushing to Cloudflare..."
+    bash utils/cloudflare-backup.sh push ./supabase-state.tar.gz || true
+    bash utils/cloudflare-backup.sh verify || true
+    date +%s > "$CF_MARKER"
+  else
+    echo "  ℹ️  Cloudflare push skipped (last push < ${PUSH_INTERVAL}s ago)"
+  fi
+fi
+
+# ── 5. Pack the full-state archive (tolerates missing pieces) ───────────
 ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -s ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
 [ -s ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
@@ -194,12 +223,21 @@ ARCHIVE_FILES="volumes/functions volumes/snippets"
 [ -s ./coolify_backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES coolify_backup.dump"
 [ -s ./volumes/coolify/source/.env ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/source/.env"
 [ -d ./volumes/coolify/ssh ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/ssh"
+# Rotated Cloudflare refresh token (single-use) — the ONLY copy that survives
+# the per-run .env recreation; without it off-site backups die after one session.
+[ -s ./.cf-creds ] && ARCHIVE_FILES="$ARCHIVE_FILES .cf-creds"
 # Coolify's on-disk state for projects/apps (generated compose files etc.) — so
 # a restored session has byte-identical configs for the auto-redeploy pass.
 [ -d ./volumes/coolify/applications ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/applications"
 [ -d ./volumes/coolify/databases ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/databases"
 [ -d ./volumes/coolify/services ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/services"
 [ -d ./volumes/coolify/backups ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/coolify/backups"
+
+# Snapshot timestamp packed INTO the archive — the restore step compares it
+# with the off-site KV manifest ts and adopts whichever backup is fresher
+# (a cancelled run never reaches the end-of-run cache save).
+date +%s > ./state-ts
+ARCHIVE_FILES="$ARCHIVE_FILES state-ts"
 
 # Coolify's container writes bind-mounted dirs (ssh/keys, ssh/mux) as ITS OWN
 # user, which the runner user cannot read — that makes tar abort and the state
@@ -229,29 +267,4 @@ else
   [ -s "$TAR_LOG" ] && sed 's/^/      /' "$TAR_LOG"
   rm -f "$TAR_LOG"
   exit 1
-fi
-
-# ── 5. Off-site mirror to Cloudflare KV (best-effort, throttled) ────────
-# The archive already contains DB dumps + Coolify secrets + pgsodium key, so a
-# single push covers everything. cloudflare-backup.sh keeps 'latest/' fresh,
-# stamps the same bytes under archive/<ts>/ and prunes the OLDEST generations —
-# remote storage never grows, and the freshest backup survives even if the
-# GitHub cache/artifacts are wiped for any reason.
-PUSH_INTERVAL=1500   # push at most once per ~25 min (KV free: 1k writes/day)
-CF_MARKER=./.cf_push_last
-if [ -s ./supabase-state.tar.gz ]; then
-  DO_PUSH=1
-  if [ -f "$CF_MARKER" ]; then
-    LAST_PUSH=$(cat "$CF_MARKER" 2>/dev/null || echo 0)
-    NOW=$(date +%s)
-    if [ $(( NOW - LAST_PUSH )) -lt $PUSH_INTERVAL ]; then DO_PUSH=0; fi
-  fi
-  if [ "$DO_PUSH" = 1 ]; then
-    echo "  ☁️  pushing to Cloudflare..."
-    bash utils/cloudflare-backup.sh push ./supabase-state.tar.gz || true
-    bash utils/cloudflare-backup.sh verify || true
-    date +%s > "$CF_MARKER"
-  else
-    echo "  ℹ️  Cloudflare push skipped (last push < ${PUSH_INTERVAL}s ago)"
-  fi
 fi
