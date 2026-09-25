@@ -16,8 +16,6 @@ Thumbs.db
 /supabase/volumes/redis/data/
 /supabase/volumes/snippets/
 /supabase/volumes/functions/*
-# Coolify runtime storage (SSH keys, secrets, project configs)
-/supabase/volumes/coolify/
 # The logs, cache and migrate edge functions ship with the repo
 !/supabase/volumes/functions/logs/
 !/supabase/volumes/functions/logs/*
@@ -31,8 +29,8 @@ Thumbs.db
 !/supabase/volumes/functions/redis-http/*
 
 # State archives (database dumps — contain data, never commit)
-/supabase/backup.dump
-/supabase/backup.dump.new
+/supabase/*.dump
+/supabase/*.dump.*
 /supabase/dump.rdb
 /supabase/dump.rdb.new
 # Redis AOF (multi-part appendonly dir) captured by snapshot-state.sh
@@ -41,11 +39,6 @@ Thumbs.db
 /supabase/pgsodium_root.key
 /supabase/supabase-state.tar.gz
 /supabase/supabase-state.tar.gz.new
-
-# Companion Coolify stack: its own DB dump (projects, encrypted creds) and the
-# Cloudflare-push throttle marker — same rule as the Supabase state above.
-/supabase/coolify_backup.dump
-/supabase/coolify_backup.dump.new
 /supabase/.cf_push_last
 
 # Rotated Cloudflare OAuth refresh token (SECRET — archived with the state so

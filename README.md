@@ -113,14 +113,12 @@ same tunnel** — none of them come for free:
 |---|---|---|---|---|
 | `supabase.<domain>` | HTTP | `localhost:8000` | Studio API, Auth, REST, Realtime — the whole public surface | ✅ |
 | `redis.<domain>` | HTTP | `localhost:8081` | Redis Commander web console (see [🔗 Permanent Redis link](#-permanent-redis-link-free--no-card)) | ⬜ |
-| `coolify.<domain>` | HTTP | `localhost:8082` | The companion Coolify dashboard | ⬜ |
 | `db.<domain>` | **TCP** (not HTTP) | `localhost:5432` | `./pg-tunnel.sh` — a real Postgres connection. Also needs a **Service Auth** Access policy | ⬜ |
-| `*.<apps-domain>` | HTTP | `localhost:80` | Frontends deployed *by* Coolify, via its own managed proxy | ⬜ |
 
 Two things worth knowing before debugging a 404 or 502:
 
-- **There is no wildcard record.** Cloudflare zones don't get a `*.domain` entry by default, so a subdomain you haven't added resolves to nothing at all (`NXDOMAIN`). Every hostname above must be created explicitly — including the `*.<apps-domain>` one, which needs its own wildcard DNS record first.
-- **A DNS record is not a route.** A hostname that answers Cloudflare's **502** has a record *and* a proxy, but nothing on the runner is reachable at the configured origin (e.g. Coolify isn't up) — or the ingress rule points somewhere else. A **404** usually means no ingress rule matches the hostname. `setup-coolify.sh` probes `coolify.<domain>/api/health` at the end of each session and reports which of these it is, so you don't have to guess.
+- **There is no wildcard record.** Cloudflare zones don't get a `*.domain` entry by default, so a subdomain you haven't added resolves to nothing at all (`NXDOMAIN`). Every hostname above must be created explicitly.
+- **A DNS record is not a route.** A hostname that answers Cloudflare's **502** has a record *and* a proxy, but nothing on the runner is reachable at the configured origin — or the ingress rule points somewhere else. A **404** usually means no ingress rule matches the hostname.
 
 ### Step 4: Generate Secrets
 
@@ -670,10 +668,6 @@ Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
 | `cannot find an appropriate entrypoint` from an edge function | The function directory doesn't exist on the runner — commit it (the restore step runs `git checkout -- volumes/functions/`) and make sure it's whitelisted in `.gitignore` |
 | Kong returning errors | Check workflow logs; `KONG_PROXY_ERROR_LOG` is output to stdout |
 | Want object storage? | Add `storage` and `imgproxy` services back to `docker-compose.yml` and mount `storage` SQL init |
-| **Coolify image pre-pull failed** | Not fatal — `docker compose up` re-pulls what's missing. The `🐳 Coolify — pre-pull result` step names the failing image and prints the log tail (full log: `/tmp/coolify-pull.log` on the runner). Usually a registry blip or an image tag/digest that no longer exists. |
-| **Coolify didn't start / smoke test failed** | The `🐳 Coolify — diagnosis (auto)` step runs `utils/coolify-diagnose.sh` and attaches its output to the run summary (collapsed under *Coolify auto-diagnosis*). Normally `coolify-redis` or `coolify-db` never became healthy, which blocks `coolify` via `depends_on`. |
-| Coolify root login rejected | The password must satisfy Coolify's policy: 8+ chars with upper, lower, digit **and** symbol. Set a conforming `COOLIFY_PASSWORD` secret; the workflow re-hashes it onto the root user each session. |
-| Need to inspect Coolify by hand | On the runner: `cd supabase && bash utils/coolify-diagnose.sh` — same script the auto-diagnosis runs, safe to run any time (read-only). |
 
 ---
 

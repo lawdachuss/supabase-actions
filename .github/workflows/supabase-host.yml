@@ -34,15 +34,6 @@
 #   SMTP_ADMIN_EMAIL   verified From address (must be allowed by the provider)
 #   SMTP_SENDER_NAME   display name shown as the sender
 #
-# Optional Coolify secrets (companion PaaS started alongside Supabase):
-#   COOLIFY_PASSWORD        - Coolify dashboard (root user) password. When set it
-#                             is authoritative (re-hashed onto the root user every
-#                             session) and is never printed in the run summary.
-#                             If unset, one is generated and shown once instead.
-#   COOLIFY_ADMIN_PASSWORD  - password for the fallback admin created when the
-#                             restored Coolify DB has no users.
-#   COOLIFY_AUTO_REDEPLOY   - set to 0 to stop re-deploying stored apps each run
-#
 # Optional off-site backup secret (Cloudflare KV disaster-recovery mirror):
 #   CLOUDFLARE_BACKUP_TOKEN - a permanent Cloudflare API token ("Workers KV
 #                             Storage: Edit") OR an OAuth refresh token from
@@ -414,6 +405,28 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
+          extract_state_archive() {
+            local archive="$1"
+            local members_file member
+            members_file=$(mktemp)
+            if ! tar tzf "$archive" >/dev/null 2>&1; then
+              rm -f "$members_file"
+              return 1
+            fi
+            while IFS= read -r member; do
+              case "$member" in
+                backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|.cf-creds|./.cf-creds|state-ts|./state-ts)
+                  printf '%s\n' "$member" >> "$members_file"
+                  ;;
+              esac
+            done < <(tar tzf "$archive" 2>/dev/null)
+            if [ ! -s "$members_file" ] || ! tar xzf "$archive" -C . --no-same-owner --no-same-permissions -T "$members_file"; then
+              rm -f "$members_file"
+              return 1
+            fi
+            rm -f "$members_file"
+          }
+
           # If the local/cache archive is missing (real disaster recovery), pull
           # the freshest one back from Cloudflare KV before extraction.
           if [ ! -f ./supabase-state.tar.gz ] && grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
@@ -444,18 +457,17 @@ jobs:
             fi
 
             # Extraction must NOT fail silently: continuing without the archive
-            # is what regenerated a fresh APP_KEY every session and made old
-            # encrypted Coolify credentials undecryptable (the reported bug).
-            if ! tar xzf ./supabase-state.tar.gz -C . 2>/dev/null; then
-              echo "::warning::cached state archive is unreadable — attempting off-site recovery"
+            # can leave the stack running on an incomplete state.
+            if ! extract_state_archive ./supabase-state.tar.gz; then
+              echo "::warning::cached state archive is unreadable or unsupported — attempting off-site recovery"
               if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz.offsite \
                  && [ -s ./supabase-state.tar.gz.offsite ] \
-                 && tar xzf ./supabase-state.tar.gz.offsite -C . 2>/dev/null; then
+                 && extract_state_archive ./supabase-state.tar.gz.offsite; then
                 mv -f ./supabase-state.tar.gz.offsite ./supabase-state.tar.gz
                 echo "  ✅ state recovered from the off-site Cloudflare backup"
               else
                 rm -f ./supabase-state.tar.gz.offsite
-                echo "::error::state archive is corrupt and no off-site copy could be restored. Refusing to continue as a silent fresh start (that is exactly what wipes Coolify's stored credentials). Delete the bad supabase-db-* cache entries or restore from Cloudflare KV, then re-run."
+                echo "::error::state archive is corrupt and no off-site copy could be restored. Refusing to continue as a silent fresh start. Delete the bad supabase-db-* cache entries or restore from Cloudflare KV, then re-run."
                 exit 1
               fi
             fi
@@ -501,15 +513,9 @@ jobs:
               echo "   Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1)  ready for redis container"
               chmod -R 777 volumes/redis/data 2>/dev/null || true
             fi
-            if [ -s ./coolify_backup.dump ]; then
-              echo "   Coolify dump: $(du -h ./coolify_backup.dump | cut -f1)  will restore on Coolify start"
-            fi
-            if [ -s ./volumes/coolify/source/.env ]; then
-              echo "   Coolify secrets restored  APP_KEY stays stable across sessions"
-            fi
           else
             echo "  No state archive  fresh start"
-            echo "::warning::No state archive found anywhere (cache miss or first run) — starting FRESH. Coolify credentials/data from previous sessions will be missing unless they are reprovisioned."
+            echo "::warning::No state archive found anywhere (cache miss or first run) — starting with a fresh Supabase database."
           fi
 
           # Ensure the 'main' edge function exists BEFORE containers start.
@@ -563,20 +569,6 @@ jobs:
       # run: steps, so snapshots can only be persisted via actions/cache steps
       # (end-of-run save below). The keepalive loop writes snapshots to disk so
       # that save always has the freshest archive.
-
-      #  Coolify (companion PaaS): prep + pre-pull images in the background 
-      # Prepares Coolify's storage, secrets and SSH access, then pre-pulls its
-      # images in the background so they're already local once the main stack
-      # has started. Fully additive  Supabase/Redis are untouched.
-      - name:  Coolify  prepare + pre-pull images (background)
-        env:
-          CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-          bash utils/setup-coolify.sh prep
-          nohup bash -c "cd ${{ env.SUPABASE_DIR }} && bash utils/setup-coolify.sh pull > /tmp/coolify-pull.log 2>&1" &
 
       #  Prune stale cache entries (best-effort, keeps newest 3) 
       # Keeps the Actions cache small (end-of-run state archives) so it never
@@ -853,72 +845,6 @@ jobs:
           fi
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
-
-      #  Coolify: start + health check (best-effort  never kills the session)
-      # Starts the Coolify stack and polls its health endpoint. On failure this
-      # emits a warning and exits 0 so the Supabase session continues; Coolify
-      # retries on the next session.
-      - name:  Coolify  start + health check
-        env:
-          CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          COOLIFY_PASSWORD: ${{ secrets.COOLIFY_PASSWORD }}
-          COOLIFY_ADMIN_PASSWORD: ${{ secrets.COOLIFY_ADMIN_PASSWORD }}
-          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-          if bash utils/setup-coolify.sh start; then
-            COOLIFY_URL=$(grep -E '^COOLIFY_APP_URL=' .env 2>/dev/null | cut -d= -f2-)
-            COOLIFY_URL="${COOLIFY_URL:-http://localhost:8082}"
-            echo "::notice title= Coolify is LIVE::$COOLIFY_URL  permanent link (dashboard also at http://localhost:8082)"
-          else
-            echo "::warning title= Coolify failed to start::Supabase stays up. Check the coolify container logs above; it retries next session."
-          fi
-
-      #  Coolify smoke test 
-      # Asserts the three things that used to fail silently: a usable admin,
-      # open registration, and an authenticated deploy API. Exits non-zero on
-      # regression, so a broken dashboard shows up as a red step instead of
-      # hours of a quietly unusable Coolify.
-      # NOTE: this step FAILS the run, which skips the Supabase steps below
-      # (migrations, keepalive) and makes workflow-watchman restart the session.
-      # Add `continue-on-error: true` here if Coolify should stay best-effort.
-      - name:  Coolify  smoke test
-        continue-on-error: true
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-          bash utils/setup-coolify.sh smoke
-
-      #  Coolify: publish a session API token as a short-lived artifact 
-      # The operator's dashboard token can be absent from a restored DB, and
-      # Coolify's own mints are not observable from outside the runner. Mint a
-      # fresh full-access token each session so external automation (app
-      # provisioning via the API) has working credentials, and hand it out as a
-      # 1-day artifact. The row is deleted at the next session's start, so a
-      # leaked value dies with the session.
-      - name:  Coolify  publish session API token (artifact)
-        # Best-effort: a failed mint must NOT fail the job — a failed step
-        # skips everything guarded by if: "!cancelled()" (implicit success()),
-        # including the final snapshot and the end-of-run cache save, i.e. it
-        # would silently discard the session's entire state.
-        continue-on-error: true
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-          if ! bash utils/setup-coolify.sh api-token > /tmp/coolify-session-token.txt 2>/tmp/coolify-session-diag.txt; then
-            echo "::warning title= session API token mint failed::$(tail -1 /tmp/coolify-session-diag.txt)"
-            exit 1
-          fi
-          echo "session API token: $(stat -c%s /tmp/coolify-session-token.txt) bytes on stdout"
-          cat /tmp/coolify-session-diag.txt
-      - name:  Upload Coolify session token artifact
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: coolify-session-token
-          path: /tmp/coolify-session-token.txt
-          if-no-files-found: ignore
-          retention-days: 1
-          overwrite: true
 
       #  Apply committed migrations (versioned schema changes) 
       # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs
@@ -1206,8 +1132,8 @@ jobs:
             # exists in the repo root, exit the keepalive loop (~30s latency).
             # The run then completes NORMALLY (not cancelled), so the if-always
             # final-backup and end-of-run cache-save steps still run and the
-            # freshest state archive (incl. the Coolify DB dump + app rows) is
-            # persisted to the GitHub Actions cache for the next session.
+            # freshest state archive is persisted to the GitHub Actions cache
+            # for the next session.
             # Remove the marker (git rm) once the desired session has saved.
             # ------------------------------------------------------------------
             if [ $(( TICK % 3 )) -eq 0 ] && curl -sf --max-time 10 -o /dev/null \
