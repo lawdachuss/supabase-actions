@@ -1,0 +1,52 @@
+name: External Cloudflare audit
+
+on:
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Audit Cloudflare resources
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
+          CF_ACCOUNT_ID: fb944101733d9b14aa29e5be59073eb2
+          CF_KV_NAMESPACE_ID: f7ad38b06543440a94b4c073a04b4bf3
+        run: |
+          set -euo pipefail
+          zone_json=$(curl -sS --max-time 30 \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/zones?name=chuglii.in&per_page=50")
+          if [ "$(printf '%s' "$zone_json" | jq -r '.success')" != "true" ]; then
+            echo "ZONE_LOOKUP_FAILED"
+            printf '%s' "$zone_json" | jq -r '.errors[]?.message' || true
+            exit 0
+          fi
+          zone_id=$(printf '%s' "$zone_json" | jq -r '.result[0].id // empty')
+          if [ -z "$zone_id" ]; then
+            echo "ZONE_NOT_FOUND"
+          else
+            echo "ZONE_FOUND"
+            printf '%s' "$zone_json" | jq -r '.result[0] | "ZONE\t\(.id)\t\(.name)\t\(.account.id)"'
+            records_json=$(curl -sS --max-time 30 \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?per_page=100")
+            if [ "$(printf '%s' "$records_json" | jq -r '.success')" = "true" ]; then
+              printf '%s' "$records_json" | jq -r '.result[] | select(.name == "coolify.chuglii.in") | ["DNS", .id, .type, .name, .content, (.proxied|tostring)] | @tsv'
+            else
+              echo "DNS_LOOKUP_FAILED"
+              printf '%s' "$records_json" | jq -r '.errors[]?.message' || true
+            fi
+          fi
+          kv_json=$(curl -sS --max-time 30 \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/keys?limit=1000")
+          if [ "$(printf '%s' "$kv_json" | jq -r '.success')" = "true" ]; then
+            echo "KV_ACCESS_OK"
+            printf '%s' "$kv_json" | jq -r '.result[].name' | sed 's/^/KV_KEY\t/'
+          else
+            echo "KV_ACCESS_FAILED"
+            printf '%s' "$kv_json" | jq -r '.errors[]?.message' || true
+          fi
