@@ -1,44 +1,60 @@
-name: External Cloudflare audit
+name: External Cloudflare cleanup
 
 on:
   workflow_dispatch:
+    inputs:
+      delete_dns:
+        description: Delete the verified Coolify DNS record
+        required: true
+        default: false
+        type: boolean
 
 jobs:
-  audit:
+  cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Audit Cloudflare resources
+      - name: Delete verified Coolify DNS record
         env:
           CF_API_TOKEN: ${{ secrets.CF_DNS_API_TOKEN }}
+          DELETE_DNS: ${{ inputs.delete_dns }}
           CF_ACCOUNT_ID: fb944101733d9b14aa29e5be59073eb2
           CF_KV_NAMESPACE_ID: f7ad38b06543440a94b4c073a04b4bf3
+          ZONE_ID: 9ea004236ef65e8443b72142aa61fa9d
+          RECORD_ID: 87c336f74af3a2ff6aa3864ba61cf6bf
         run: |
           set -euo pipefail
-          zone_json=$(curl -sS --max-time 30 \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            "https://api.cloudflare.com/client/v4/zones?name=chuglii.in&per_page=50")
-          if [ "$(printf '%s' "$zone_json" | jq -r '.success')" != "true" ]; then
-            echo "ZONE_LOOKUP_FAILED"
-            printf '%s' "$zone_json" | jq -r '.errors[]?.message' || true
-            exit 0
-          fi
-          zone_id=$(printf '%s' "$zone_json" | jq -r '.result[0].id // empty')
-          if [ -z "$zone_id" ]; then
-            echo "ZONE_NOT_FOUND"
-          else
-            echo "ZONE_FOUND"
-            printf '%s' "$zone_json" | jq -r '.result[0] | "ZONE\t\(.id)\t\(.name)\t\(.account.id)"'
-            records_json=$(curl -sS --max-time 30 \
+          if [ "$DELETE_DNS" = "true" ]; then
+            record_json=$(curl -sS --max-time 30 \
               -H "Authorization: Bearer $CF_API_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://api.cloudflare.com/client/v4/zones/$zone_id/dns_records?per_page=100")
-            if [ "$(printf '%s' "$records_json" | jq -r '.success')" = "true" ]; then
-              printf '%s' "$records_json" | jq -r '.result[] | select(.name == "coolify.chuglii.in") | ["DNS", .id, .type, .name, .content, (.proxied|tostring)] | @tsv'
-            else
-              echo "DNS_LOOKUP_FAILED"
-              printf '%s' "$records_json" | jq -r '.errors[]?.message' || true
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID")
+            record_name=$(printf '%s' "$record_json" | jq -r '.result.name // empty')
+            record_type=$(printf '%s' "$record_json" | jq -r '.result.type // empty')
+            if [ "$record_name" != "coolify.chuglii.in" ] || [ "$record_type" != "CNAME" ]; then
+              echo "DNS_IDENTITY_MISMATCH"
+              exit 1
             fi
+            delete_json=$(curl -sS --max-time 30 -X DELETE \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID")
+            if [ "$(printf '%s' "$delete_json" | jq -r '.success')" != "true" ]; then
+              echo "DNS_DELETE_FAILED"
+              printf '%s' "$delete_json" | jq -r '.errors[]?.message' || true
+              exit 1
+            fi
+            echo "DNS_DELETED"
+          else
+            echo "DNS_DELETE_SKIPPED"
+          fi
+          verify_json=$(curl -sS --max-time 30 \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?name=coolify.chuglii.in&per_page=100")
+          if [ "$(printf '%s' "$verify_json" | jq -r '.success')" = "true" ]; then
+            remaining=$(printf '%s' "$verify_json" | jq -r '.result | length')
+            echo "DNS_REMAINING=$remaining"
+          else
+            echo "DNS_VERIFY_FAILED"
+            printf '%s' "$verify_json" | jq -r '.errors[]?.message' || true
+            exit 1
           fi
           kv_json=$(curl -sS --max-time 30 \
             -H "Authorization: Bearer $CF_API_TOKEN" \
