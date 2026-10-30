@@ -862,6 +862,28 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
+              if ! docker compose exec -T db pg_restore -U postgres \
+                   --list /tmp/backup.dump >/dev/null; then
+                echo "::error::legacy database backup is not a valid PostgreSQL archive"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              # Legacy full-database dumps contain Supabase-managed schemas and
+              # extensions. Cleaning objects inside the initialized database
+              # leaves dependency/permission conflicts; replace the database
+              # from template1, then restore into the empty database.
+              if ! docker compose exec -T db dropdb -U postgres \
+                   --maintenance-db=template1 --if-exists --force postgres; then
+                echo "::error::could not replace database before legacy restore"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              if ! docker compose exec -T db createdb -U postgres \
+                   --template=template1 postgres; then
+                echo "::error::could not recreate database for legacy restore"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
               RESTORE_LOG=$(mktemp)
               if ! docker compose exec -T db pg_restore -U postgres -d postgres \
                  --clean --if-exists --no-owner --no-privileges --disable-triggers --jobs 2 \
