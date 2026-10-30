@@ -765,10 +765,33 @@ jobs:
             if [ -s ./db-backups/manifest.tsv ] && [ -s ./db-backups/globals.sql ]; then
               echo "Restoring all databases and PostgreSQL roles from the complete state backup..."
               GLOBAL_LOG=$(mktemp)
+              GLOBAL_RESTORE_FILE=$(mktemp)
+              if ! awk '
+                function managed_role(role) {
+                  gsub(/"/, "", role)
+                  sub(/;$/, "", role)
+                  return role == "anon" || role == "authenticated" \
+                    || role == "authenticator" || role == "dashboard_user" \
+                    || role == "pgbouncer" || role == "postgres" \
+                    || role == "service_role" || role ~ /^supabase_/
+                }
+                ($1 == "CREATE" && $2 == "ROLE" && managed_role($3)) { next }
+                ($1 == "ALTER" && $2 == "ROLE" && managed_role($3)) { next }
+                ($1 == "COMMENT" && $2 == "ON" && $3 == "ROLE" && managed_role($4)) { next }
+                (($1 == "GRANT" && $3 == "TO") || ($1 == "REVOKE" && $3 == "FROM")) \
+                  && (managed_role($2) || managed_role($4)) { next }
+                { print }
+              ' ./db-backups/globals.sql > "$GLOBAL_RESTORE_FILE"; then
+                echo "::error::could not prepare PostgreSQL globals for restore"
+                rm -f "$GLOBAL_LOG" "$GLOBAL_RESTORE_FILE"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
               docker compose exec -T db psql -U postgres -d postgres \
-                < ./db-backups/globals.sql >"$GLOBAL_LOG" 2>&1 || true
+                < "$GLOBAL_RESTORE_FILE" >"$GLOBAL_LOG" 2>&1 || true
               GLOBAL_ERRORS=$(grep -i "ERROR:" "$GLOBAL_LOG" 2>/dev/null \
                 | grep -viE 'role ".*" already exists|tablespace ".*" already exists' || true)
+              rm -f "$GLOBAL_RESTORE_FILE"
               if [ -n "$GLOBAL_ERRORS" ]; then
                 echo "::error::failed to restore PostgreSQL roles/global settings"
                 echo "$GLOBAL_ERRORS" | head -10 | sed 's/^/    /'
