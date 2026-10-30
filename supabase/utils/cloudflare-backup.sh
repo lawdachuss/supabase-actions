@@ -43,6 +43,7 @@ set -uo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CF_ENV="$BASE_DIR/.env"
+ROOT_ENV="$BASE_DIR/../.env"
 
 CHUNK_BYTES=$((24 * 1024 * 1024))   # 24 MiB (KV hard limit is 25 MiB)
 KEEP_ARCHIVES=1                      # generations kept under archive/ (oldest pruned)
@@ -61,12 +62,15 @@ CF_OAUTH_CLIENT_ID="54d11594-84e4-41aa-b438-e81b8fa78ee7"
 
 # ---------------------------------------------------------------------------
 load_cfg() {
-  if [ -f "$CF_ENV" ]; then
-    CF_ACCOUNT_ID="$(grep -E '^CF_ACCOUNT_ID=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
-    CF_KV_NAMESPACE_ID="$(grep -E '^CF_KV_NAMESPACE_ID=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
-    CF_API_TOKEN="$(grep -E '^CF_API_TOKEN=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
-    CF_REFRESH_TOKEN="$(grep -E '^CF_REFRESH_TOKEN=' "$CF_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
-  fi
+  local env_file
+  for env_file in "$CF_ENV" "$ROOT_ENV"; do
+    [ -f "$env_file" ] || continue
+    [ -n "$CF_ACCOUNT_ID" ] || CF_ACCOUNT_ID="$(grep -E '^CF_ACCOUNT_ID=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+    [ -n "$CF_KV_NAMESPACE_ID" ] || CF_KV_NAMESPACE_ID="$(grep -E '^CF_KV_NAMESPACE_ID=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+    [ -n "$CF_API_TOKEN" ] || CF_API_TOKEN="$(grep -E '^CF_API_TOKEN=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+    [ -n "$CF_API_TOKEN" ] || CF_API_TOKEN="$(grep -E '^CLOUDFLARE_API_TOKEN=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+    [ -n "$CF_REFRESH_TOKEN" ] || CF_REFRESH_TOKEN="$(grep -E '^CF_REFRESH_TOKEN=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '\r')"
+  done
 }
 
 # Renew the OAuth access token from CF_REFRESH_TOKEN; rotates the refresh token

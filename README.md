@@ -631,6 +631,8 @@ Each archive contains custom-format dumps of every connectable non-template Post
 
 Secrets such as database/JWT passwords, SMTP credentials, OAuth secrets, and API keys are deliberately not copied from `.env`; configure them as GitHub Actions secrets. Backups contain database contents, role password hashes, captured mail, and Cloudflare refresh credentials, so restrict access to Actions caches and any configured Cloudflare KV backup token. Supabase object storage is not enabled in this stack and therefore its objects are not included.
 
+For the Cloudflare KV disaster-recovery mirror, set the GitHub Actions secret `CLOUDFLARE_BACKUP_TOKEN` and variables `CF_BACKUP_ACCOUNT_ID` and `CF_BACKUP_KV_NAMESPACE_ID`. Locally, the backup utility reads `CF_ACCOUNT_ID`, `CF_KV_NAMESPACE_ID`, and `CLOUDFLARE_API_TOKEN` from the repository-root `.env` when `supabase/.env` does not provide them. Use an account API token with Workers KV read/write permissions.
+
 ### Cache limitations
 
 - GitHub Actions cache has **10GB limit** per repo
