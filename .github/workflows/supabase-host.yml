@@ -121,6 +121,22 @@ jobs:
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          # Optional real SMTP for auth emails (falls back to inbucket if unset)
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_ADMIN_EMAIL: ${{ secrets.SMTP_ADMIN_EMAIL }}
+          SMTP_SENDER_NAME: ${{ secrets.SMTP_SENDER_NAME }}
+          # Optional OAuth providers (auto-enabled when the client ID secret is set)
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_SECRET: ${{ secrets.GOOGLE_SECRET }}
+          GITHUB_CLIENT_ID: ${{ secrets.GITHUB_CLIENT_ID }}
+          GITHUB_SECRET: ${{ secrets.GITHUB_SECRET }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
           if [ -z "$CF_TUNNEL_TOKEN" ]; then
@@ -300,23 +316,6 @@ jobs:
           with open('.env','w') as f: f.write(env_content)
           print(".env configured")
           PYEOF
-        env:
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
-          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
-          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
-          # Optional real SMTP for auth emails (falls back to inbucket if unset)
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_ADMIN_EMAIL: ${{ secrets.SMTP_ADMIN_EMAIL }}
-          SMTP_SENDER_NAME: ${{ secrets.SMTP_SENDER_NAME }}
-          # Optional OAuth providers (auto-enabled when the client ID secret is set)
-          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-          GOOGLE_SECRET: ${{ secrets.GOOGLE_SECRET }}
-          GITHUB_CLIENT_ID: ${{ secrets.GITHUB_CLIENT_ID }}
-          GITHUB_SECRET: ${{ secrets.GITHUB_SECRET }}
 
       #  Wire off-site backup creds (Cloudflare KV) into .env 
       # The keepalive loop pushes every state archive to Workers KV after each
