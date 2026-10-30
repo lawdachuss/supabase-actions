@@ -3,7 +3,10 @@
 # 📸 snapshot-state.sh — snapshot the FULL Supabase state into an archive
 # =============================================================================
 # Produces ./supabase-state.tar.gz containing:
-#   backup.dump          - pg_dump (custom format) of the whole database
+#   db-backups/          - custom-format dumps of every connectable database
+#   db-backups/globals.sql - roles, memberships, and tablespaces
+#   .state-settings.env  - allowlisted non-secret runtime settings
+#   postgresql.auto.conf - PostgreSQL ALTER SYSTEM settings
 #   pgsodium_root.key    - Vault encryption key (from the db-config volume)
 #   volumes/functions    - edge functions managed via Studio
 #   volumes/snippets     - SQL snippets managed via Studio
@@ -19,36 +22,109 @@ set -uo pipefail
 COMPOSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$COMPOSE_DIR"
 
-# ── 1. Dump the database (only if the db container is up) ──────────────
-if docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
-  echo "  🗄️  pg_dump..."
-  # -Z 6: good compression for the custom-format dump — keeps snapshots small
-  # within GitHub's 10GB per-repo cache budget without burning excessive CPU in
-  # the live DB container every 5 minutes (max -Z 9 on a large DB can stall the
-  # session). (The analytics/log data lives in the separate '_supabase' database
-  # and is intentionally not backed up — it's disposable and would bloat every
-  # snapshot.)
-  if docker compose exec -T db pg_dump -U postgres -F c -Z 6 -f /tmp/backup.dump.new postgres \
-       && docker compose cp db:/tmp/backup.dump.new ./backup.dump.new; then
-    NEW_SIZE=$(stat -c%s ./backup.dump.new 2>/dev/null || echo 0)
-    OLD_SIZE=$(stat -c%s ./backup.dump 2>/dev/null || echo 0)
-    # Safeguard: never overwrite an existing large database backup (>1MB) with a tiny/empty dump (<500KB)
-    if [ "$OLD_SIZE" -gt 1000000 ] && [ "$NEW_SIZE" -lt 500000 ]; then
-      echo "  ⚠️  DANGER: New dump is suspiciously small (${NEW_SIZE}B vs ${OLD_SIZE}B)."
-      echo "  ⚠️  Preserving existing backup.dump (${OLD_SIZE}B) to prevent accidental data loss!"
-      rm -f ./backup.dump.new
-    else
-      mv -f ./backup.dump.new ./backup.dump
-      echo "  ✅ database dump updated ($(du -h ./backup.dump | cut -f1))"
-    fi
-  else
-    echo "  ⚠️  pg_dump failed — reusing previous backup.dump (if any)"
-  fi
-else
-  echo "  ℹ️  DB not ready — skipping pg_dump"
+# ── 1. Dump every connectable database and cluster globals ─────────────
+if ! docker compose exec -T db pg_isready -U postgres > /dev/null 2>&1; then
+  echo "  ERROR: PostgreSQL is not ready; keeping the previous complete archive" >&2
+  exit 1
 fi
 
-# ── 2. Save the pgsodium root key (straight from the db-config volume) ──
+DB_STAGING="$(mktemp -d ./db-backups.new.XXXXXX)"
+if ! DB_LIST=$(docker compose exec -T db psql -U postgres -d postgres -At -F '|' -c \
+  "SELECT replace(encode(convert_to(datname, 'UTF8'), 'base64'), chr(10), '') || '|' || replace(encode(convert_to(pg_get_userbyid(datdba), 'UTF8'), 'base64'), chr(10), '') FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname"); then
+  echo "  ERROR: could not enumerate PostgreSQL databases; keeping the previous archive" >&2
+  rm -rf "$DB_STAGING"
+  exit 1
+fi
+if [ -z "$DB_LIST" ]; then
+  echo "  ERROR: PostgreSQL returned no connectable databases; keeping the previous archive" >&2
+  rm -rf "$DB_STAGING"
+  exit 1
+fi
+
+if ! docker compose exec -T db pg_dumpall -U postgres --globals-only > "$DB_STAGING/globals.sql"; then
+  echo "  ERROR: failed to dump PostgreSQL roles and global settings" >&2
+  rm -rf "$DB_STAGING"
+  exit 1
+fi
+
+: > "$DB_STAGING/manifest.tsv"
+DB_INDEX=0
+while IFS='|' read -r DB_NAME_B64 DB_OWNER_B64; do
+  [ -n "$DB_NAME_B64" ] || continue
+  DB_INDEX=$((DB_INDEX + 1))
+  DB_NAME="$(printf '%s' "$DB_NAME_B64" | base64 -d)"
+  DB_OWNER="$(printf '%s' "$DB_OWNER_B64" | base64 -d)"
+  if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ]; then
+    echo "  ERROR: invalid database metadata returned by PostgreSQL" >&2
+    rm -rf "$DB_STAGING"
+    exit 1
+  fi
+  DB_DUMP_NAME="$(printf 'db-%08d.dump' "$DB_INDEX")"
+  echo "  🗄️  dumping database: $DB_NAME"
+  if ! docker compose exec -T db pg_dump -U postgres --format=custom --compress=6 --create \
+       --dbname="$DB_NAME" > "$DB_STAGING/$DB_DUMP_NAME" \
+       || [ ! -s "$DB_STAGING/$DB_DUMP_NAME" ]; then
+    echo "  ERROR: failed to dump database: $DB_NAME" >&2
+    rm -rf "$DB_STAGING"
+    exit 1
+  fi
+  if ! docker compose cp "$DB_STAGING/$DB_DUMP_NAME" db:/tmp/state-validation.dump \
+       || ! docker compose exec -T db pg_restore --list /tmp/state-validation.dump >/dev/null \
+       || ! docker compose exec -T db rm -f /tmp/state-validation.dump; then
+    echo "  ERROR: PostgreSQL dump validation failed for database: $DB_NAME" >&2
+    rm -rf "$DB_STAGING"
+    exit 1
+  fi
+  printf '%s\t%s\t%s\n' "$DB_DUMP_NAME" "$DB_NAME_B64" "$DB_OWNER_B64" >> "$DB_STAGING/manifest.tsv"
+done <<EOF
+$DB_LIST
+EOF
+
+if [ "$DB_INDEX" -eq 0 ]; then
+  echo "  ERROR: no database dumps were created; keeping the previous archive" >&2
+  rm -rf "$DB_STAGING"
+  exit 1
+fi
+
+DB_OLD="./db-backups.previous"
+rm -rf "$DB_OLD"
+if [ -d ./db-backups ]; then
+  mv ./db-backups "$DB_OLD"
+fi
+if mv "$DB_STAGING" ./db-backups; then
+  DB_STAGING=""
+  rm -rf "$DB_OLD"
+  echo "  ✅ complete database snapshot updated ($DB_INDEX databases)"
+else
+  [ ! -d "$DB_OLD" ] || mv "$DB_OLD" ./db-backups
+  echo "  ERROR: could not publish the complete database snapshot" >&2
+  rm -rf "$DB_STAGING"
+  exit 1
+fi
+
+if ! bash utils/state-settings.sh save; then
+  echo "  ERROR: could not snapshot runtime settings" >&2
+  exit 1
+fi
+
+# ── 2. Save PostgreSQL ALTER SYSTEM settings ───────────────────────────
+PG_AUTO_CONF_NEW=./postgresql.auto.conf.new
+if docker compose exec -T db sh -c 'test -f "$PGDATA/postgresql.auto.conf"'; then
+  if ! docker compose exec -T db sh -c 'cat "$PGDATA/postgresql.auto.conf"' > "$PG_AUTO_CONF_NEW"; then
+    echo "  ERROR: could not snapshot PostgreSQL ALTER SYSTEM settings" >&2
+    rm -f "$PG_AUTO_CONF_NEW"
+    exit 1
+  fi
+  if [ -s "$PG_AUTO_CONF_NEW" ]; then
+    mv -f "$PG_AUTO_CONF_NEW" ./postgresql.auto.conf
+  else
+    rm -f "$PG_AUTO_CONF_NEW" ./postgresql.auto.conf
+  fi
+else
+  rm -f "$PG_AUTO_CONF_NEW" ./postgresql.auto.conf
+fi
+
+# ── 3. Save the pgsodium root key (straight from the db-config volume) ──
 DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1 || true)
 if [ -n "$DB_VOL" ] && \
    docker run --rm -v "$DB_VOL":/etc/postgresql-custom supabase/postgres:17.6.1.136 \
@@ -60,7 +136,7 @@ else
   echo "  ℹ️  no pgsodium key found in db-config volume"
 fi
 
-# ── 3. Save Redis data (if redis container is running) ──────────────────
+# ── 4. Save Redis data (if redis container is running) ──────────────────
 # Redis persists in two formats and BOTH are archived:
 #   appendonlydir/  AOF — primary. Appended on every write, so it captures
 #                   everything up to the last second (durable across in-session
@@ -146,10 +222,12 @@ if docker compose ps --services --filter "status=running" 2>/dev/null | grep -q 
   fi
 fi
 
-# ── 4. Pack the full-state archive (tolerates missing pieces) ───────────
+# ── 5. Pack the full-state archive ─────────────────────────────────────
 pack_archive() {
-  ARCHIVE_FILES="volumes/functions volumes/snippets"
-  [ -s ./backup.dump ] && ARCHIVE_FILES="$ARCHIVE_FILES backup.dump"
+  ARCHIVE_FILES="volumes/functions volumes/snippets db-backups"
+  [ -d ./volumes/inbucket/data ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/inbucket/data"
+  [ -f ./.state-settings.env ] && ARCHIVE_FILES="$ARCHIVE_FILES .state-settings.env"
+  [ -s ./postgresql.auto.conf ] && ARCHIVE_FILES="$ARCHIVE_FILES postgresql.auto.conf"
   [ -s ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
   [ -s ./dump.rdb ] && ARCHIVE_FILES="$ARCHIVE_FILES dump.rdb"
   [ -d ./appendonlydir ] && ARCHIVE_FILES="$ARCHIVE_FILES appendonlydir"
@@ -178,7 +256,7 @@ pack_archive() {
 
 pack_archive || exit 1
 
-# ── 5. Off-site mirror to Cloudflare KV (best-effort, throttled) ────────
+# ── 6. Off-site mirror to Cloudflare KV (best-effort, throttled) ────────
 PUSH_INTERVAL=1500
 CF_MARKER=./.cf_push_last
 if [ -s ./supabase-state.tar.gz ]; then

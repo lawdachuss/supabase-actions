@@ -38,9 +38,14 @@ Thumbs.db
 /supabase/*.dump.*
 /supabase/dump.rdb
 /supabase/dump.rdb.new
+/supabase/appendonlydir/
+/supabase/appendonlydir.new/
+/supabase/db-backups/
+/supabase/db-backups.new.*/
+/supabase/db-backups.previous/
+/supabase/.state-settings.env*
+/supabase/postgresql.auto.conf*
 # Redis AOF (multi-part appendonly dir) captured by snapshot-state.sh
-/supabase/appendonlydir
-/supabase/appendonlydir.new
 /supabase/pgsodium_root.key
 /supabase/supabase-state.tar.gz
 /supabase/supabase-state.tar.gz.new

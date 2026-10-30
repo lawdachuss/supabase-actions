@@ -3,8 +3,8 @@
 // =============================================================================
 // Served at /functions/v1/redis-http via Kong. Lets the frontend API (which
 // runs on Vercel and therefore cannot run `cloudflared access tcp`) talk to
-// the self-hosted Redis over plain HTTPS — no bore.pub, no ephemeral ports, no
-// vendor. This is the "permanent Redis" address the app was missing.
+// the self-hosted Redis over plain HTTPS — no random-port relay or extra
+// vendor. This is the permanent public Redis endpoint used by external apps.
 //
 //   POST /functions/v1/redis-http          { "cmd": "get",  "args": ["api:home"] }
 //   POST /functions/v1/redis-http          { "pipeline": [{ "cmd": "setex", "args": [...] }, ...] }
@@ -15,8 +15,8 @@
 // `Authorization: Bearer <key>`. Without it the endpoint answers 401 — the
 // commands here can mutate cache data, so it must never be anonymous.
 //
-// The connection uses DB 0 with no prefix — exactly the keyspace the frontend
-// API already used over the old bore tunnel, so the existing cache survives.
+// The connection uses DB 0 with no prefix, preserving the existing Redis
+// keyspace used by the frontend API.
 // Replies are JSON (deep-converted from Buffers); session gaps answer 503 with
 // Retry-After so clients back off instead of hanging (same contract as the
 // `cache` function).

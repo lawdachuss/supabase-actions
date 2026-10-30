@@ -15,9 +15,9 @@
 #    The hourly schedule is a fallback if self-dispatch fails or a run is
 #    terminated before reaching the handoff.
 #
-# Required GitHub Secrets:
+# Required GitHub configuration:
 #   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
-#   CF_TUNNEL_DOMAIN    - Your domain for public access (e.g. supabase.chuglii.in)
+#   CF_TUNNEL_DOMAIN    - Actions variable for your public domain (e.g. supabase.chuglii.in)
 #   POSTGRES_PASSWORD   - Your secure PostgreSQL password
 #   JWT_SECRET          - JWT signing secret (32+ chars)
 #   DASHBOARD_PASSWORD  - Supabase Studio admin password
@@ -43,7 +43,7 @@
 #
 # Repository: https://github.com/apunabhibhilegendhai/Supabase-Actions
 # The secrets listed above are configured on that repository (Settings → Secrets
-# and variables → Actions); CF_TUNNEL_DOMAIN lives in the Variables tab.
+# and variables → Actions); CF_TUNNEL_DOMAIN should be an Actions variable.
 # =============================================================================
 
 name:  Full Supabase Self-Hosted
@@ -118,23 +118,32 @@ jobs:
 
       #  Parallel prep + startup (everything runs at once) 
       - name:  Super-fast startup
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          CF_TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
+          if [ -z "$CF_TUNNEL_TOKEN" ]; then
+            echo "::error::CF_TUNNEL_TOKEN is required to start the public Cloudflare tunnel"
+            exit 1
+          fi
+          if [ -z "$CF_TUNNEL_DOMAIN" ]; then
+            echo "::error::CF_TUNNEL_DOMAIN is required to publish a permanent public Redis HTTPS endpoint"
+            exit 1
+          fi
           
           # 
           # PHASE 1: Prepare dependencies (parallel background jobs)
           # 
           (
-            # Download cloudflared & bore (TCP tunnel for Redis)
+            # Download cloudflared for the public Supabase tunnel.
             curl -sL --retry 3 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
               -o /usr/local/bin/cloudflared &&
             chmod +x /usr/local/bin/cloudflared &&
-            curl -sL --retry 3 https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /usr/local/bin &&
-            chmod +x /usr/local/bin/bore &&
             cloudflared version
           ) &
           pip install 'ecdsa>=0.19.0' -q &
-          (mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs,redis/data} && chmod -R 777 volumes/redis/data) &
+          (mkdir -p volumes/{db/data,functions,pooler,snippets,api,logs,redis/data,inbucket/data} && chmod -R 777 volumes/redis/data) &
           
           # Pull Docker images in the background (runs in parallel with setup).
           # No image cache anymore  images are re-pullable and pull quickly.
@@ -157,12 +166,8 @@ jobs:
           # PHASE 2: Configure .env (fast  ~3s)
           # 
           cp .env.example .env
-          CF_DOMAIN="${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}"
-          if [ -n "$CF_DOMAIN" ]; then
-            export PUBLIC_URL="https://$CF_DOMAIN"
-          else
-            export PUBLIC_URL="http://localhost:8000"
-          fi
+          CF_DOMAIN="$CF_TUNNEL_DOMAIN"
+          export PUBLIC_URL="https://$CF_DOMAIN"
           python3 << 'PYEOF'
           import os, hmac, hashlib, base64, json, uuid
           from ecdsa import SigningKey, NIST256p
@@ -417,8 +422,8 @@ jobs:
             echo "  Cloudflare backup ready (off-site mirror + disaster-recovery restore)"
           fi
 
-      #  Restore full state (functions, snippets, pgsodium key) 
-      - name:  Restore full state (functions, snippets, pgsodium key)
+      # Restore all database and runtime state before starting application services.
+      - name: Restore full state (databases, Redis, mail, functions, settings)
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
@@ -430,10 +435,45 @@ jobs:
               rm -f "$members_file"
               return 1
             fi
+            if tar -tvzf "$archive" 2>/dev/null \
+              | awk 'substr($0, 1, 1) == "l" || substr($0, 1, 1) == "h" { found = 1 } END { exit !found }'; then
+              rm -f "$members_file"
+              return 1
+            fi
             while IFS= read -r member; do
               case "$member" in
-                backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|.cf-creds|./.cf-creds|state-ts|./state-ts)
-                  printf '%s\n' "$member" >> "$members_file"
+                backup.dump|./backup.dump|pgsodium_root.key|./pgsodium_root.key|postgresql.auto.conf|./postgresql.auto.conf|dump.rdb|./dump.rdb|appendonlydir|./appendonlydir|appendonlydir/|./appendonlydir/|appendonlydir/appendonly.aof.manifest|./appendonlydir/appendonly.aof.manifest|volumes/functions|./volumes/functions|volumes/functions/|./volumes/functions/|volumes/snippets|./volumes/snippets|volumes/snippets/|./volumes/snippets/|volumes/inbucket/data|./volumes/inbucket/data|volumes/inbucket/data/|./volumes/inbucket/data/|volumes/redis/data/dump.rdb|./volumes/redis/data/dump.rdb|volumes/redis/data/appendonly.aof|./volumes/redis/data/appendonly.aof|volumes/redis/data/appendonlydir|./volumes/redis/data/appendonlydir|volumes/redis/data/appendonlydir/|./volumes/redis/data/appendonlydir/|db-backups|./db-backups|db-backups/|./db-backups/|db-backups/globals.sql|./db-backups/globals.sql|db-backups/manifest.tsv|./db-backups/manifest.tsv|db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|./db-backups/db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump|.state-settings.env|./.state-settings.env|.cf-creds|./.cf-creds|state-ts|./state-ts)
+                  case "$member" in
+                    */) ;;
+                    *) printf '%s\n' "$member" >> "$members_file" ;;
+                  esac
+                  ;;
+                volumes/functions/*|./volumes/functions/*|volumes/snippets/*|./volumes/snippets/*|volumes/inbucket/data/*|./volumes/inbucket/data/*)
+                  archive_member="${member#./}"
+                  case "$archive_member" in */) archive_member="${archive_member%/}" ;; esac
+                  case "$archive_member" in
+                    /*|*\\*) rm -f "$members_file"; return 1 ;;
+                  esac
+                  IFS='/' read -r -a path_parts <<< "$archive_member"
+                  for path_part in "${path_parts[@]}"; do
+                    case "$path_part" in
+                      ""|"."|"..") rm -f "$members_file"; return 1 ;;
+                    esac
+                  done
+                  case "$member" in
+                    */) ;;
+                    *) printf '%s\n' "$member" >> "$members_file" ;;
+                  esac
+                  ;;
+                appendonlydir/*|./appendonlydir/*)
+                  redis_member="${member#./}"
+                  redis_member="${redis_member#appendonlydir/}"
+                  if printf '%s\n' "$redis_member" | grep -Eq '^appendonly\.aof\.[0-9]+\.(base\.rdb|incr\.aof)$'; then
+                    printf '%s\n' "$member" >> "$members_file"
+                  else
+                    rm -f "$members_file"
+                    return 1
+                  fi
                   ;;
               esac
             done < <(tar tzf "$archive" 2>/dev/null)
@@ -452,7 +492,7 @@ jobs:
           fi
 
           if [ -f ./supabase-state.tar.gz ]; then
-            echo " State archive found  restoring edge functions, snippets, DB dump, pgsodium key..."
+            echo " State archive found  restoring databases, roles, Redis, functions, snippets, settings, and pgsodium key..."
 
             # Prefer the OFF-SITE Cloudflare copy when it is fresher than the
             # cached one. A cancelled run never reaches the end-of-run cache
@@ -515,8 +555,10 @@ jobs:
             git checkout -- volumes/functions/ 2>/dev/null || true
             echo "   functions: $(ls volumes/functions 2>/dev/null | tr '\n' ' ')"
             echo "   snippets:  $(ls volumes/snippets 2>/dev/null | tr '\n' ' ')"
-            if [ -f ./backup.dump ]; then
-              echo "    DB dump: $(du -h ./backup.dump | cut -f1)  will be restored by restore_db()"
+            if [ -f ./db-backups/manifest.tsv ]; then
+              echo "    Database set: $(wc -l < ./db-backups/manifest.tsv | tr -d ' ') database(s) will be restored by restore_db()"
+            elif [ -f ./backup.dump ]; then
+              echo "    Legacy DB dump: $(du -h ./backup.dump | cut -f1)  will be restored by restore_db()"
             else
               echo "    DB dump: absent (fresh database)"
             fi
@@ -530,9 +572,33 @@ jobs:
               echo "   Redis dump: $(du -h ./volumes/redis/data/dump.rdb | cut -f1)  ready for redis container"
               chmod -R 777 volumes/redis/data 2>/dev/null || true
             fi
+            if [ -d ./appendonlydir ]; then
+              if [ ! -s ./appendonlydir/appendonly.aof.manifest ] \
+                 || ! find ./appendonlydir -maxdepth 1 -type f \( -name '*.aof' -o -name '*.rdb' \) | grep -q .; then
+                echo "::error::Redis AOF archive is incomplete; refusing to restore it"
+                exit 1
+              fi
+              rm -rf ./volumes/redis/data/appendonlydir
+              mkdir -p ./volumes/redis/data
+              cp -a ./appendonlydir ./volumes/redis/data/appendonlydir
+              chmod -R 777 ./volumes/redis/data
+              echo "   Redis AOF restored to volumes/redis/data/appendonlydir"
+            else
+              rm -rf ./volumes/redis/data/appendonlydir
+            fi
           else
             echo "  No state archive  fresh start"
             echo "::warning::No state archive found anywhere (cache miss or first run) — starting with a fresh Supabase database."
+          fi
+
+          if ! bash utils/state-settings.sh restore; then
+            echo "::error::persisted runtime settings could not be restored"
+            exit 1
+          fi
+          if [ -f ./supabase-state.tar.gz ] \
+             && [ ! -d ./db-backups ] && [ ! -f ./backup.dump ]; then
+            echo "::error::state archive contains no database backup; refusing to start a silent fresh database"
+            exit 1
           fi
 
           # Ensure the 'main' edge function exists BEFORE containers start.
@@ -602,18 +668,18 @@ jobs:
           cd ${{ env.SUPABASE_DIR }}
           bash utils/prune-caches.sh || true
 
-      #  Start containers + restore DB + tunnel (all in parallel) 
+      # Restore databases before starting the application services.
       - name:  Start containers + restore DB + tunnel
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
-          # Start all containers (non-blocking)
-          docker compose up -d
-          echo "Containers started, waiting for healthchecks..."
-
-          #  Run jobs in parallel with exit-code tracking 
+          # Keep application connections away while the database is restored.
           STATUS_FILE=$(mktemp)
           echo 0 > "$STATUS_FILE"
+          docker compose up -d db redis
+          echo "Database and Redis started; waiting for database initialization..."
 
           restore_db() {
             # FIX: docker compose wait <svc> blocks until the container STOPS (not
@@ -656,55 +722,166 @@ jobs:
               INIT_ELAPSED=$((INIT_ELAPSED + 1))
             done
             if [ $INIT_ELAPSED -ge $INIT_TIMEOUT ]; then
-              echo "  Timed out waiting for init scripts  continuing anyway"
-            fi
-
-            if [ ! -f ./backup.dump ]; then
-              echo "No backup file found  starting fresh database"
-              return
-            fi
-
-            # Verify backup is valid before attempting restore
-            BACKUP_SIZE=$(stat -c%s ./backup.dump 2>/dev/null || echo 0)
-            if [ "$BACKUP_SIZE" -lt 100 ]; then
-              echo "  Backup file too small (${BACKUP_SIZE}B)  skipping restore"
-              return
-            fi
-            echo "Restoring database from backup ($(du -h ./backup.dump | cut -f1))..."
-
-            # Copy backup into container
-            if ! docker compose cp ./backup.dump db:/tmp/backup.dump; then
-              echo "ERROR: Failed to copy backup into container"
+              echo "::error::timed out waiting for database initialization; refusing to restore over an incomplete database"
               echo 1 > "$STATUS_FILE"
               return
             fi
 
-            # Grant postgres access to auth schema so pg_restore and migrations can access it
-            docker compose exec -T db psql -U postgres -d postgres -c "
-              GRANT ALL ON SCHEMA auth TO postgres;
-              GRANT ALL ON ALL TABLES IN SCHEMA auth TO postgres;
-              GRANT ALL ON ALL SEQUENCES IN SCHEMA auth TO postgres;
-              GRANT ALL ON ALL ROUTINES IN SCHEMA auth TO postgres;
-            " 2>/dev/null || true
-
-            # Restore with clean and disable-triggers to ensure table structures and constraints restore cleanly
-            RESTORE_LOG=$(mktemp)
-            if docker compose exec -T db pg_restore -U postgres -d postgres \
-              --clean --if-exists --no-owner --no-privileges --disable-triggers \
-              --jobs 2 \
-              /tmp/backup.dump 2>"$RESTORE_LOG"; then
-              echo " Database fully restored from backup"
-            else
-              # Filter out expected drop/cleanup notices (e.g. "does not exist" on fresh tables, "permission denied" on auth schema)
-              REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access|set_graphql_placeholder|pgrst_drop_watch|pgrst_ddl_watch|grant_pg_net_access|grant_pg_cron_access" || true)
-              if [ -n "$REAL_ERRORS" ]; then
-                echo "  pg_restore warnings:"
-                echo "$REAL_ERRORS" | head -5 | sed 's/^/    /'
-              else
-                echo " Database restored (all drop/system notices are harmless  data intact)"
+            if [ -s ./postgresql.auto.conf ]; then
+              echo "Restoring PostgreSQL ALTER SYSTEM settings..."
+              if ! docker compose exec -T db sh -c \
+                   'cat > "$PGDATA/postgresql.auto.conf" && chmod 600 "$PGDATA/postgresql.auto.conf"' \
+                   < ./postgresql.auto.conf; then
+                echo "::error::could not install the saved PostgreSQL settings"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              if ! docker compose restart db >/dev/null; then
+                echo "::error::PostgreSQL could not restart with the saved settings"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              DB_READY=0
+              for i in $(seq 1 60); do
+                if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
+                  DB_READY=1
+                  break
+                fi
+                sleep 2
+              done
+              if [ "$DB_READY" -ne 1 ]; then
+                echo "::error::PostgreSQL did not become ready after restoring saved settings"
+                echo 1 > "$STATUS_FILE"
+                return
               fi
             fi
-            rm -f "$RESTORE_LOG"
+
+            if [ -d ./db-backups ] \
+               && { [ ! -s ./db-backups/manifest.tsv ] || [ ! -s ./db-backups/globals.sql ]; }; then
+              echo "::error::database backup set is incomplete (manifest or PostgreSQL globals are missing)"
+              echo 1 > "$STATUS_FILE"
+              return
+            fi
+
+            if [ -s ./db-backups/manifest.tsv ] && [ -s ./db-backups/globals.sql ]; then
+              echo "Restoring all databases and PostgreSQL roles from the complete state backup..."
+              GLOBAL_LOG=$(mktemp)
+              docker compose exec -T db psql -U postgres -d postgres \
+                < ./db-backups/globals.sql >"$GLOBAL_LOG" 2>&1 || true
+              GLOBAL_ERRORS=$(grep -i "ERROR:" "$GLOBAL_LOG" 2>/dev/null \
+                | grep -viE 'role ".*" already exists|tablespace ".*" already exists' || true)
+              if [ -n "$GLOBAL_ERRORS" ]; then
+                echo "::error::failed to restore PostgreSQL roles/global settings"
+                echo "$GLOBAL_ERRORS" | head -10 | sed 's/^/    /'
+                rm -f "$GLOBAL_LOG"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              rm -f "$GLOBAL_LOG"
+
+              # Keep the active GitHub secret authoritative if a historical globals
+              # dump contains a previous password hash for the built-in postgres role.
+              if ! printf '%s\n' "ALTER ROLE postgres WITH PASSWORD :'POSTGRES_PASSWORD';" \
+                   | docker compose exec -T db psql -U postgres -d postgres \
+                     -v "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" >/dev/null; then
+                echo "::error::failed to synchronize the postgres password with GitHub Actions secrets"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+
+              RESTORE_FAILED=0
+              RESTORE_COUNT=0
+              while IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64; do
+                [ -n "$DB_DUMP_NAME" ] || continue
+                case "$DB_DUMP_NAME" in
+                  db-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].dump) ;;
+                  *)
+                    echo "::error::invalid database dump entry in backup manifest"
+                    RESTORE_FAILED=1
+                    break
+                    ;;
+                esac
+                DB_NAME="$(printf '%s' "$DB_NAME_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database name in backup manifest"
+                  RESTORE_FAILED=1
+                  break
+                }
+                DB_OWNER="$(printf '%s' "$DB_OWNER_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database owner in backup manifest"
+                  RESTORE_FAILED=1
+                  break
+                }
+                if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ] \
+                   || [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
+                  echo "::error::incomplete database entry in backup manifest: $DB_DUMP_NAME"
+                  RESTORE_FAILED=1
+                  break
+                fi
+                echo "Restoring database: $DB_NAME"
+                if ! docker compose cp "./db-backups/$DB_DUMP_NAME" "db:/tmp/$DB_DUMP_NAME"; then
+                  echo "::error::failed to copy database dump: $DB_DUMP_NAME"
+                  RESTORE_FAILED=1
+                  break
+                fi
+                RESTORE_LOG=$(mktemp)
+                RESTORE_STATUS=0
+                docker compose exec -T db pg_restore -U postgres \
+                  --clean --if-exists --create --disable-triggers --jobs 2 \
+                  -d template1 "/tmp/$DB_DUMP_NAME" 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
+                ALL_RESTORE_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null || true)
+                RESTORE_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null \
+                  | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access|set_graphql_placeholder|pgrst_drop_watch|pgrst_ddl_watch|grant_pg_net_access|grant_pg_cron_access" || true)
+                if [ -n "$RESTORE_ERRORS" ]; then
+                  echo "  PostgreSQL restore errors for $DB_NAME:"
+                  echo "$RESTORE_ERRORS" | head -10 | sed 's/^/    /'
+                  RESTORE_FAILED=1
+                elif [ "$RESTORE_STATUS" -ne 0 ] && [ -z "$ALL_RESTORE_ERRORS" ]; then
+                  echo "::error::pg_restore failed without a recognized database error for $DB_NAME"
+                  RESTORE_FAILED=1
+                fi
+                rm -f "$RESTORE_LOG"
+                if [ "$RESTORE_FAILED" -ne 0 ]; then
+                  break
+                fi
+                RESTORE_COUNT=$((RESTORE_COUNT + 1))
+              done < ./db-backups/manifest.tsv
+
+              if [ "$RESTORE_COUNT" -eq 0 ]; then
+                echo "::error::database manifest did not contain any restorable databases"
+                RESTORE_FAILED=1
+              fi
+              if [ "$RESTORE_FAILED" -ne 0 ]; then
+                echo "::error::one or more database backups could not be fully restored"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              echo " All databases and PostgreSQL global objects restored"
+            elif [ -f ./backup.dump ]; then
+              echo "Restoring legacy database backup ($(du -h ./backup.dump | cut -f1))..."
+              if ! docker compose cp ./backup.dump db:/tmp/backup.dump; then
+                echo "::error::failed to copy legacy database backup into the container"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              RESTORE_LOG=$(mktemp)
+              if ! docker compose exec -T db pg_restore -U postgres -d postgres \
+                 --clean --if-exists --no-owner --no-privileges --disable-triggers --jobs 2 \
+                   /tmp/backup.dump 2>"$RESTORE_LOG"; then
+                REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null \
+                  | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access|set_graphql_placeholder|pgrst_drop_watch|pgrst_ddl_watch|grant_pg_net_access|grant_pg_cron_access" || true)
+                if [ -n "$REAL_ERRORS" ]; then
+                  echo "::error::legacy database restore failed"
+                  echo "$REAL_ERRORS" | head -10 | sed 's/^/    /'
+                  rm -f "$RESTORE_LOG"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+              fi
+              rm -f "$RESTORE_LOG"
+            else
+              echo "No database backup found; starting a fresh database"
+              return
+            fi
 
             #  Verify restore success 
             echo "Verifying restore..."
@@ -747,10 +924,10 @@ jobs:
               return
             fi
             echo "Kong is ready on port 8000!"
-            if [ -n "${{ secrets.CF_TUNNEL_TOKEN }}" ]; then
+            if [ -n "$CF_TUNNEL_TOKEN" ]; then
               # Run tunnel using remotely managed token (supports multiple hostnames in Zero Trust dashboard)
               nohup cloudflared tunnel --no-autoupdate run \
-                --token ${{ secrets.CF_TUNNEL_TOKEN }} \
+                --token "$CF_TUNNEL_TOKEN" \
                 > /tmp/cloudflared.log 2>&1 &
               TUNNEL_PID=$!
               echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
@@ -761,7 +938,7 @@ jobs:
                 kill $TUNNEL_PID 2>/dev/null || true
                 nohup cloudflared tunnel --no-autoupdate run \
                   --url http://localhost:8000 \
-                  --token ${{ secrets.CF_TUNNEL_TOKEN }} \
+                  --token "$CF_TUNNEL_TOKEN" \
                   > /tmp/cloudflared.log 2>&1 &
                 TUNNEL_PID=$!
                 echo "TUNNEL_PID=$TUNNEL_PID" >> $GITHUB_ENV
@@ -785,50 +962,17 @@ jobs:
             fi
           }
 
-          start_redis_tunnel() {
-            for i in $(seq 1 30); do
-              if docker compose exec -T redis redis-cli ping >/dev/null 2>&1; then
-                break
-              fi
-              sleep 1
-            done
-            if command -v bore >/dev/null 2>&1; then
-              # Attempt to bind permanent fixed port 26379 first
-              nohup bore local 6379 --to bore.pub --port 26379 > /tmp/bore.log 2>&1 &
-              BORE_PID=$!
-              echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
-              for i in $(seq 1 5); do
-                sleep 1
-                BORE_PORT=$(grep -oP 'listening at bore.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
-                if [ -n "$BORE_PORT" ]; then
-                  break
-                fi
-              done
-              # If fixed port was already taken on bore.pub, fall back to any available port
-              if [ -z "$BORE_PORT" ]; then
-                kill $BORE_PID 2>/dev/null || true
-                nohup bore local 6379 --to bore.pub > /tmp/bore.log 2>&1 &
-                BORE_PID=$!
-                echo "BORE_PID=$BORE_PID" >> $GITHUB_ENV
-                for i in $(seq 1 8); do
-                  sleep 1
-                  BORE_PORT=$(grep -oP 'listening at bore.pub:\K[0-9]+' /tmp/bore.log 2>/dev/null | head -1)
-                  if [ -n "$BORE_PORT" ]; then
-                    break
-                  fi
-                done
-              fi
-              if [ -n "$BORE_PORT" ]; then
-                echo "REDIS_TCP_PORT=$BORE_PORT" >> $GITHUB_ENV
-                echo "REDIS_TCP_HOST=bore.pub" >> $GITHUB_ENV
-                echo "Redis TCP tunnel active at bore.pub:$BORE_PORT"
-              fi
-            fi
-          }
+          restore_db
+          if [ "$(cat "$STATUS_FILE")" -ne 0 ]; then
+            echo "::error::database restore failed; application services will not be started"
+            cat "$STATUS_FILE"
+            rm -f "$STATUS_FILE"
+            exit 1
+          fi
 
-          restore_db &
+          docker compose up -d
+          echo "Database restore complete; all Supabase services are starting..."
           start_tunnel &
-          start_redis_tunnel &
           wait
 
           # FIX: supavisor (pooler) crash-loops at boot  it starts before the
@@ -999,13 +1143,11 @@ jobs:
           # and could cut the cache save off at the 355-min timeout, losing up to
           # 5h of data on the next restore).
           END_TIME=$(( $(date +%s) + DURATION ))
-          DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
+          DOMAIN="$TUNNEL_DOMAIN"
+          REDIS_HTTP_URL="https://$DOMAIN/functions/v1/redis-http"
           # Read Redis password safely from .env without shell-evaluating JSON values
           REDIS_PASSWORD=$(grep -E '^REDIS_PASSWORD=' .env 2>/dev/null | cut -d= -f2- | tr -d '\r')
           export REDIS_PASSWORD  # must be exported so snapshot-state.sh subprocess can use it for redis-cli auth
-
-          BASE_DOMAIN=$(echo "$DOMAIN" | sed 's/^supabase\.//')
-          REDIS_SUBDOMAIN="redis.$BASE_DOMAIN"
 
           echo ""
           echo "+=============================================================+"
@@ -1014,16 +1156,8 @@ jobs:
           echo "|                                                             |"
           echo "|  Studio:        http://localhost:8000                       |"
           echo "|  Tunnel:        Connected via Cloudflare                    |"
-          if [ -n "$TUNNEL_DOMAIN" ]; then
-            echo "|  Studio Domain: https://$DOMAIN                               |"
-            echo "|  Redis Web UI:  https://$REDIS_SUBDOMAIN (port 8081)           |"
-            echo "|  Cache API:     https://$DOMAIN/functions/v1/cache         |"
-          fi
-          if [ -n "${REDIS_TCP_PORT:-}" ]; then
-            echo "|  Redis TCP:     ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT} (or $REDIS_SUBDOMAIN)     |"
-          else
-            echo "|  Redis:         redis:6379 (Docker internal network)        |"
-          fi
+          echo "|  Studio Domain: https://$DOMAIN                               |"
+          echo "|  Public Redis:  $REDIS_HTTP_URL       |"
           echo "|  Snapshots:     every 5 min  saved at shutdown             |"
           echo "|                                                             |"
           echo "|  Monitor:       https://github.com/${{ github.repository }}/actions|"
@@ -1044,31 +1178,17 @@ jobs:
               echo "| Service | Link / Endpoint |"
               echo "|---|---|"
               echo "|  **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
-              echo "|  **Redis Web Dashboard** | [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) *(route to \`localhost:8081\` in CF Zero Trust)* |"
-              if [ -n "${REDIS_TCP_PORT:-}" ]; then
-                echo "|  **Redis Direct TCP** | \`redis://default:${REDIS_PASSWORD}@$REDIS_SUBDOMAIN:${REDIS_TCP_PORT}\` |"
-              fi
+              echo "|  **Permanent public Redis API** | [$REDIS_HTTP_URL]($REDIS_HTTP_URL) *(HTTPS; authenticate with the Supabase service-role key in the \`apikey\` header)* |"
               echo "|  **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
               echo "|  **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
               echo "|  **Auth API** | [https://$DOMAIN/auth/v1/](https://$DOMAIN/auth/v1/) |"
               echo ""
-              if [ -n "${REDIS_TCP_PORT:-}" ]; then
-                echo "####  Connect to Redis from Anywhere:"
-                echo "- **Permanent URI**: \`redis://default:${REDIS_PASSWORD}@$REDIS_SUBDOMAIN:${REDIS_TCP_PORT}\` *(requires CNAME \`$REDIS_SUBDOMAIN\`  \`bore.pub\` in DNS)*"
-                echo "- **Direct Relay URI**: \`redis://default:${REDIS_PASSWORD}@${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}\`"
-                echo "- **CLI Command**: \`redis-cli -h ${REDIS_TCP_HOST:-bore.pub} -p ${REDIS_TCP_PORT} -a ${REDIS_PASSWORD}\`"
-                echo ""
-              fi
-              echo "- **Redis Web GUI**: [https://$REDIS_SUBDOMAIN](https://$REDIS_SUBDOMAIN) (credentials: \`redis\` / \`redis\`)"
+              echo "Use the Redis HTTPS API with \`POST $REDIS_HTTP_URL\` and an \`apikey: <SUPABASE_SERVICE_ROLE_KEY>\` header."
               echo "- **Redis Internal**: \`redis:6379\` (Docker network)"
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          if [ -n "${REDIS_TCP_PORT:-}" ]; then
-            echo "::notice title= Supabase & Redis Live::Studio: https://$DOMAIN | Redis Web: https://$REDIS_SUBDOMAIN | TCP: ${REDIS_TCP_HOST:-bore.pub}:${REDIS_TCP_PORT}"
-          else
-            echo "::notice title= Supabase is Live::Studio: https://$DOMAIN | Redis: https://$DOMAIN/functions/v1/cache"
-          fi
+          echo "::notice title= Supabase & Redis Live::Studio: https://$DOMAIN | Redis API: $REDIS_HTTP_URL"
 
           #  Keepalive loop + health checks + 5-min on-disk snapshots 
           # (run_id/run_attempt are used by the final cache-save step's key)
@@ -1125,11 +1245,6 @@ jobs:
                 FAILS=0
                 REMAINING=$(( (END_TIME - NOW) / 60 ))
                 echo "$(date '+%H:%M:%S') -- Healthy | ${REMAINING}m remaining | snapshots: $SNAPSHOTS"
-                if [ -n "${BORE_PID:-}" ] && ! kill -0 "$BORE_PID" 2>/dev/null; then
-                  echo "   bore process exited  restarting Redis tunnel..."
-                  nohup bore local 6379 --to bore.pub > /tmp/bore.log 2>&1 &
-                  BORE_PID=$!
-                fi
               else
                 FAILS=$((FAILS + 1))
                 echo "$(date '+%H:%M:%S') -- Health check failed ($FAILS/3 consecutive)"
@@ -1174,14 +1289,6 @@ jobs:
         run: |
           cd ${{ env.SUPABASE_DIR }}
           bash utils/snapshot-state.sh || true
-          # Safeguard: if archive is suspiciously small (<500KB), remove it so an aborted run never overwrites a real database in cache
-          # (stat the archive relative to this step's cwd  supabase/  BACKUP_FILE is workspace-root-relative)
-          ARCHIVE_SIZE=$(stat -c%s ./supabase-state.tar.gz 2>/dev/null || echo 0)
-          if [ "$ARCHIVE_SIZE" -lt 500000 ]; then
-            echo "::warning::state archive is suspiciously small (${ARCHIVE_SIZE}B) — refusing to overwrite the production cache entry with it (the previous good archive stays authoritative; check the off-site Cloudflare mirror too)"
-            echo " Archive is suspiciously small (${ARCHIVE_SIZE}B)  refusing to overwrite production cache!"
-            rm -f ./supabase-state.tar.gz
-          fi
 
       #  Stop services 
       - name:  Stop Supabase services
@@ -1209,7 +1316,7 @@ jobs:
           TUNNEL_DOMAIN: ${{ vars.CF_TUNNEL_DOMAIN || secrets.CF_TUNNEL_DOMAIN }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          DOMAIN="${TUNNEL_DOMAIN:-localhost:8000}"
+          DOMAIN="${TUNNEL_DOMAIN:-}"
           echo ""
           echo "+=============================================================+"
           echo "|  SESSION COMPLETE                                           |"
@@ -1221,7 +1328,10 @@ jobs:
           echo "|  Next run: self-chain dispatch (queued immediately)         |"
           if [ -n "$TUNNEL_DOMAIN" ]; then
             echo "|  https://$DOMAIN                                              |"
+            echo "|  Redis API: https://$DOMAIN/functions/v1/redis-http          |"
             echo "|  Badge: https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
+          else
+            echo "::warning::Permanent public Redis URL unavailable because CF_TUNNEL_DOMAIN is not configured"
           fi
           echo "|  Monitor: https://github.com/${{ github.repository }}/actions    |"
           echo "+=============================================================+"

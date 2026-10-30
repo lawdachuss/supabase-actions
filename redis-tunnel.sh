@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 🔌 redis-tunnel.sh — a PERMANENT Redis link, free (no card, no new provider)
+# 🔌 redis-tunnel.sh — optional local Redis connection through Cloudflare
 # =============================================================================
-# The bore.pub relay in the workflow hands out a RANDOM port every session, so
-# it can never be a permanent redis:// URL. ngrok can't help on the free plan
-# either (reserved TCP addresses are paid-only — `ngrok tcp 6379` prints a NEW
-# random N.tcp.ngrok.io:PORT every session).
+# The workflow's permanent public Redis endpoint is HTTPS:
+#   https://<CF_TUNNEL_DOMAIN>/functions/v1/redis-http
 #
-# Your Cloudflare Tunnel, on the other hand, is already permanent. This script
-# dials Redis through it and exposes a stable LOCAL port, so the address you
-# put in your app never changes:
+# For clients that require the raw Redis protocol, this optional helper uses
+# Cloudflare Access TCP to expose a stable LOCAL port. It is not a public
+# redis:// address; the client also needs this tunnel running:
 #
 #     ./redis-tunnel.sh                     # redis://127.0.0.1:6379, stays up
 #     redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD"
@@ -121,7 +119,7 @@ fi
 
 echo ""
 echo "==================================================================="
-echo "  Permanent Redis link"
+echo "  Local Redis TCP connection (Cloudflare Tunnel)"
 echo "==================================================================="
 echo "  Tunnel:      $HOST  →  127.0.0.1:$LOCAL_PORT"
 echo "  Keep this running — the local address stays valid forever."

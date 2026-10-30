@@ -477,6 +477,13 @@ services:
     container_name: supabase-mail
     image: inbucket/inbucket:3.1.1
     restart: unless-stopped
+    environment:
+      INBUCKET_STORAGE_TYPE: file
+      INBUCKET_STORAGE_PARAMS: path:/data
+      INBUCKET_STORAGE_RETENTIONPERIOD: "0"
+      INBUCKET_STORAGE_MAILBOXMSGCAP: "0"
+    volumes:
+      - ./volumes/inbucket/data:/data
     ports:
       - ${INBUCKET_WEB_PORT:-9000}:9000   # Web UI
       - ${INBUCKET_SMTP_PORT:-2500}:2500  # SMTP

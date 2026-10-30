@@ -25,7 +25,7 @@
 | Feature | Included |
 |---|---|
 | **PostgreSQL database** | ✅ Full Supabase Postgres |
-| **Redis 7 In-Memory Cache** | ✅ Cache + Kong rate-limiting backend + RDB persistence + [permanent remote link](#-permanent-redis-link-free--no-card) |
+| **Redis 7 In-Memory Cache** | ✅ Cache + Kong rate-limiting backend + RDB persistence + [permanent public HTTPS API](#-permanent-public-redis-url) |
 | **PostgREST API** | ✅ Auto-generated REST API |
 | **Auth (GoTrue)** | ✅ Login, signup, JWT, OAuth |
 | **Realtime subscriptions** | ✅ WebSocket-based live queries |
@@ -49,7 +49,7 @@
 3. **Starts all Supabase services** via Docker Compose (Postgres, Redis, Kong, Auth, PostgREST, Realtime, Studio, Edge Functions, Supavisor, Logflare, Vector)
 4. **Connects Cloudflare Tunnel** — your permanent URL goes live
 5. **Runs for ~5h30m** — access Studio, API, Auth, Realtime (maximizes the full 6-hour GitHub limit)
-6. **Snapshot every 5 minutes (on disk)** — the full state (DB + edge functions + snippets + Vault key) is refreshed continuously and **persisted to the GitHub cache at shutdown** (GitHub no longer exposes cache credentials to `run:` steps, so mid-session cache uploads aren't possible). A clean handoff between scheduled runs loses nothing; a hard-cancelled run falls back to the previous run's backup
+6. **Snapshot every 5 minutes (on disk)** — all connectable PostgreSQL databases and global roles/settings, PostgreSQL `ALTER SYSTEM` settings, Redis RDB+AOF, Inbucket mail, edge functions, snippets, the Vault key, and allowlisted non-secret runtime settings are refreshed continuously and **persisted to the GitHub cache at shutdown**. A clean handoff between scheduled runs loses nothing; a hard-cancelled run falls back to the previous run's backup
 7. **Graceful shutdown** — final backup, then repeat
 8. **Repeat** — next run picks up where you left off
 
@@ -113,7 +113,7 @@ same tunnel** — none of them come for free:
 | Subdomain | Type | Origin URL | Serves | Required? |
 |---|---|---|---|---|
 | `supabase.<domain>` | HTTP | `localhost:8000` | Studio API, Auth, REST, Realtime — the whole public surface | ✅ |
-| `redis.<domain>` | HTTP | `localhost:8081` | Redis Commander web console (see [🔗 Permanent Redis link](#-permanent-redis-link-free--no-card)) | ⬜ |
+| `redis.<domain>` | HTTP | `localhost:8081` | Optional Redis Commander web console | ⬜ |
 | `db.<domain>` | **TCP** (not HTTP) | `localhost:5432` | `./pg-tunnel.sh` — a real Postgres connection. Also needs a **Service Auth** Access policy | ⬜ |
 
 Two things worth knowing before debugging a 404 or 502:
@@ -143,7 +143,7 @@ openssl rand -base64 16
 
 ### Step 5: Add GitHub Secrets
 
-This workflow requires **4 secrets** (1 optional). You can set them via the GitHub UI or the `gh` CLI (recommended if you have it installed).
+This workflow requires **4 secrets and the `CF_TUNNEL_DOMAIN` variable**. You can set them via the GitHub UI or the `gh` CLI (recommended if you have it installed).
 
 #### Option A: Using `gh` CLI (fastest)
 
@@ -155,8 +155,8 @@ cd supabase-selfhosted
 gh secret set CF_TUNNEL_TOKEN
 # Paste your tunnel token and press Ctrl+D
 
-# 2. Your domain on Cloudflare (OPTIONAL — leave out if no domain yet)
-gh secret set CF_TUNNEL_DOMAIN
+# 2. Your public domain on Cloudflare (REQUIRED)
+gh variable set CF_TUNNEL_DOMAIN --body "supabase.yourdomain.com"
 # Example: supabase.yourdomain.com (no https://)
 
 # 3. PostgreSQL password (REQUIRED) — generate a secure one
@@ -170,9 +170,10 @@ gh secret set DASHBOARD_PASSWORD
 # Type a strong password and press Ctrl+D
 ```
 
-> **One-liner for all 4 required secrets:**
+> **One-liner for the 4 required secrets and domain variable:**
 > ```bash
 > gh secret set CF_TUNNEL_TOKEN -b"$(echo -n 'paste-your-token-here')" && \
+> gh variable set CF_TUNNEL_DOMAIN --body "supabase.yourdomain.com" && \
 > openssl rand -hex 32 | gh secret set POSTGRES_PASSWORD && \
 > openssl rand -base64 32 | gh secret set JWT_SECRET && \
 > gh secret set DASHBOARD_PASSWORD -b"your-strong-password"
@@ -180,24 +181,23 @@ gh secret set DASHBOARD_PASSWORD
 
 #### Option B: GitHub UI
 
-Go to **Settings → Secrets and variables → Actions → New repository secret** and add each one:
+Go to **Settings → Secrets and variables → Actions**. Add the secrets under
+**Secrets** and `CF_TUNNEL_DOMAIN` under **Variables**:
 
 | Secret | Required | Value |
 |---|---|---|
 | `CF_TUNNEL_TOKEN` | ✅ Required | The tunnel token from Step 3 (`eyJh...`) |
-| `CF_TUNNEL_DOMAIN` | ⬜ Optional | Your URL: `supabase.yourdomain.com` (no `https://`) |
+| `CF_TUNNEL_DOMAIN` (Actions variable) | ✅ Required | Your public URL: `supabase.yourdomain.com` (no `https://`); the workflow prints a stable public Redis API URL on this domain. |
 | `POSTGRES_PASSWORD` | ✅ Required | Output from `openssl rand -hex 32` |
 | `JWT_SECRET` | ✅ Required | Output from `openssl rand -base64 32` |
 | `DASHBOARD_PASSWORD` | ✅ Required | Your secure Supabase Studio password |
-| `NGROK_AUTHTOKEN` | ⬜ Optional | ngrok **agent authtoken** (dashboard → Your Authtoken). Publishes a permanent link to the Redis web console. Not the API key. |
-| `NGROK_DOMAIN` | ⬜ Optional | ngrok static dev domain to bind, e.g. `uncompiled-tinkly-laronda.ngrok-free.dev`. Omit to let ngrok use the account's assigned domain. |
 
 #### Secrets Reference
 
 | Secret | Where It's Used | What It Does |
 |---|---|---|
 | `CF_TUNNEL_TOKEN` | Cloudflare Tunnel step | Authenticates the tunnel to Cloudflare's edge. Created once in the Cloudflare dashboard. |
-| `CF_TUNNEL_DOMAIN` | `.env` generation + Tunnel display | Sets the public URL so Supabase generates correct redirect URIs. Omit this to use `localhost:8000` (tunnel still connects, but no public routing). |
+| `CF_TUNNEL_DOMAIN` (Actions variable) | `.env` generation + Tunnel display | Sets the required public URL so Supabase generates correct redirect URIs and the stable Redis API link. |
 | `POSTGRES_PASSWORD` | `.env` → PostgreSQL container | Superuser password for the database. Used internally by all Supabase services. |
 | `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates all API keys from this secret. |
 | `DASHBOARD_PASSWORD` | `.env` → Supabase Studio | Login password for Studio at port 8000 (username: `supabase`). |
@@ -348,39 +348,28 @@ A lightweight Redis 7 instance (`redis:7-alpine`) runs alongside the Supabase st
   - Password: `${REDIS_PASSWORD}` (configured in `.env`)
   - Connection URI: `redis://default:${REDIS_PASSWORD}@redis:6379`
 
-### 🔗 Permanent Redis link (free — no card)
+### 🔗 Permanent public Redis URL
 
-The internal `redis://redis:6379` address only resolves inside the Docker network. For an address you can hardcode in an app that runs anywhere, use your **existing Cloudflare Tunnel** — it's already permanent and free:
+The workflow publishes the same HTTPS endpoint on every run, using your required
+`CF_TUNNEL_DOMAIN`:
 
-1. **One-time dashboard step** — Zero Trust → Networks → Tunnels → your tunnel → **Public Hostname** → Add:
+```text
+https://supabase.yourdomain.com/functions/v1/redis-http
+```
 
-   | Field | Value |
-   |---|---|
-   | Subdomain | `redis` |
-   | Domain | your domain (e.g. `chuglii.in`) |
-   | Type | **TCP** |
-   | URL | `localhost:6379` |
+The exact URL is printed in the Actions run summary. Send Redis commands with
+`POST` and a JSON body such as `{"cmd":"get","args":["api:home"]}` or a
+`pipeline` array. Authenticate with
+`apikey: <SUPABASE_SERVICE_ROLE_KEY>` (or a configured `REDIS_LINK_TOKEN`).
+The endpoint requires authentication; do not expose the service-role key in
+browser code or public clients. Use the `/functions/v1/cache` API below for
+browser/mobile clients that should use the public anon key.
 
-   Recommended: add an Access application with a service token so the port isn't open to the world (Redis's password is the only other lock).
-
-2. **Connect** — `cloudflared` is the client half of a TCP tunnel, so run the bundled helper once and leave it up:
-
-   ```bash
-   ./redis-tunnel.sh                 # → redis://127.0.0.1:6379, stays valid forever
-   redis-cli -h 127.0.0.1 -p 6379 -a "$REDIS_PASSWORD"
-   ```
-
-   It reads `remote.env` (`REMOTE_URL`/`REDIS_TUNNEL_HOSTNAME`, plus `CF_ACCESS_CLIENT_ID`/`CF_ACCESS_CLIENT_SECRET` if you set an Access token) and prints the ready-to-paste URI.
-
-**Already-permanent alternatives with zero setup:**
-
-- **General-purpose Redis HTTPS bridge** — `POST https://<your-domain>/functions/v1/redis-http` with `{ "cmd": "get", "args": [...] }` (or `pipeline`). Auth: `apikey: <SUPABASE_SERVICE_ROLE_KEY>` (or `REDIS_LINK_TOKEN`). This is the permanent Redis endpoint used by the frontend API on Vercel, where `cloudflared` can't run. Works from any HTTP client, no software. See `supabase/volumes/functions/redis-http/index.ts`.
-- **HTTP cache API** — `https://<your-domain>/functions/v1/cache` (see below); no client software, just `fetch`.
-- **Web console** — if `NGROK_AUTHTOKEN` is set, the workflow publishes the redis-commander UI on your ngrok **free permanent dev domain** and prints the link in the run summary.
-
-> ⚠️ **Why not ngrok for the raw link?** ngrok's free plan includes only a permanent *HTTPS* dev domain. A permanent `redis://host:port` needs a **reserved TCP address**, which ngrok restricts to paid plans — `ngrok tcp 6379` on free prints a **new random `N.tcp.ngrok.io:PORT` every session**, exactly the problem it's meant to solve (and TCP needs a card on file). The Cloudflare route above gets you the same permanence for free.
->
-> The `bore.pub` relay in the workflow prints an **ephemeral** `bore.pub:<random port>` each session. It's kept as a convenience for quick `redis-cli` access, but never hardcode it.
+The public endpoint is HTTPS, not a raw `redis://` TCP address. The workflow no
+longer creates or prints random-port Redis relays. For optional raw Redis
+protocol access from a machine where you can run `cloudflared`, see
+[`redis-tunnel.sh`](./redis-tunnel.sh); it creates a local
+`redis://127.0.0.1:6379` connection through your Cloudflare Tunnel.
 
 ### 🌐 Frontend HTTP Cache API (`/functions/v1/cache`)
 
@@ -575,7 +564,7 @@ curl -H "apikey: $SERVICE_ROLE_KEY" https://supabase.yourdomain.com/api/logs
 `/api/logs` query params: `level=info|warn|error`, `q=<search text>`, `limit=<1-500>`,
 `after=<ISO timestamp>`, `before=<ISO timestamp>`.
 
-Logs are kept only while a session runs (they live in the separate `_supabase` database and are not part of the state backup).
+Logs and analytics live in the separate `_supabase` database; it is included with the other connectable databases in the state backup.
 
 ---
 
@@ -630,24 +619,27 @@ This setup is **free** (GitHub Actions + Cloudflare free tier). The trade-off:
 ### How data persists
 
 ```
-Run 1: Start fresh DB → Use Supabase → pg_dump → Save to cache
+Run 1: Start fresh DB → Use Supabase → snapshot all databases + roles + Redis → Save to cache
   ↓
-Run 2: Restore from cache → Use Supabase → pg_dump → Save to cache
+Run 2: Restore from cache → Use Supabase → snapshot all state → Save to cache
   ↓
-Run 3: Restore from cache → Use Supabase → pg_dump → Save to cache
+Run 3: Restore from cache → Use Supabase → snapshot all state → Save to cache
   ...
 ```
+
+Each archive contains custom-format dumps of every connectable non-template PostgreSQL database, PostgreSQL global roles/memberships and `ALTER SYSTEM` settings, Redis RDB and AOF data, Inbucket messages, Studio-managed functions and snippets, the pgsodium root key, and a whitelist of non-secret `.env` settings. Database dumps are validated before replacing the previous database snapshot; restore runs before application services start. Legacy single-database archives remain restorable. Code and tracked configuration changes are restored by the repository checkout; Studio-managed functions and snippets are included in the state archive.
+
+Secrets such as database/JWT passwords, SMTP credentials, OAuth secrets, and API keys are deliberately not copied from `.env`; configure them as GitHub Actions secrets. Backups contain database contents, role password hashes, captured mail, and Cloudflare refresh credentials, so restrict access to Actions caches and any configured Cloudflare KV backup token. Supabase object storage is not enabled in this stack and therefore its objects are not included.
 
 ### Cache limitations
 
 - GitHub Actions cache has **10GB limit** per repo
 - The state is snapshotted every 5 minutes **on disk** and saved to the cache **at session end** — persistence relies on the end-of-run `actions/cache` save (GitHub doesn't expose cache-service env vars to `run:` steps, so per-snapshot uploads aren't possible)
 - Old state-cache entries are pruned automatically (the newest 3 are kept) to stay under the cache limit
-- Docker images are **not cached** — they're pulled fresh each run (~2 min, in parallel with setup), so the cache budget is used only for the (tiny) database state archives
-- The DB dump uses **maximum compression** (`pg_dump -Z 9`), so state archives stay tiny within the 10GB budget
-- Analytics/log data lives in the separate `_supabase` database and is intentionally **not backed up** (it's disposable and would bloat every snapshot)
+- Docker images are **not cached** — they're pulled fresh each run (~2 min, in parallel with setup)
+- Database dumps use `pg_dump -Z 6`; backups are not discarded based on a minimum size
 - Cache is **evicted** after 7 days of inactivity
-- If cache is lost, you start fresh (schema is auto-created by Supabase SQL init scripts)
+- If the Actions cache is lost, the workflow attempts recovery from Cloudflare KV when configured; without either copy, it starts fresh (schema is auto-created by Supabase SQL init scripts)
 
 ---
 
