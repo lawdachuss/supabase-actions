@@ -224,32 +224,55 @@ fi
 
 # ── 5. Pack the full-state archive ─────────────────────────────────────
 pack_archive() {
-  ARCHIVE_FILES="volumes/functions volumes/snippets db-backups"
-  [ -d ./volumes/inbucket/data ] && ARCHIVE_FILES="$ARCHIVE_FILES volumes/inbucket/data"
-  [ -f ./.state-settings.env ] && ARCHIVE_FILES="$ARCHIVE_FILES .state-settings.env"
-  [ -s ./postgresql.auto.conf ] && ARCHIVE_FILES="$ARCHIVE_FILES postgresql.auto.conf"
-  [ -s ./pgsodium_root.key ] && ARCHIVE_FILES="$ARCHIVE_FILES pgsodium_root.key"
-  [ -s ./dump.rdb ] && ARCHIVE_FILES="$ARCHIVE_FILES dump.rdb"
-  [ -d ./appendonlydir ] && ARCHIVE_FILES="$ARCHIVE_FILES appendonlydir"
-  [ -s ./.cf-creds ] && ARCHIVE_FILES="$ARCHIVE_FILES .cf-creds"
+  local archive_files=(volumes/functions volumes/snippets db-backups)
+  local inbucket_stage="" tar_log
+  local -a tar_args
+  [ -f ./.state-settings.env ] && archive_files+=(.state-settings.env)
+  [ -s ./postgresql.auto.conf ] && archive_files+=(postgresql.auto.conf)
+  [ -s ./pgsodium_root.key ] && archive_files+=(pgsodium_root.key)
+  [ -s ./dump.rdb ] && archive_files+=(dump.rdb)
+  [ -d ./appendonlydir ] && archive_files+=(appendonlydir)
+  [ -s ./.cf-creds ] && archive_files+=(.cf-creds)
 
   date +%s > ./state-ts
-  ARCHIVE_FILES="$ARCHIVE_FILES state-ts"
+  archive_files+=(state-ts)
+
+  if docker compose ps --services --filter "status=running" 2>/dev/null \
+    | grep -qx "supabase-mail"; then
+    inbucket_stage="$(mktemp -d ./inbucket-snapshot.XXXXXX)" || return 1
+    if ! mkdir -p "$inbucket_stage/volumes/inbucket/data"; then
+      rm -rf "$inbucket_stage"
+      return 1
+    fi
+    if ! docker compose cp supabase-mail:/data/. "$inbucket_stage/volumes/inbucket/data/"; then
+      echo "  ERROR: could not copy Inbucket mail from the running container" >&2
+      rm -rf "$inbucket_stage"
+      return 1
+    fi
+  elif [ -d ./volumes/inbucket/data ]; then
+    archive_files+=(volumes/inbucket/data)
+  fi
 
   rm -f ./supabase-state.tar.gz.new
-  TAR_LOG=$(mktemp)
-  if tar --warning=no-file-changed \
-     -czf ./supabase-state.tar.gz.new -C . $ARCHIVE_FILES 2>"$TAR_LOG" && \
+  tar_log="$(mktemp)"
+  tar_args=(--warning=no-file-changed -czf ./supabase-state.tar.gz.new -C .)
+  tar_args+=("${archive_files[@]}")
+  if [ -n "$inbucket_stage" ]; then
+    tar_args+=(-C "$inbucket_stage" volumes/inbucket/data)
+  fi
+  if tar "${tar_args[@]}" 2>"$tar_log" && \
      mv -f ./supabase-state.tar.gz.new ./supabase-state.tar.gz; then
     SIZE=$(du -h ./supabase-state.tar.gz | cut -f1)
-    echo "  ✅ state archive updated ($SIZE): $ARCHIVE_FILES"
-    rm -f "$TAR_LOG"
+    echo "  ✅ full-state archive updated ($SIZE)"
+    rm -f "$tar_log"
+    [ -z "$inbucket_stage" ] || rm -rf "$inbucket_stage"
     return 0
   else
     rm -f ./supabase-state.tar.gz.new
     echo "  ⚠️  archive creation failed — previous archive preserved"
-    [ -s "$TAR_LOG" ] && sed 's/^/      /' "$TAR_LOG"
-    rm -f "$TAR_LOG"
+    [ -s "$tar_log" ] && sed 's/^/      /' "$tar_log"
+    rm -f "$tar_log"
+    [ -z "$inbucket_stage" ] || rm -rf "$inbucket_stage"
     return 1
   fi
 }
