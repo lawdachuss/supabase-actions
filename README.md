@@ -43,7 +43,8 @@
 
 ## ⏱️ How It Works
 
-1. **Workflow triggers** — manually or every 6 hours via cron
+1. **Workflow triggers** — manually, hourly via cron, or immediately through the
+   self-chain handoff
 2. **Restores database and Redis** from GitHub Actions cache (your data survives)
 3. **Starts all Supabase services** via Docker Compose (Postgres, Redis, Kong, Auth, PostgREST, Realtime, Studio, Edge Functions, Supavisor, Logflare, Vector)
 4. **Connects Cloudflare Tunnel** — your permanent URL goes live
@@ -52,7 +53,7 @@
 7. **Graceful shutdown** — final backup, then repeat
 8. **Repeat** — next run picks up where you left off
 
-> **Downtime:** ~1-2 minutes between runs via workflow-watchman (scheduled runs queue behind the active session; sessions run ~5h05m)
+> **Downtime:** ~1-2 minutes between runs via the self-chain handoff (scheduled runs queue behind the active session; sessions run ~5h05m)
 
 ## 📡 Health Check / Monitoring
 
@@ -69,7 +70,7 @@ Click the badge at the top of this README to see the latest workflow run:
 |-------|-----|
 | **Last workflow status** | README badge or Actions tab in your repo |
 | **Tunnel status** | [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels |
-| **Next scheduled run** | Waiting for cron `0 */6 * * *` (every 6 hours) |
+| **Next scheduled run** | Waiting for the hourly cron (`23 * * * *`) |
 | **Container health** | Workflow logs show docker compose ps output |
 
 ---
@@ -622,7 +623,7 @@ Object storage is intentionally excluded but can be re-added (see Troubleshootin
 This setup is **free** (GitHub Actions + Cloudflare free tier). The trade-off:
 - ✅ **Zero cost** to run
 - ✅ **Auto-scaling** runners
-- ✅ **Full 6-hour window utilized** (5h05m uptime + ~2m gap via watchman)
+- ✅ **Full 6-hour window utilized** (5h05m uptime + ~2m gap via self-chain)
 - ❌ **~15 minutes downtime** between 6-hour runs
 - ❌ **Ephemeral** — cache could be evicted if not used for 7+ days
 

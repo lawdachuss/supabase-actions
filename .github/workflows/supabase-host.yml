@@ -11,11 +11,9 @@
 #     the end-of-run actions/cache save (which runs from the action runtime).
 # 3. Exposes everything via Cloudflare Tunnel
 # 4. Runs for ~5h30m per session (maximizing the full 6-hour GitHub Actions limit)
-# 5. 24/7 chaining: the workflow-watchman Cloudflare Worker dispatches a new
-#    run the moment a session completes (2 min grace). The 6-hour schedule
-#    remains as a no-cancel fallback  with cancel-in-progress: false it
-#    QUEUES behind the active session and starts only after it ends, so it
-#    never kills a live session (watchman fills schedule delays too).
+# 5. 24/7 chaining: each session dispatches its successor after completion.
+#    The hourly schedule is a fallback if self-dispatch fails or a run is
+#    terminated before reaching the handoff.
 #
 # Required GitHub Secrets:
 #   CF_TUNNEL_TOKEN     - Cloudflare Tunnel token (from cloudflared tunnel token generate)
@@ -49,13 +47,13 @@
 # =============================================================================
 
 name:  Full Supabase Self-Hosted
-run-name:  Full Supabase Self-Hosted${{ github.event.inputs.triggered_by == 'workflow-watchman' && ' (watchman)' || github.event.inputs.triggered_by == 'self-chain' && ' (chain)' || '' }}
+run-name:  Full Supabase Self-Hosted${{ github.event.inputs.triggered_by == 'self-chain' && ' (chain)' || '' }}
 
 on:
   workflow_dispatch:
     inputs:
       triggered_by:
-        description: 'Source of the trigger (workflow-watchman auto-restart)'
+        description: 'Source of the trigger (self-chain handoff)'
         required: false
         default: ''
   schedule:
@@ -70,11 +68,11 @@ on:
   # NOTE: 'push' trigger removed on purpose  a push mid-session would queue a
   # duplicate run (concurrency no longer cancels live sessions). Manual runs now
   # QUEUE behind the active session and start after it ends. Use workflow_dispatch
-  # or the workflow-watchman worker to restart instead.
+  # or the self-chain handoff to restart instead.
 
 concurrency:
   group: supabase-host
-  # NO cancel-in-progress: a new run (schedule or watchman) QUEUES behind the
+  # NO cancel-in-progress: a new run (schedule or self-chain) QUEUES behind the
   # active session and starts only after it ends. Never kills a live session.
   cancel-in-progress: false
 
@@ -865,39 +863,6 @@ jobs:
           echo "All services ready!"
           docker compose ps 2>/dev/null | head -15
 
-      #  Ensure the OpenDrive application role (every session) 
-      # docker-entrypoint-initdb.d scripts only run on a brand-new data directory, and a
-      # pg_dump snapshot carries no roles at all — so after the upstream revert deleted
-      # opendrive_role.sql, a restored session simply had no `opendrive_app`, and every
-      # OpenDrive connection was refused. This recreates it idempotently on every startup,
-      # before migrations (docs/SELF-HOSTED-BACKEND.md, "How OpenDrive gets a database role").
-      - name:  Ensure the OpenDrive application role
-        env:
-          OPENDRIVE_APP_PASSWORD: ${{ secrets.OPENDRIVE_APP_PASSWORD }}
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-          : "${OPENDRIVE_APP_PASSWORD:?set the OPENDRIVE_APP_PASSWORD secret}"
-
-          for i in $(seq 1 60); do
-            if docker compose exec -T db pg_isready -U postgres >/dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-
-          # :'VAR' is NOT interpolated inside a $$ ... $$ block, so the CREATE is built
-          # with format(%L) and handed to \gexec instead of being put in a DO block.
-          docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 -v OPENDRIVE_APP_PASSWORD="$OPENDRIVE_APP_PASSWORD" <<'OPENDRIVE_ROLE_SQL'
-          SELECT format('CREATE ROLE opendrive_app WITH LOGIN BYPASSRLS PASSWORD %L', :'OPENDRIVE_APP_PASSWORD')
-            WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'opendrive_app')
-          \gexec
-          ALTER ROLE opendrive_app WITH LOGIN BYPASSRLS PASSWORD :'OPENDRIVE_APP_PASSWORD';
-          GRANT CONNECT ON DATABASE postgres TO opendrive_app;
-          GRANT USAGE ON SCHEMA public TO opendrive_app;
-          GRANT CREATE ON SCHEMA public TO opendrive_app;
-          OPENDRIVE_ROLE_SQL
-          echo "opendrive_app role present with the configured password"
-
       #  Apply committed migrations (versioned schema changes) 
       # Applies supabase/migrations/*.sql on top of the restored DB (fresh DBs
       # already get the volumes/db/*.sql init scripts at first boot). Files are
@@ -952,29 +917,6 @@ jobs:
           if [ "$APPLIED" -eq 0 ]; then
             echo "  No new migrations (supabase/migrations empty or up to date)"
           fi
-
-      #  Grant the OpenDrive application role its runtime DML 
-      # Runs AFTER migrations so tables created by them are covered. BYPASSRLS only
-      # bypasses row-level security — the role owns nothing, so it still needs explicit
-      # table, sequence and function privileges.
-      - name:  Grant the OpenDrive application role its runtime DML
-        run: |
-          cd ${{ env.SUPABASE_DIR }}
-
-          docker compose exec -T db psql -U postgres -v ON_ERROR_STOP=1 <<'OPENDRIVE_GRANTS_SQL'
-          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO opendrive_app;
-          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO opendrive_app;
-          GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO opendrive_app;
-          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO opendrive_app;
-          ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO opendrive_app;
-
-          -- 102-opendrive-harden-rls-and-grants.sql revokes ALL on the migration ledger from
-          -- opendrive_app (it is bookkeeping, not an API resource). This step runs after the
-          -- migrations, so the blanket grant above would silently undo that hardening — take it
-          -- back out here rather than relying on the ordering.
-          REVOKE ALL ON TABLE public._schema_migrations FROM opendrive_app;
-          OPENDRIVE_GRANTS_SQL
-          echo "opendrive_app runtime grants applied (migration ledger excluded)"
 
       #  Confirm all unconfirmed users (fixes stuck signups) 
       # If ENABLE_EMAIL_AUTOCONFIRM was false in a previous session and Inbucket
@@ -1088,7 +1030,7 @@ jobs:
           echo "|  Badge:         https://github.com/${{ github.repository }}/actions/workflows/supabase-host.yml/badge.svg |"
           echo "|                                                             |"
           echo "|  Runs until:    $(date -d @$END_TIME '+%H:%M UTC')             |"
-          echo "|  Auto-restart:  watchman + 6h sched                         |"
+          echo "|  Auto-restart:  self-chain + hourly schedule                |"
           echo "|  Remaining:     $(( DURATION / 60 )) min                                 |"
           echo "|                                                             |"
           echo "+=============================================================+"
@@ -1165,10 +1107,9 @@ jobs:
             # these are liveness checks: they fail only when the endpoint is
             # unreachable.
             # NOTE: after 3 CONSECUTIVE failed health checks (~3 min) the step
-            # exits non-zero. The run then concludes 'failure', which the
-            # workflow-watchman worker sees within ~1-2 min and restarts  so a
-            # mid-session crash (Kong/Postgres/tunnel death) can never silently
-            # idle for the remaining ~5h. The if: always() steps below still run
+            # exits non-zero. The run then concludes 'failure' and the self-chain
+            # dispatches a replacement, so a mid-session crash (Kong/Postgres/
+            # tunnel death) does not idle for the remaining ~5h. The if: always() steps still run
             # (final backup + cache save), so the freshest state is preserved.
             if [ $(( TICK % 6 )) -eq 0 ]; then
               HEALTH_OK=1
@@ -1195,7 +1136,7 @@ jobs:
                 docker compose ps --no-color 2>/dev/null | head -10 || true
                 if [ "$FAILS" -ge 3 ]; then
                   echo ""
-                  echo " HEALTH CHECK FAILED 3x IN A ROW  Supabase/tunnel is DOWN. Exiting to trigger watchman restart (cache save still runs)."
+                  echo " HEALTH CHECK FAILED 3x IN A ROW  Supabase/tunnel is DOWN. Exiting so the self-chain can restart (cache save still runs)."
                   exit 1
                 fi
               fi
@@ -1293,17 +1234,15 @@ jobs:
 
       #  Chain the next session
       # GitHub's `schedule` trigger has never fired for this repo (0 schedule
-      # runs since it was created) and the external workflow-watchman worker has
-      # never dispatched a run either — so the only reliable 24/7 handoff is the
-      # run re-dispatching itself as its final act. That is permitted with the
+      # runs since it was created) — so the reliable 24/7 handoff is the run
+      # re-dispatching itself as its final act. That is permitted with the
       # built-in token: `workflow_dispatch` is the documented exception to the
       # "GITHUB_TOKEN-triggered events do not create runs" rule, and this job
       # already declares `actions: write`. Guarded so that a cancelled run, an
       # early (pre-session) failure, or an operator `.session-stop` never starts
       # a new session — only one that actually ran (success) or died mid-session
-      # (health-check `failure`) chains forward. The hourly schedule and the
-      # watchman worker remain as backstops for the cases this cannot cover
-      # (hard 6h kill, or a cancel).
+      # (health-check `failure`) chains forward. The hourly schedule remains as
+      # a backstop for cases this cannot cover (hard 6h kill, or a cancel).
       - name:  Chain the next session
         if: ${{ always() && !cancelled() && (steps.keepalive.outcome == 'success' || steps.keepalive.outcome == 'failure') }}
         env:
@@ -1326,7 +1265,7 @@ jobs:
             -d "$BODY")
           echo "  dispatch HTTP ${CODE}"
           if [ "$CODE" != "204" ]; then
-            echo "::warning::self-chain dispatch failed (HTTP ${CODE}); a schedule/watchman fallback will have to restart"
+            echo "::warning::self-chain dispatch failed (HTTP ${CODE}); the hourly schedule will have to restart"
             cat /tmp/dispatch.out 2>/dev/null || true
           else
             echo "  next session queued"

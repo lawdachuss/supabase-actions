@@ -403,8 +403,7 @@ services:
     # `db` published NO host port: the only host-side route to Postgres was Supavisor
     # (${POSTGRES_PORT}), and that container never comes up on this runner. The result
     # was that tcp://localhost:5432 refused every connection, Cloudflare answered 502,
-    # `cloudflared access tcp` reported "websocket: bad handshake", and OpenDrive's
-    # database pre-flight died with ECONNRESET on every run.
+    # and `cloudflared access tcp` reported "websocket: bad handshake".
     #
     # Publish the primary directly too. The tunnel ingress points here, and this is the
     # service this workflow waits on, restores and migrates — so its health is proven
