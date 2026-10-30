@@ -787,7 +787,7 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              docker compose exec -T db psql -U postgres -d postgres \
+              docker compose exec -T db psql -U supabase_admin -d postgres \
                 < "$GLOBAL_RESTORE_FILE" >"$GLOBAL_LOG" 2>&1 || true
               GLOBAL_ERRORS=$(grep -i "ERROR:" "$GLOBAL_LOG" 2>/dev/null \
                 | grep -viE 'role ".*" already exists|tablespace ".*" already exists' || true)
@@ -804,7 +804,7 @@ jobs:
               # Keep the active GitHub secret authoritative if a historical globals
               # dump contains a previous password hash for the built-in postgres role.
               if ! printf '%s\n' "ALTER ROLE postgres WITH PASSWORD :'POSTGRES_PASSWORD';" \
-                   | docker compose exec -T db psql -U postgres -d postgres \
+                   | docker compose exec -T db psql -U supabase_admin -d postgres \
                      -v "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" >/dev/null; then
                 echo "::error::failed to synchronize the postgres password with GitHub Actions secrets"
                 echo 1 > "$STATUS_FILE"
@@ -847,7 +847,7 @@ jobs:
                 fi
                 RESTORE_LOG=$(mktemp)
                 RESTORE_STATUS=0
-                docker compose exec -T db pg_restore -U postgres \
+                docker compose exec -T db pg_restore -U supabase_admin \
                   --clean --if-exists --create --disable-triggers --jobs 2 \
                   -d template1 "/tmp/$DB_DUMP_NAME" 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
                 ALL_RESTORE_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null || true)
@@ -895,20 +895,20 @@ jobs:
               # extensions. Cleaning objects inside the initialized database
               # leaves dependency/permission conflicts; replace the database
               # from template1, then restore into the empty database.
-              if ! docker compose exec -T db dropdb -U postgres \
+              if ! docker compose exec -T db dropdb -U supabase_admin \
                    --maintenance-db=template1 --if-exists --force postgres; then
                 echo "::error::could not replace database before legacy restore"
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              if ! docker compose exec -T db createdb -U postgres \
+              if ! docker compose exec -T db createdb -U supabase_admin \
                    --template=template1 postgres; then
                 echo "::error::could not recreate database for legacy restore"
                 echo 1 > "$STATUS_FILE"
                 return
               fi
               RESTORE_LOG=$(mktemp)
-              if ! docker compose exec -T db pg_restore -U postgres -d postgres \
+              if ! docker compose exec -T db pg_restore -U supabase_admin -d postgres \
                  --clean --if-exists --no-owner --no-privileges --disable-triggers --jobs 2 \
                    /tmp/backup.dump 2>"$RESTORE_LOG"; then
                 REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null \
