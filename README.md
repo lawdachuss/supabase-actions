@@ -203,12 +203,26 @@ Go to **Settings → Secrets and variables → Actions**. Add the secrets under
 | `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates all API keys from this secret. |
 | `DASHBOARD_PASSWORD` | `.env` → Supabase Studio | Login password for Studio at port 8000 (username: `supabase`). |
 | `REDIS_DASHBOARD_PASSWORD` | `.env` → Redis Commander | Login password for the dashboard at `https://redis.yourdomain.com` (username: `redis`). |
+| `OPENAI_API_KEY` | `.env` → Supabase Studio | Optional OpenAI API key for Studio's built-in AI Assistant. |
 | `SMTP_HOST` | `.env` → GoTrue (auth email) | SMTP server hostname (e.g. `smtp.resend.com`). Optional — unset keeps dev-only inbucket. |
 | `SMTP_PORT` | `.env` → GoTrue (auth email) | SMTP port (587 TLS typical). |
 | `SMTP_USER` | `.env` → GoTrue (auth email) | SMTP username (Resend: `resend`). |
 | `SMTP_PASS` | `.env` → GoTrue (auth email) | SMTP password / API key. |
 | `SMTP_ADMIN_EMAIL` | `.env` → GoTrue (auth email) | Verified From address for auth emails. |
 | `SMTP_SENDER_NAME` | `.env` → GoTrue (auth email) | Sender display name (e.g. `Supabase`). |
+
+#### Supabase Studio AI Assistant
+
+The workflow leaves `OPENAI_API_KEY` empty unless you add it as a GitHub Actions
+secret. Studio's built-in assistant expects an OpenAI API key; a ChatGPT
+subscription is not API access. To enable it, create an API key at
+[OpenAI API keys](https://platform.openai.com/api-keys), add it as the
+`OPENAI_API_KEY` repository secret, and start a new workflow run.
+
+The stock Studio image in this repository does not expose a provider/base-URL
+setting, so a Gemini API key cannot be substituted for an OpenAI key. Gemini
+offers a free tier with usage limits, but using it in Studio requires a custom
+Studio/provider integration; it is not enabled by this configuration.
 
 #### Auto-Generated Keys (no setup needed)
 

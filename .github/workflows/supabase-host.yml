@@ -128,6 +128,7 @@ jobs:
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
           SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Optional real SMTP for auth emails (falls back to inbucket if unset)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -335,6 +336,8 @@ jobs:
                   f.write(f'SUPABASE_API_KEY={api_key}\n')
               if service_role_key:
                   f.write(f'SUPABASE_SERVICE_ROLE_KEY={service_role_key}\n')
+              if os.environ.get('OPENAI_API_KEY'):
+                  f.write(f'OPENAI_API_KEY={os.environ["OPENAI_API_KEY"]}\n')
           print(".env configured")
           PYEOF
 
