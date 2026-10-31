@@ -128,6 +128,10 @@ async function ensureTrackingTable() {
   await db().unsafe(
     'CREATE TABLE IF NOT EXISTS public._schema_migrations (name text PRIMARY KEY, applied_at timestamptz DEFAULT now())',
   );
+  await db().unsafe('ALTER TABLE public._schema_migrations ENABLE ROW LEVEL SECURITY');
+  await db().unsafe(
+    'REVOKE ALL ON TABLE public._schema_migrations FROM PUBLIC, anon, authenticated',
+  );
 }
 
 async function isApplied(name: string): Promise<boolean> {

@@ -42,6 +42,7 @@ restarts.
   `ENABLE_CUSTOM_ACCESS_TOKEN_HOOK=true` is set. Add your claims logic to the
   function body.
 - `009-security-linter-fixes.sql` — pins function search paths and limits the
-  custom access-token hook to `supabase_auth_admin`. The RLS-enabled
-  `edge_cache` and `_schema_migrations` tables intentionally have no policies;
-  ordinary API roles must not access either table.
+  custom access-token hook to `supabase_auth_admin`.
+- `010-schema-migrations-rls.sql` — enables RLS and revokes API-role access to
+  the migration tracker. The RLS-enabled `edge_cache` table intentionally has
+  no policies; ordinary API roles must not access it.
