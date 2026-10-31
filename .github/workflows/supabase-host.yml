@@ -1308,7 +1308,9 @@ jobs:
             # Remove the marker (git rm) once the desired session has saved.
             # ------------------------------------------------------------------
             if [ $(( TICK % 3 )) -eq 0 ] && curl -sf --max-time 10 -o /dev/null \
-                 "https://raw.githubusercontent.com/${{ github.repository }}/master/.session-stop"; then
+                 -H "Authorization: Bearer $GH_TOKEN" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${{ github.repository }}/contents/.session-stop?ref=master"; then
               echo "  End-session marker (.session-stop) detected  ending session gracefully; state will be saved to cache"
               break
             fi
@@ -1400,7 +1402,9 @@ jobs:
           set -uo pipefail
           # Operator asked the stack to stay down — honour the marker.
           if curl -sf --max-time 10 -o /dev/null \
-               "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/master/.session-stop"; then
+               -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github.raw" \
+               "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.session-stop?ref=master"; then
             echo "  .session-stop marker present — not chaining a new session."
             exit 0
           fi
