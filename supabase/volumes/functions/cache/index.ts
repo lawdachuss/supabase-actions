@@ -12,7 +12,7 @@
 //
 // Headers:
 //   apikey: <SUPABASE_ANON_KEY or SUPABASE_PUBLISHABLE_KEY>
-//   Authorization: Bearer <SUPABASE_ANON_KEY or User JWT>
+//   Authorization: Bearer <signed-in user's access token>
 //
 // ── Surviving session gaps ──────────────────────────────────────────────────
 // This stack runs on ephemeral GitHub Actions runners, so Redis genuinely
@@ -33,11 +33,15 @@ import Redis from 'npm:ioredis@5.4.1';
 
 const REDIS_URL = Deno.env.get('REDIS_URL') ||
   `redis://default:${Deno.env.get('REDIS_PASSWORD') || ''}@redis:6379/1`;
+const SUPABASE_URL = (Deno.env.get('SUPABASE_URL') || '').replace(/\/+$/, '');
+const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY') || '';
 
 // How long a request will wait for a reconnect before giving up (ms), and what
 // we tell clients to wait before retrying (seconds).
 const READY_GRACE_MS = Number(Deno.env.get('REDIS_READY_GRACE_MS') ?? 1500);
 const RETRY_AFTER_SECONDS = Number(Deno.env.get('REDIS_RETRY_AFTER') ?? 5);
+const MAX_KEY_LENGTH = 256;
+const MAX_VALUE_BYTES = 1_000_000;
 
 let redisClient: Redis | null = null;
 
@@ -132,6 +136,67 @@ function errorResponse(message: string, status = 400): Response {
   return jsonResponse({ error: message }, status);
 }
 
+async function authenticateUser(req: Request): Promise<string | Response> {
+  const authorization = req.headers.get('authorization') || '';
+  if (!/^Bearer\s+\S+$/i.test(authorization)) {
+    return errorResponse('A signed-in user access token is required', 401);
+  }
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    console.error('[cache function] Supabase Auth URL or anon key is not configured');
+    return errorResponse('Authentication service is unavailable', 503);
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        authorization,
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    console.error('[cache function] user authentication request failed:', err);
+    return errorResponse('Authentication service is unavailable', 503);
+  }
+
+  if (!response.ok) {
+    if (response.status >= 500) {
+      console.error('[cache function] Auth service returned:', response.status);
+      return errorResponse('Authentication service is unavailable', 503);
+    }
+    return errorResponse('A valid signed-in user access token is required', 401);
+  }
+
+  let user: unknown;
+  try {
+    user = await response.json();
+  } catch (err) {
+    console.error('[cache function] Auth service returned invalid user data:', err);
+    return errorResponse('Authentication service returned an invalid response', 502);
+  }
+
+  if (typeof user !== 'object' || user === null || !('id' in user) ||
+    typeof user.id !== 'string' ||
+    !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(user.id)) {
+    console.error('[cache function] Auth service response did not contain a valid user ID');
+    return errorResponse('Authentication service returned an invalid response', 502);
+  }
+
+  return user.id;
+}
+
+function isValidKey(key: unknown): key is string {
+  return typeof key === 'string' &&
+    key.length > 0 &&
+    new TextEncoder().encode(key).byteLength <= MAX_KEY_LENGTH &&
+    !/[\u0000-\u001f\u007f]/.test(key);
+}
+
+function scopedKey(userId: string, key: string): string {
+  return `user:${userId}:${key}`;
+}
+
 // 503 + Retry-After: the honest answer when Redis is between sessions. Clients
 // that honour Retry-After back off cleanly instead of hammering.
 function unavailableResponse(client: Redis): Response {
@@ -165,12 +230,12 @@ Deno.serve(async (req: Request) => {
 
   try {
     const url = new URL(req.url);
-    const redis = getRedis();
 
     // ── 2. Health check endpoint (?health=true) ─────────────────────────────
     // Answers 200 when Redis is reachable and 503 when it isn't, so it doubles
     // as a proper liveness probe (a client can tell "session gap" from "bug").
     if (url.searchParams.get('health') === 'true') {
+      const redis = getRedis();
       if (!(await awaitReady(redis, 3000))) {
         return jsonResponse(
           {
@@ -205,6 +270,12 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    // Validate the access token with Auth before using its subject as the
+    // boundary between callers' Redis namespaces.
+    const userId = await authenticateUser(req);
+    if (userId instanceof Response) return userId;
+    const redis = getRedis();
+
     // ── 3. Gate every data operation on a live connection ───────────────────
     if (!(await awaitReady(redis))) {
       return unavailableResponse(redis);
@@ -213,11 +284,12 @@ Deno.serve(async (req: Request) => {
     // ── 4. GET: Read a cached key ───────────────────────────────────────────
     if (req.method === 'GET') {
       const key = url.searchParams.get('key');
-      if (!key) {
-        return errorResponse("Missing 'key' query parameter (e.g. ?key=my_key)");
+      if (!isValidKey(key)) {
+        return errorResponse(`'key' must be a non-empty string of at most ${MAX_KEY_LENGTH} bytes`);
       }
 
-      const raw = await redis.get(key);
+      const cacheKey = scopedKey(userId, key);
+      const raw = await redis.get(cacheKey);
       if (raw === null) {
         return jsonResponse({ key, value: null, exists: false }, 404);
       }
@@ -230,7 +302,7 @@ Deno.serve(async (req: Request) => {
         // Leave as string if not JSON
       }
 
-      const ttl = await redis.ttl(key);
+      const ttl = await redis.ttl(cacheKey);
       return jsonResponse({
         key,
         value: parsedValue,
@@ -249,19 +321,26 @@ Deno.serve(async (req: Request) => {
       }
 
       const { key, value, ttl } = body;
-      if (!key) {
-        return errorResponse("Missing 'key' in JSON body");
+      if (!isValidKey(key)) {
+        return errorResponse(`'key' must be a non-empty string of at most ${MAX_KEY_LENGTH} bytes`);
       }
       if (value === undefined) {
         return errorResponse("Missing 'value' in JSON body");
       }
 
       const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+      if (serialized === undefined) {
+        return errorResponse("'value' could not be serialized as JSON");
+      }
+      if (new TextEncoder().encode(serialized).byteLength > MAX_VALUE_BYTES) {
+        return errorResponse(`'value' must not exceed ${MAX_VALUE_BYTES} bytes`);
+      }
 
+      const cacheKey = scopedKey(userId, key);
       if (typeof ttl === 'number' && ttl > 0) {
-        await redis.set(key, serialized, 'EX', Math.floor(ttl));
+        await redis.set(cacheKey, serialized, 'EX', Math.floor(ttl));
       } else {
-        await redis.set(key, serialized);
+        await redis.set(cacheKey, serialized);
       }
 
       return jsonResponse({
@@ -274,11 +353,11 @@ Deno.serve(async (req: Request) => {
     // ── 6. DELETE: Remove a cached key ──────────────────────────────────────
     if (req.method === 'DELETE') {
       const key = url.searchParams.get('key');
-      if (!key) {
-        return errorResponse("Missing 'key' query parameter (e.g. ?key=my_key)");
+      if (!isValidKey(key)) {
+        return errorResponse(`'key' must be a non-empty string of at most ${MAX_KEY_LENGTH} bytes`);
       }
 
-      const deleted = await redis.del(key);
+      const deleted = await redis.del(scopedKey(userId, key));
       return jsonResponse({
         success: true,
         key,
@@ -296,6 +375,6 @@ Deno.serve(async (req: Request) => {
     }
     const message = err instanceof Error ? err.message : String(err);
     console.error('[cache function] error:', message);
-    return jsonResponse({ error: 'Internal server error', details: message }, 500);
+    return jsonResponse({ error: 'Internal server error' }, 500);
   }
 });

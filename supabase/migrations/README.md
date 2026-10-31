@@ -46,3 +46,7 @@ restarts.
 - `010-schema-migrations-rls.sql` — enables RLS and revokes API-role access to
   the migration tracker. The RLS-enabled `edge_cache` table intentionally has
   no policies; ordinary API roles must not access it.
+- `011-api-role-permissions.sql` — revokes broad default grants for new public
+  objects, applies explicit table permissions, and limits mutating RPCs to
+  `service_role`. New public objects now need deliberate grants before they
+  are reachable through the Data API.

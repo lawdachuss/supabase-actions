@@ -391,29 +391,38 @@ protocol access from a machine where you can run `cloudflared`, see
 
 ### 🌐 Frontend HTTP Cache API (`/functions/v1/cache`)
 
-External browser or mobile frontends can access Redis directly via HTTPS through the built-in edge function:
+Signed-in browser or mobile users can access their own Redis cache namespace
+via HTTPS through the built-in edge function. The public anon/publishable key
+identifies the project but does not authenticate a user; include that user's
+Supabase Auth access token in `Authorization`. The function validates the token
+with Auth and scopes every cache key to that user, so callers cannot read,
+overwrite, or delete another user's entries.
 
 ```javascript
+// accessToken is the signed-in user's Supabase Auth access token.
+const headers = {
+  "apikey": SUPABASE_ANON_KEY,
+  "Authorization": `Bearer ${accessToken}`,
+  "Content-Type": "application/json"
+};
+
 // 1. Set a key (with optional TTL in seconds)
 await fetch("https://supabase.yourdomain.com/functions/v1/cache", {
   method: "POST",
-  headers: {
-    "apikey": SUPABASE_ANON_KEY,
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({ key: "user:123", value: { name: "Alice" }, ttl: 3600 })
+  headers,
+  body: JSON.stringify({ key: "profile", value: { name: "Alice" }, ttl: 3600 })
 });
 
 // 2. Get a key
-const res = await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=user:123", {
-  headers: { "apikey": SUPABASE_ANON_KEY }
+const res = await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=profile", {
+  headers
 });
-const data = await res.json(); // { key: "user:123", value: { name: "Alice" }, exists: true, ttl: 3599 }
+const data = await res.json(); // { key: "profile", value: { name: "Alice" }, exists: true, ttl: 3599 }
 
 // 3. Delete a key
-await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=user:123", {
+await fetch("https://supabase.yourdomain.com/functions/v1/cache?key=profile", {
   method: "DELETE",
-  headers: { "apikey": SUPABASE_ANON_KEY }
+  headers
 });
 ```
 
@@ -435,8 +444,11 @@ async function cacheFetch(url, init) {
 // Never let a cache miss break the request — fall back to Postgres.
 async function getUser(id) {
   try {
-    const res = await cacheFetch(`/functions/v1/cache?key=user:${id}`, {
-      headers: { apikey: SUPABASE_ANON_KEY },
+    const res = await cacheFetch(`/functions/v1/cache?key=profile:${id}`, {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${accessToken}`,
+      },
     });
     if (res.ok) return (await res.json()).value;
   } catch {
