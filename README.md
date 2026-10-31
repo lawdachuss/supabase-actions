@@ -191,6 +191,7 @@ Go to **Settings → Secrets and variables → Actions**. Add the secrets under
 | `POSTGRES_PASSWORD` | ✅ Required | Output from `openssl rand -hex 32` |
 | `JWT_SECRET` | ✅ Required | Output from `openssl rand -base64 32` |
 | `DASHBOARD_PASSWORD` | ✅ Required | Your secure Supabase Studio password |
+| `REDIS_DASHBOARD_PASSWORD` | ✅ Required | Password for the Redis Commander dashboard |
 
 #### Secrets Reference
 
@@ -201,6 +202,7 @@ Go to **Settings → Secrets and variables → Actions**. Add the secrets under
 | `POSTGRES_PASSWORD` | `.env` → PostgreSQL container | Superuser password for the database. Used internally by all Supabase services. |
 | `JWT_SECRET` | `.env` → JWT key generation | Signs all Auth tokens. The workflow auto-generates all API keys from this secret. |
 | `DASHBOARD_PASSWORD` | `.env` → Supabase Studio | Login password for Studio at port 8000 (username: `supabase`). |
+| `REDIS_DASHBOARD_PASSWORD` | `.env` → Redis Commander | Login password for the dashboard at `https://redis.yourdomain.com` (username: `redis`). |
 | `SMTP_HOST` | `.env` → GoTrue (auth email) | SMTP server hostname (e.g. `smtp.resend.com`). Optional — unset keeps dev-only inbucket. |
 | `SMTP_PORT` | `.env` → GoTrue (auth email) | SMTP port (587 TLS typical). |
 | `SMTP_USER` | `.env` → GoTrue (auth email) | SMTP username (Resend: `resend`). |
@@ -350,13 +352,13 @@ A lightweight Redis 7 instance (`redis:7-alpine`) runs alongside the Supabase st
 
 ### 🔗 Permanent public Redis URL
 
-The workflow publishes the Supabase hostname and a Redis HTTPS endpoint on every
-run. Set `CF_TUNNEL_DOMAIN` to the Supabase hostname; the Redis hostname uses the
-same parent domain:
+The workflow publishes the Supabase Studio and Redis Commander dashboards on
+their own hostnames. The Redis HTTPS API remains available at its function path:
 
 ```text
 Supabase: https://supabase.yourdomain.com
-Redis:    https://redis.yourdomain.com/functions/v1/redis-http
+Redis dashboard: https://redis.yourdomain.com
+Redis API: https://redis.yourdomain.com/functions/v1/redis-http
 ```
 
 The exact URL is printed in the Actions run summary. Send Redis commands with
@@ -533,6 +535,7 @@ Then go to **Actions → Supabase Self-Hosted → Run workflow** (or wait for th
 |---|---|
 | **Supabase Studio** | `https://supabase.yourdomain.com` |
 | **Login** | Username: `supabase` / Password: your `DASHBOARD_PASSWORD` |
+| **Redis Commander** | `https://redis.yourdomain.com` (username: `redis`; password: `REDIS_DASHBOARD_PASSWORD`) |
 | **REST API** | `https://supabase.yourdomain.com/rest/v1/` |
 | **Auth** | `https://supabase.yourdomain.com/auth/v1/` |
 | **Realtime** | `wss://supabase.yourdomain.com/realtime/v1/` |

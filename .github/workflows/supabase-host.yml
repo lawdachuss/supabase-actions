@@ -21,6 +21,7 @@
 #   POSTGRES_PASSWORD   - Your secure PostgreSQL password
 #   JWT_SECRET          - JWT signing secret (32+ chars)
 #   DASHBOARD_PASSWORD  - Supabase Studio admin password
+#   REDIS_DASHBOARD_PASSWORD - Redis Commander dashboard password
 #
 # Optional SMTP secrets (REAL auth emails  confirmation / reset / OTP actually
 # reach users instead of the dev-only inbucket fake SMTP). Leave unset to keep
@@ -423,6 +424,9 @@ jobs:
 
       # Restore all database and runtime state before starting application services.
       - name: Restore full state (databases, Redis, mail, functions, settings)
+        env:
+          DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          REDIS_DASHBOARD_PASSWORD: ${{ secrets.REDIS_DASHBOARD_PASSWORD }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
 
@@ -594,6 +598,30 @@ jobs:
             echo "::error::persisted runtime settings could not be restored"
             exit 1
           fi
+          if [ -z "$DASHBOARD_PASSWORD" ] || [ -z "$REDIS_DASHBOARD_PASSWORD" ]; then
+            echo "::error::dashboard passwords must be configured as GitHub Actions secrets"
+            exit 1
+          fi
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          env_file = Path(".env")
+          lines = env_file.read_text().splitlines()
+          settings = {
+              "DASHBOARD_USERNAME": "supabase",
+              "DASHBOARD_PASSWORD": os.environ["DASHBOARD_PASSWORD"],
+              "REDIS_DASHBOARD_USER": "redis",
+              "REDIS_DASHBOARD_PASSWORD": os.environ["REDIS_DASHBOARD_PASSWORD"],
+          }
+          for key, value in settings.items():
+              prefix = f"{key}="
+              lines = [line for line in lines if not line.startswith(prefix)]
+              lines.append(f"{key}={value}")
+          env_file.write_text("\n".join(lines) + "\n")
+          PY
+          chmod 600 .env
+          echo "Supabase and Redis dashboard credentials applied from Actions secrets."
           if [ -f ./supabase-state.tar.gz ] \
              && [ ! -d ./db-backups ] && [ ! -f ./backup.dump ]; then
             echo "::error::state archive contains no database backup; refusing to start a silent fresh database"
@@ -1209,6 +1237,7 @@ jobs:
               echo "| Service | Link / Endpoint |"
               echo "|---|---|"
               echo "|  **Studio Dashboard** | [https://$DOMAIN](https://$DOMAIN) |"
+              echo "|  **Redis Commander Dashboard** | [https://$REDIS_DOMAIN](https://$REDIS_DOMAIN) |"
               echo "|  **Permanent public Redis API** | [$REDIS_HTTP_URL]($REDIS_HTTP_URL) *(HTTPS; authenticate with the Supabase service-role key in the \`apikey\` header)* |"
               echo "|  **Redis Cache API** | [https://$DOMAIN/functions/v1/cache](https://$DOMAIN/functions/v1/cache) |"
               echo "|  **REST API** | [https://$DOMAIN/rest/v1/](https://$DOMAIN/rest/v1/) |"
@@ -1219,7 +1248,7 @@ jobs:
               echo "- **Scheduled run ends**: $(date -d @$END_TIME '+%H:%M UTC')"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "::notice title= Supabase & Redis Live::Studio: https://$DOMAIN | Redis API: $REDIS_HTTP_URL"
+          echo "::notice title= Supabase & Redis Live::Studio: https://$DOMAIN | Redis dashboard: https://$REDIS_DOMAIN | Redis API: $REDIS_HTTP_URL"
 
           #  Keepalive loop + health checks + 5-min on-disk snapshots 
           # (run_id/run_attempt are used by the final cache-save step's key)
