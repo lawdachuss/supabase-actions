@@ -1121,6 +1121,12 @@ jobs:
           docker compose up -d
           echo "Database restore complete; all Supabase services are starting..."
 
+          sleep 15
+          echo "=== KONG LOGS ==="
+          docker compose logs kong 2>&1 | tail -50 || true
+          echo "=== KONG STATUS ==="
+          docker compose ps kong 2>&1 || true
+
           # FIX: supavisor (pooler) crash-loops at boot  it starts before the
           # DB is fully stable and its migrate/eval fail, causing restart loops.
           # Restart it after restore, then POLL until healthy (up to 60s).
