@@ -955,7 +955,7 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              docker compose exec -T db psql -U postgres -d postgres \
+              docker compose exec -T db psql -U supabase_admin -d postgres \
                 < "$GLOBAL_RESTORE_FILE" >"$GLOBAL_LOG" 2>&1 || true
               GLOBAL_ERRORS=$(grep -i "ERROR:" "$GLOBAL_LOG" 2>/dev/null \
                 | grep -viE 'role ".*" already exists|tablespace ".*" already exists' || true)
@@ -968,16 +968,6 @@ jobs:
                 return
               fi
               rm -f "$GLOBAL_LOG"
-
-              # Keep the active GitHub secret authoritative if a historical globals
-              # dump contains a previous password hash for the built-in postgres role.
-              if ! printf '%s\n' "ALTER ROLE postgres WITH PASSWORD :'POSTGRES_PASSWORD';" \
-                   | docker compose exec -T db psql -U postgres -d postgres \
-                     -v "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" >/dev/null; then
-                echo "::error::failed to synchronize the postgres password with GitHub Actions secrets"
-                echo 1 > "$STATUS_FILE"
-                return
-              fi
 
               RESTORE_FAILED=0
               RESTORE_COUNT=0
@@ -1015,7 +1005,7 @@ jobs:
                 fi
                 RESTORE_LOG=$(mktemp)
                 RESTORE_STATUS=0
-                docker compose exec -T db pg_restore -U postgres \
+                docker compose exec -T db pg_restore -U "$DB_OWNER" \
                   --clean --if-exists --create --disable-triggers --exit-on-error --jobs 2 \
                   -d template1 "/tmp/$DB_DUMP_NAME" 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
                 if [ "$RESTORE_STATUS" -ne 0 ]; then
@@ -1027,7 +1017,7 @@ jobs:
                 if [ "$RESTORE_FAILED" -ne 0 ]; then
                   break
                 fi
-                if ! docker compose exec -T db psql -U postgres -d template1 \
+                if ! docker compose exec -T db psql -U "$DB_OWNER" -d template1 \
                      -v ON_ERROR_STOP=1 -v "db_name=$DB_NAME" -v "db_owner=$DB_OWNER" \
                      -c 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' >/dev/null; then
                   echo "::error::failed to restore database owner for $DB_NAME"
