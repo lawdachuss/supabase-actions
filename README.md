@@ -234,7 +234,7 @@ The workflow automatically generates all these keys from `JWT_SECRET` — no man
 >
 > Only `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_PUBLISHABLE_KEY` are published — the `service_role` / secret keys are root on the database and are never written to a summary or log. For those, use `remote.env` with `./remote.sh`.
 >
-> ⚠️ A key copied from an old `.env`, an old run, or a tutorial will **not** work: the keys are derived from `JWT_SECRET`, so changing that secret (or the run that generated your copy) silently invalidates every copy. Symptoms are a plain `401` from every endpoint — see the troubleshooting table.
+> ⚠️ A key copied from an old `.env`, an old run, or a tutorial will not work as a legacy JWT if its signing secret differs from the current `JWT_SECRET`. To keep existing legacy HS256 keys working after `JWT_SECRET` changes, set the repository secrets `SUPABASE_COMPAT_ANON_KEY` and `SUPABASE_COMPAT_SERVICE_ROLE_KEY` to those exact keys. Kong accepts them as API keys and translates them to the current runtime JWTs. The service-role key grants administrator access; never put it in browser or public-client code.
 
 #### 📧 Real auth emails (optional)
 
@@ -643,10 +643,11 @@ For the Cloudflare KV disaster-recovery mirror, set the GitHub Actions secret `C
 - GitHub Actions cache has **10GB limit** per repo
 - The state is snapshotted every 5 minutes **on disk** and saved to the cache **at session end** — persistence relies on the end-of-run `actions/cache` save (GitHub doesn't expose cache-service env vars to `run:` steps, so per-snapshot uploads aren't possible)
 - Old state-cache entries are pruned automatically (the newest 3 are kept) to stay under the cache limit
+- Cloudflare KV uploads use immutable, checksummed generations; the latest pointer moves only after read-back verification, and the newest 3 complete generations are retained
 - Docker images are **not cached** — they're pulled fresh each run (~2 min, in parallel with setup)
 - Database dumps use `pg_dump -Z 6`; backups are not discarded based on a minimum size
 - Cache is **evicted** after 7 days of inactivity
-- If the Actions cache is lost, the workflow attempts recovery from Cloudflare KV when configured; without either copy, it starts fresh (schema is auto-created by Supabase SQL init scripts)
+- If a local/cache archive is missing, the workflow attempts recovery from Cloudflare KV when configured. It fails closed rather than starting an empty database if a later workflow run has no usable backup; only the first run may initialize fresh.
 
 ---
 

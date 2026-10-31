@@ -126,6 +126,8 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
+          SUPABASE_COMPAT_ANON_KEY: ${{ secrets.SUPABASE_COMPAT_ANON_KEY }}
+          SUPABASE_COMPAT_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_COMPAT_SERVICE_ROLE_KEY }}
           # Optional real SMTP for auth emails (falls back to inbucket if unset)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -167,11 +169,6 @@ jobs:
           echo " Pulling Docker images in background..."
           docker compose pull 2>&1 | tail -3 &
 
-          # Ensure the named volume used by Postgres for pgsodium key persist exists.
-          # On a fresh runner, or after a cache miss, this volume can be missing and
-          # `docker compose up` will fail with: external volume "db-config" not found.
-          docker volume create supabase_db-config >/dev/null 2>&1 || true
-
           wait
 
           # Guard: the compose file declares db-config as external: true, so docker
@@ -186,7 +183,7 @@ jobs:
           CF_DOMAIN="$CF_TUNNEL_DOMAIN"
           export PUBLIC_URL="https://$CF_DOMAIN"
           python3 << 'PYEOF'
-          import os, hmac, hashlib, base64, json, uuid
+          import os, hmac, hashlib, base64, json, re, uuid
           from ecdsa import SigningKey, NIST256p
           from ecdsa.util import sigencode_string
 
@@ -198,6 +195,20 @@ jobs:
           def derive_b64(name, length):
               return base64.urlsafe_b64encode(
                   hmac.new(secret.encode(), name.encode(), hashlib.sha512).digest()).decode()[:length]
+          def validate_compat_key(name, value, expected_role):
+              if not value:
+                  return
+              try:
+                  header, payload, signature = value.split('.')
+                  decoded_header = json.loads(base64.urlsafe_b64decode(header + '=' * (-len(header) % 4)))
+                  decoded_payload = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+                  base64.urlsafe_b64decode(signature + '=' * (-len(signature) % 4))
+              except (ValueError, json.JSONDecodeError):
+                  raise SystemExit(f'{name} must be a three-part JWT')
+              if decoded_header.get('alg') != 'HS256' or decoded_payload.get('role') != expected_role:
+                  raise SystemExit(f'{name} must be an HS256 JWT with role {expected_role}')
+              if not re.fullmatch(r'[A-Za-z0-9_-]+', header) or not re.fullmatch(r'[A-Za-z0-9_-]+', payload) or not re.fullmatch(r'[A-Za-z0-9_-]+', signature):
+                  raise SystemExit(f'{name} contains unsupported characters')
           def b64url(d):
               return base64.urlsafe_b64encode(d).rstrip(b'=').decode()
           def sign_hs256(payload_dict, secret):
@@ -219,6 +230,10 @@ jobs:
           exp = iat + 315360000
           anon_key = sign_hs256({'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret)
           service_key = sign_hs256({'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret)
+          compat_anon_key = os.environ.get('SUPABASE_COMPAT_ANON_KEY', '')
+          compat_service_key = os.environ.get('SUPABASE_COMPAT_SERVICE_ROLE_KEY', '')
+          validate_compat_key('SUPABASE_COMPAT_ANON_KEY', compat_anon_key, 'anon')
+          validate_compat_key('SUPABASE_COMPAT_SERVICE_ROLE_KEY', compat_service_key, 'service_role')
 
           skb = derive_b64('secret_key_base', 64)
           rek = derive_hex('realtime_enc_key', 8)
@@ -315,6 +330,11 @@ jobs:
           else:
               print(f"All {len(reps)} replacements applied")
           with open('.env','w') as f: f.write(env_content)
+          with open('.env','a') as f:
+              if compat_anon_key:
+                  f.write(f'SUPABASE_COMPAT_ANON_KEY={compat_anon_key}\n')
+              if compat_service_key:
+                  f.write(f'SUPABASE_COMPAT_SERVICE_ROLE_KEY={compat_service_key}\n')
           print(".env configured")
           PYEOF
 
@@ -439,7 +459,7 @@ jobs:
               return 1
             fi
             if tar -tvzf "$archive" 2>/dev/null \
-              | awk 'substr($0, 1, 1) == "l" || substr($0, 1, 1) == "h" { found = 1 } END { exit !found }'; then
+              | awk 'substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { found = 1 } END { exit !found }'; then
               rm -f "$members_file"
               return 1
             fi
@@ -491,7 +511,23 @@ jobs:
           # the freshest one back from Cloudflare KV before extraction.
           if [ ! -f ./supabase-state.tar.gz ] && grep -q '^CF_API_TOKEN=.' .env 2>/dev/null; then
             echo "  No state archive on disk  attempting Cloudflare restore..."
-            bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz || true
+            if bash utils/cloudflare-backup.sh restore ./supabase-state.tar.gz; then
+              CF_RESTORE_STATUS=0
+            else
+              CF_RESTORE_STATUS=$?
+            fi
+            if [ "$CF_RESTORE_STATUS" -ne 0 ] && [ "$CF_RESTORE_STATUS" -ne 2 ]; then
+              echo "::error::Cloudflare backup is configured but could not be restored; refusing to start empty"
+              exit 1
+            fi
+            if [ "$CF_RESTORE_STATUS" -eq 0 ] && [ ! -s ./supabase-state.tar.gz ]; then
+              echo "::error::Cloudflare reported restore success but produced no archive"
+              exit 1
+            fi
+          fi
+          if [ ! -f ./supabase-state.tar.gz ] && [ "${{ github.run_number }}" -gt 1 ]; then
+            echo "::error::no cached or off-site state archive exists after the first workflow run; refusing to create an empty replacement database"
+            exit 1
           fi
 
           if [ -f ./supabase-state.tar.gz ]; then
@@ -503,7 +539,10 @@ jobs:
             # and stamped with its own state-ts) can be hours newer than the
             # cache entry. Adopt whichever backup has the higher timestamp.
             LOCAL_TS="$(tar xzf ./supabase-state.tar.gz -O state-ts 2>/dev/null | tr -dc '0-9' | head -1)"
-            KV_TS="$(bash utils/cloudflare-backup.sh manifest 2>/dev/null | tr -dc '0-9' | head -1)"
+            if ! KV_TS="$(bash utils/cloudflare-backup.sh manifest)"; then
+              echo "::error::could not read the Cloudflare backup manifest; refusing to restore a potentially stale cached snapshot"
+              exit 1
+            fi
             LOCAL_TS="${LOCAL_TS:-0}"; KV_TS="${KV_TS:-0}"
             if [ "$KV_TS" -gt "$LOCAL_TS" ] 2>/dev/null; then
               echo "  ☁️  off-site backup is fresher (kv ts $KV_TS > cached ts $LOCAL_TS) — using it"
@@ -512,7 +551,8 @@ jobs:
                 echo "  ☁️  freshest state adopted from Cloudflare KV"
               else
                 rm -f ./supabase-state.tar.gz.kv
-                echo "::warning::fresher off-site backup exists but could not be fetched — falling back to the cached copy"
+                echo "::error::fresher off-site backup exists but could not be fetched; refusing to restore an older cached snapshot"
+                exit 1
               fi
             fi
 
@@ -535,17 +575,18 @@ jobs:
             # DB boots, so the same encryption key is used and Vault data stays decryptable.
             if [ -f ./pgsodium_root.key ]; then
               echo "   Injecting pgsodium root key into db-config volume..."
-              DB_VOL=$(docker volume ls --format '{{.Name}}' | grep -E 'db-config$' | head -1 || true)
-              if [ -z "$DB_VOL" ]; then
-                DB_VOL="supabase_db-config"
-                docker volume create "$DB_VOL" >/dev/null 2>&1 || true
+              DB_VOL=db-config
+              if ! docker volume inspect "$DB_VOL" >/dev/null 2>&1; then
+                echo "::error::required PostgreSQL db-config volume is missing; refusing to generate a replacement encryption key"
+                exit 1
               fi
               if docker run --rm -v "$DB_VOL":/etc/postgresql-custom \
                 -v "$PWD/pgsodium_root.key:/tmp/pgsodium_root.key:ro" \
                 supabase/postgres:17.6.1.136 sh -c "cp /tmp/pgsodium_root.key /etc/postgresql-custom/pgsodium_root.key && chmod 644 /etc/postgresql-custom/pgsodium_root.key"; then
                 echo "   pgsodium root key injected into $DB_VOL"
               else
-                echo "    pgsodium key injection failed  Vault data may not decrypt this run"
+                echo "::error::pgsodium key injection failed; refusing to start with a different Vault encryption key"
+                exit 1
               fi
               rm -f ./pgsodium_root.key
             else
@@ -576,14 +617,38 @@ jobs:
               chmod -R 777 volumes/redis/data 2>/dev/null || true
             fi
             if [ -d ./appendonlydir ]; then
-              if [ ! -s ./appendonlydir/appendonly.aof.manifest ] \
-                 || ! find ./appendonlydir -maxdepth 1 -type f \( -name '*.aof' -o -name '*.rdb' \) | grep -q .; then
+              AOF_FILE_COUNT=0
+              while IFS=' ' read -r ENTRY AOF_FILE SEQ_LABEL SEQ TYPE_LABEL TYPE EXTRA; do
+                [ -n "$ENTRY" ] || continue
+                if [ "$ENTRY" != "file" ] || [ "$SEQ_LABEL" != "seq" ] \
+                   || ! [[ "$SEQ" =~ ^[0-9]+$ ]] \
+                   || [ "$TYPE_LABEL" != "type" ] \
+                   || { [ "$TYPE" != "b" ] && [ "$TYPE" != "i" ]; } \
+                   || [ -n "$EXTRA" ] \
+                   || ! [[ "$AOF_FILE" =~ ^appendonly\.aof\.[0-9]+\.(base\.rdb|incr\.aof)$ ]] \
+                   || [ ! -s "./appendonlydir/$AOF_FILE" ]; then
+                  echo "::error::Redis AOF manifest references an invalid or missing file"
+                  exit 1
+                fi
+                AOF_FILE_COUNT=$((AOF_FILE_COUNT + 1))
+              done < ./appendonlydir/appendonly.aof.manifest
+              if [ ! -s ./appendonlydir/appendonly.aof.manifest ] || [ "$AOF_FILE_COUNT" -eq 0 ]; then
                 echo "::error::Redis AOF archive is incomplete; refusing to restore it"
                 exit 1
               fi
-              rm -rf ./volumes/redis/data/appendonlydir
               mkdir -p ./volumes/redis/data
-              cp -a ./appendonlydir ./volumes/redis/data/appendonlydir
+              rm -rf ./volumes/redis/data/appendonlydir.restore
+              cp -a ./appendonlydir ./volumes/redis/data/appendonlydir.restore
+              rm -rf ./volumes/redis/data/appendonlydir.previous
+              [ ! -d ./volumes/redis/data/appendonlydir ] \
+                || mv ./volumes/redis/data/appendonlydir ./volumes/redis/data/appendonlydir.previous
+              if ! mv ./volumes/redis/data/appendonlydir.restore ./volumes/redis/data/appendonlydir; then
+                [ ! -d ./volumes/redis/data/appendonlydir.previous ] \
+                  || mv ./volumes/redis/data/appendonlydir.previous ./volumes/redis/data/appendonlydir
+                echo "::error::could not install the validated Redis AOF archive"
+                exit 1
+              fi
+              rm -rf ./volumes/redis/data/appendonlydir.previous
               chmod -R 777 ./volumes/redis/data
               echo "   Redis AOF restored to volumes/redis/data/appendonlydir"
             else
@@ -792,6 +857,77 @@ jobs:
 
             if [ -s ./db-backups/manifest.tsv ] && [ -s ./db-backups/globals.sql ]; then
               echo "Restoring all databases and PostgreSQL roles from the complete state backup..."
+              PREFLIGHT_NAMES=$(mktemp)
+              PREFLIGHT_COUNT=0
+              while IFS=$'\t' read -r DB_DUMP_NAME DB_NAME_B64 DB_OWNER_B64 EXTRA_FIELD; do
+                [ -n "$DB_DUMP_NAME" ] || continue
+                if [ -n "$EXTRA_FIELD" ] \
+                   || ! [[ "$DB_DUMP_NAME" =~ ^db-[0-9]{8}\.dump$ ]] \
+                   || [ -z "$DB_NAME_B64" ] || [ -z "$DB_OWNER_B64" ]; then
+                  echo "::error::invalid database entry in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                DB_NAME="$(printf '%s' "$DB_NAME_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database name in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                }
+                DB_OWNER="$(printf '%s' "$DB_OWNER_B64" | base64 -d 2>/dev/null)" || {
+                  echo "::error::invalid database owner in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                }
+                if [ -z "$DB_NAME" ] || [ -z "$DB_OWNER" ] \
+                   || [ "$(printf '%s' "$DB_NAME" | base64 -w0)" != "$DB_NAME_B64" ] \
+                   || [ "$(printf '%s' "$DB_OWNER" | base64 -w0)" != "$DB_OWNER_B64" ] \
+                   || grep -Fxq "$DB_NAME" "$PREFLIGHT_NAMES" \
+                   || [ ! -s "./db-backups/$DB_DUMP_NAME" ]; then
+                  echo "::error::invalid or duplicate database metadata in backup manifest"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                printf '%s\n' "$DB_NAME" >> "$PREFLIGHT_NAMES"
+                if ! docker compose cp "./db-backups/$DB_DUMP_NAME" "db:/tmp/$DB_DUMP_NAME"; then
+                  echo "::error::database dump failed pre-restore validation: $DB_DUMP_NAME"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                if ! DUMP_DB_NAME=$(docker compose exec -T db pg_restore -U postgres \
+                  --list "/tmp/$DB_DUMP_NAME" 2>/dev/null \
+                  | sed -n -e 's/^;[[:space:]]*dbname: //p' \
+                      -e 's/^; Database: //p' | tr -d '\r'); then
+                  echo "::error::database dump failed pre-restore validation: $DB_DUMP_NAME"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                if [ "$DUMP_DB_NAME" != "$DB_NAME" ]; then
+                  echo "::error::database dump name does not match the manifest entry: $DB_DUMP_NAME"
+                  rm -f "$PREFLIGHT_NAMES"
+                  echo 1 > "$STATUS_FILE"
+                  return
+                fi
+                PREFLIGHT_COUNT=$((PREFLIGHT_COUNT + 1))
+              done < ./db-backups/manifest.tsv
+              rm -f "$PREFLIGHT_NAMES"
+              if [ "$PREFLIGHT_COUNT" -eq 0 ]; then
+                echo "::error::database manifest contains no database entries"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+              DUMP_FILE_COUNT=$(find ./db-backups -maxdepth 1 -type f -name 'db-*.dump' | wc -l)
+              if [ "$DUMP_FILE_COUNT" -ne "$PREFLIGHT_COUNT" ]; then
+                echo "::error::database backup contains unreferenced or missing dump files"
+                echo 1 > "$STATUS_FILE"
+                return
+              fi
+
               GLOBAL_LOG=$(mktemp)
               GLOBAL_RESTORE_FILE=$(mktemp)
               if ! awk '
@@ -815,7 +951,7 @@ jobs:
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              docker compose exec -T db psql -U supabase_admin -d postgres \
+              docker compose exec -T db psql -U postgres -d postgres \
                 < "$GLOBAL_RESTORE_FILE" >"$GLOBAL_LOG" 2>&1 || true
               GLOBAL_ERRORS=$(grep -i "ERROR:" "$GLOBAL_LOG" 2>/dev/null \
                 | grep -viE 'role ".*" already exists|tablespace ".*" already exists' || true)
@@ -832,7 +968,7 @@ jobs:
               # Keep the active GitHub secret authoritative if a historical globals
               # dump contains a previous password hash for the built-in postgres role.
               if ! printf '%s\n' "ALTER ROLE postgres WITH PASSWORD :'POSTGRES_PASSWORD';" \
-                   | docker compose exec -T db psql -U supabase_admin -d postgres \
+                   | docker compose exec -T db psql -U postgres -d postgres \
                      -v "POSTGRES_PASSWORD=$POSTGRES_PASSWORD" >/dev/null; then
                 echo "::error::failed to synchronize the postgres password with GitHub Actions secrets"
                 echo 1 > "$STATUS_FILE"
@@ -875,22 +1011,23 @@ jobs:
                 fi
                 RESTORE_LOG=$(mktemp)
                 RESTORE_STATUS=0
-                docker compose exec -T db pg_restore -U supabase_admin \
-                  --clean --if-exists --create --disable-triggers --jobs 2 \
+                docker compose exec -T db pg_restore -U postgres \
+                  --clean --if-exists --create --disable-triggers --exit-on-error --jobs 2 \
                   -d template1 "/tmp/$DB_DUMP_NAME" 2>"$RESTORE_LOG" || RESTORE_STATUS=$?
-                ALL_RESTORE_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null || true)
-                RESTORE_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null \
-                  | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access|set_graphql_placeholder|pgrst_drop_watch|pgrst_ddl_watch|grant_pg_net_access|grant_pg_cron_access" || true)
-                if [ -n "$RESTORE_ERRORS" ]; then
-                  echo "  PostgreSQL restore errors for $DB_NAME:"
-                  echo "$RESTORE_ERRORS" | head -10 | sed 's/^/    /'
-                  RESTORE_FAILED=1
-                elif [ "$RESTORE_STATUS" -ne 0 ] && [ -z "$ALL_RESTORE_ERRORS" ]; then
-                  echo "::error::pg_restore failed without a recognized database error for $DB_NAME"
+                if [ "$RESTORE_STATUS" -ne 0 ]; then
+                  echo "::error::PostgreSQL restore failed for $DB_NAME:"
+                  tail -20 "$RESTORE_LOG" | sed 's/^/    /'
                   RESTORE_FAILED=1
                 fi
                 rm -f "$RESTORE_LOG"
                 if [ "$RESTORE_FAILED" -ne 0 ]; then
+                  break
+                fi
+                if ! docker compose exec -T db psql -U postgres -d template1 \
+                     -v ON_ERROR_STOP=1 -v "db_name=$DB_NAME" -v "db_owner=$DB_OWNER" \
+                     -c 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' >/dev/null; then
+                  echo "::error::failed to restore database owner for $DB_NAME"
+                  RESTORE_FAILED=1
                   break
                 fi
                 RESTORE_COUNT=$((RESTORE_COUNT + 1))
@@ -923,31 +1060,27 @@ jobs:
               # extensions. Cleaning objects inside the initialized database
               # leaves dependency/permission conflicts; replace the database
               # from template1, then restore into the empty database.
-              if ! docker compose exec -T db dropdb -U supabase_admin \
+              if ! docker compose exec -T db dropdb -U postgres \
                    --maintenance-db=template1 --if-exists --force postgres; then
                 echo "::error::could not replace database before legacy restore"
                 echo 1 > "$STATUS_FILE"
                 return
               fi
-              if ! docker compose exec -T db createdb -U supabase_admin \
+              if ! docker compose exec -T db createdb -U postgres \
                    --template=template1 postgres; then
                 echo "::error::could not recreate database for legacy restore"
                 echo 1 > "$STATUS_FILE"
                 return
               fi
               RESTORE_LOG=$(mktemp)
-              if ! docker compose exec -T db pg_restore -U supabase_admin -d postgres \
-                 --clean --if-exists --no-owner --no-privileges --disable-triggers --jobs 2 \
+              if ! docker compose exec -T db pg_restore -U postgres -d postgres \
+                 --no-owner --no-privileges --disable-triggers --exit-on-error --jobs 2 \
                    /tmp/backup.dump 2>"$RESTORE_LOG"; then
-                REAL_ERRORS=$(grep -i "error:" "$RESTORE_LOG" 2>/dev/null \
-                  | grep -viE "does not exist|already exists|permission denied for schema auth|must be owner of|grant_pg_graphql_access|set_graphql_placeholder|pgrst_drop_watch|pgrst_ddl_watch|grant_pg_net_access|grant_pg_cron_access" || true)
-                if [ -n "$REAL_ERRORS" ]; then
-                  echo "::error::legacy database restore failed"
-                  echo "$REAL_ERRORS" | head -10 | sed 's/^/    /'
-                  rm -f "$RESTORE_LOG"
-                  echo 1 > "$STATUS_FILE"
-                  return
-                fi
+                echo "::error::legacy database restore failed"
+                tail -20 "$RESTORE_LOG" | sed 's/^/    /'
+                rm -f "$RESTORE_LOG"
+                echo 1 > "$STATUS_FILE"
+                return
               fi
               rm -f "$RESTORE_LOG"
             else
@@ -1153,6 +1286,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}   # hourly prune-caches.sh needs it too
         run: |
           cd ${{ env.SUPABASE_DIR }}
+          rm -f ./.snapshot-success
 
           DURATION=18300  # 5h05m  leaves ~50 min buffer for final backup + cache save
           # (was 5h30m; the old 25 min shutdown budget was too tight for large DBs
@@ -1266,11 +1400,11 @@ jobs:
             if [ "$NOW" -ge "$NEXT_SNAP" ]; then
               echo ""
               echo " [$(date '+%H:%M:%S')] Snapshot #$SLOT (every-5-min on-disk)..."
-              bash utils/snapshot-state.sh || true
-              if [ -s ./supabase-state.tar.gz ]; then
+              if bash utils/snapshot-state.sh; then
+                touch ./.snapshot-success
                 SNAPSHOTS=$((SNAPSHOTS + 1))
               else
-                echo "    archive not created  will retry next tick"
+                echo "    snapshot failed; previous archive preserved and this tick will not count as success"
               fi
               NEXT_SNAP=$((NOW + 300))
               SLOT=$((SLOT + 1))
@@ -1355,10 +1489,22 @@ jobs:
       # freshest possible archive at shutdown. Crash-safe: the previous
       # archive is never deleted before the new one is fully written.
       - name:  Final state backup before shutdown
-        if: "!cancelled()"
+        id: final-snapshot
+        if: "!cancelled() && (steps.keepalive.outcome == 'success' || steps.keepalive.outcome == 'failure')"
+        env:
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
         run: |
           cd ${{ env.SUPABASE_DIR }}
-          bash utils/snapshot-state.sh || true
+          if bash utils/snapshot-state.sh; then
+            touch ./.snapshot-success
+          fi
+          if [ -s ./supabase-state.tar.gz ] && [ -f ./.snapshot-success ]; then
+            echo "cache_ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cache_ready=false" >> "$GITHUB_OUTPUT"
+            echo "::error::this workflow run produced no successful state snapshot; cache save is disabled"
+            exit 1
+          fi
 
       #  Stop services 
       - name:  Stop Supabase services
@@ -1373,7 +1519,7 @@ jobs:
       # persists the freshest one to the Actions cache at the end of the run.
       # Only runs if NOT cancelled and a valid state archive exists on disk.
       - name:  Save final state to GitHub Actions cache
-        if: "!cancelled() && hashFiles('supabase/supabase-state.tar.gz') != ''"
+        if: "!cancelled() && steps.final-snapshot.outputs.cache_ready == 'true' && hashFiles('supabase/supabase-state.tar.gz') != ''"
         uses: actions/cache/save@v6
         with:
           path: ${{ env.BACKUP_FILE }}

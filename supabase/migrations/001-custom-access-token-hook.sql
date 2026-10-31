@@ -13,7 +13,7 @@ create or replace function public.custom_access_token_hook(event jsonb)
 returns jsonb
 language plpgsql
 security definer
-set search_path = public
+set search_path = pg_catalog
 as $$
   declare
     claims jsonb;
@@ -35,6 +35,7 @@ as $$
 $$;
 
 -- The auth service needs execute permission on the hook
+revoke all on function public.custom_access_token_hook(jsonb) from public, anon, authenticated;
 grant execute on function public.custom_access_token_hook to supabase_auth_admin;
 
 -- Make sure the function is in the public schema (the pg-functions:// URI

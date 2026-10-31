@@ -12,6 +12,15 @@
 #   3. If apikey matches publishable key -> set anon asymmetric JWT internal "API key"
 #   4. Fallback: pass apikey as-is (legacy HS256 JWT)
 
+for key in "$SUPABASE_COMPAT_ANON_KEY" "$SUPABASE_COMPAT_SERVICE_ROLE_KEY"; do
+    case "$key" in
+        *[!A-Za-z0-9._-]*)
+            echo "Invalid character in configured Supabase compatibility API key" >&2
+            exit 1
+            ;;
+    esac
+done
+
 if [ -n "$SUPABASE_SECRET_KEY" ] && [ -n "$SUPABASE_PUBLISHABLE_KEY" ]; then
     # Opaque keys configured -> full translation expressions
     export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or (headers.apikey == '$SUPABASE_SECRET_KEY' and 'Bearer $SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_PUBLISHABLE_KEY' and 'Bearer $ANON_KEY_ASYMMETRIC') or headers.apikey)"
@@ -25,10 +34,18 @@ else
     export LUA_RT_WS_EXPR="\$(query_params.apikey)"
 fi
 
+if [ -n "$SUPABASE_COMPAT_ANON_KEY" ] || [ -n "$SUPABASE_COMPAT_SERVICE_ROLE_KEY" ]; then
+    export LUA_AUTH_EXPR="\$((headers.authorization == 'Bearer $SUPABASE_COMPAT_SERVICE_ROLE_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.authorization == 'Bearer $SUPABASE_COMPAT_ANON_KEY' and '$ANON_KEY_ASYMMETRIC') or (headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= string.char(115,98,95,115,101,99,114,101,116,95) and headers.authorization) or (headers.apikey == '$SUPABASE_COMPAT_SERVICE_ROLE_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_COMPAT_ANON_KEY' and '$ANON_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or headers.apikey)"
+    export LUA_RT_WS_EXPR="\$((query_params.apikey == '$SUPABASE_COMPAT_SERVICE_ROLE_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_COMPAT_ANON_KEY' and '$ANON_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or query_params.apikey)"
+fi
+
 # Substitute environment variables in the Kong declarative config.
 # Uses awk instead of eval/echo to preserve YAML quoting (eval strips double
 # quotes, breaking "Header: value" patterns that YAML parses as mappings).
-awk '{
+awk '
+  index($0, "$SUPABASE_COMPAT_ANON_KEY") && !ENVIRON["SUPABASE_COMPAT_ANON_KEY"] { next }
+  index($0, "$SUPABASE_COMPAT_SERVICE_ROLE_KEY") && !ENVIRON["SUPABASE_COMPAT_SERVICE_ROLE_KEY"] { next }
+  {
   result = ""
   rest = $0
   while (match(rest, /\$[A-Za-z_][A-Za-z_0-9]*/)) {

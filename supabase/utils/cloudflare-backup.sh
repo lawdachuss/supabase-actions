@@ -7,22 +7,20 @@
 # value at 25 MiB, so larger archives are split into CHUNK_BYTES-sized chunks.
 #
 # Namespace layout:
-#   latest/<base>.<NN>         chunks of the CURRENT (freshest) archive
-#   latest/manifest.json       {file, ts, parts, size, sha256}
-#   archive/<ts>/<base>.<NN>   same bytes, timestamped (rolling history)
-#   archive/<ts>/manifest.json
+#   archive/<generation>/<base>.<NNNNNNNN>  immutable archive chunks
+#   archive/<generation>/manifest.json      verified archive manifest
+#   latest/manifest.json                    pointer to the current generation
 #
 # Retention: the freshest set is always under 'latest/' (overwritten each
-# push). Each push also stamps the same bytes under archive/<now>/ but then
-# prunes to KEEP_ARCHIVES generations — so the OLDEST archive is deleted
-# automatically and the store never grows forever. It always holds the latest
-# backup and at most one previous generation.
+# push). Chunks are immutable and the latest pointer changes only after the
+# full generation has been read back and verified. Failed uploads therefore
+# cannot corrupt the last known-good backup.
 #
 # The runner keeps no growing local history either: snapshots overwrite a single
 # on-disk archive and chunk temp dirs are removed after each push.
 #
 # Usage:
-#   cloudflare-backup.sh push <file>            # upload + prune oldest
+#   cloudflare-backup.sh push <file>            # verify, publish + prune oldest
 #   cloudflare-backup.sh restore <outfile>      # pull latest and reassemble
 #   cloudflare-backup.sh manifest               # print latest backup's unix ts
 #   cloudflare-backup.sh verify                 # confirm 'latest' is restorable (size+sha256)
@@ -46,8 +44,8 @@ CF_ENV="$BASE_DIR/.env"
 ROOT_ENV="$BASE_DIR/../.env"
 
 CHUNK_BYTES=$((24 * 1024 * 1024))   # 24 MiB (KV hard limit is 25 MiB)
-KEEP_ARCHIVES=1                      # generations kept under archive/ (oldest pruned)
-RESTORE_ATTEMPTS=5                       # reads before giving up on a restore (see cmd_restore)
+KEEP_ARCHIVES=3                      # complete generations kept under archive/
+RESTORE_ATTEMPTS=20                      # allow time for KV edge propagation during restore
 
 CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 CF_KV_NAMESPACE_ID="${CF_KV_NAMESPACE_ID:-}"
@@ -108,10 +106,17 @@ cf_refresh_token() {
 
 # put with a single 401 → refresh-retry (access tokens only live ~1h).
 put_with_retry() {
-  if put_value "$1" "$2"; then
+  local status
+  put_value "$1" "$2"
+  status=$?
+  if [ "$status" -eq 0 ]; then
     return 0
   fi
-  cf_refresh_token && put_value "$1" "$2"
+  if [ "$status" -eq 2 ] && cf_refresh_token; then
+    put_value "$1" "$2"
+    return $?
+  fi
+  return 1
 }
 
 cfg_ok() {
@@ -133,28 +138,80 @@ urlenc() {
 
 # ---------------------------------------------------------------------------
 list_keys() {  # list_keys <urlencoded-prefix> -> one key per line, may paginate
-  local prefix="$1" cursor="" body keys k
+  local prefix="$1" cursor="" body keys
   while :; do
     local q="?limit=1000&prefix=$prefix"
-    [ -n "$cursor" ] && q="$q&cursor=$cursor"
-    body="$(curl -s "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/keys$q" \
+    [ -n "$cursor" ] && q="$q&cursor=$(urlenc "$cursor")"
+    body="$(curl -fsS --max-time 30 "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/keys$q" \
       -H "Authorization: Bearer $CF_API_TOKEN")"
-    keys="$(printf '%s' "$body" | grep -o '"name":"[^"]*"' | sed 's/"name":"//; s/"$//')"
+    if ! keys="$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("success") is not True:
+    raise SystemExit(1)
+for item in d.get("result", []):
+    print(item["name"])
+')"; then
+      echo "  ERROR: Cloudflare KV returned an invalid key-list response" >&2
+      return 1
+    fi
     [ -n "$keys" ] && printf '%s\n' "$keys"
-    cursor="$(printf '%s' "$body" | grep -o '"cursor":"[^"]*"' | head -1 | sed 's/"cursor":"//; s/"$//')"
+    if ! cursor="$(printf '%s' "$body" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("success") is not True:
+    raise SystemExit(1)
+print(d.get("result_info", {}).get("cursor") or d.get("cursor") or "")
+')"; then
+      echo "  ERROR: Cloudflare KV returned an invalid pagination response" >&2
+      return 1
+    fi
     [ -z "$cursor" ] && break
   done
 }
 
 prune_archives() {
-  local all keep="" oldest="" tss="" ts
-  all="$(list_keys 'archive%2F')"      # encoded "archive/"
+  local all keep="" tss="" ts latest_generation="" latest_tmp latest_status
+  if ! all="$(list_keys 'archive%2F')"; then
+    echo "  ⚠️  archive pruning skipped because KV listing was incomplete"
+    return 1
+  fi
   [ -z "$all" ] && return 0
-  tss="$(printf '%s\n' "$all" | sed -n 's|^archive/\([0-9]*\)/.*|\1|p' | sort -un)"
+  latest_tmp="$(mktemp)"
+  get_value "latest/manifest.json" "$latest_tmp"
+  latest_status=$?
+  if [ "$latest_status" -eq 0 ]; then
+    latest_generation="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d.get("generation", ""))
+' "$latest_tmp" 2>/dev/null)" || {
+      rm -f "$latest_tmp"
+      echo "  ⚠️  archive pruning skipped because the latest manifest is invalid"
+      return 1
+    }
+  elif [ "$latest_status" -ne 2 ]; then
+    rm -f "$latest_tmp"
+    echo "  ⚠️  archive pruning skipped because the latest manifest could not be read"
+    return 1
+  fi
+  rm -f "$latest_tmp"
+  tss="$(printf '%s\n' "$all" \
+    | sed -n 's|^archive/\([0-9][0-9]*\)/.*$|\1|p' \
+    | sort -un)"
   [ -z "$tss" ] && return 0
-  # newest KEEP_ARCHIVES generations survive; everything older gets deleted
-  keep="$(printf '%s\n' "$tss" | tail -n "$KEEP_ARCHIVES")"
-  local doomed="" k
+  # Retain only complete generations; failed uploads have no manifest and
+  # should not displace a usable backup or accumulate orphaned chunks.
+  local complete
+  complete="$(printf '%s\n' "$all" \
+    | sed -n 's|^archive/\([0-9][0-9]*\)/manifest\.json$|\1|p' \
+    | sort -un)"
+  keep="$(printf '%s\n' "$complete" | tail -n "$KEEP_ARCHIVES")"
+  if [ -n "$latest_generation" ] \
+     && ! printf '%s\n' "$keep" | grep -Fxq "$latest_generation"; then
+    keep="${keep}"$'\n'"$latest_generation"
+  fi
+  local doomed="" k delete_failed=0
   while IFS= read -r ts; do
     if ! printf '%s\n' "$keep" | grep -qx "$ts"; then
       while IFS= read -r k; do
@@ -184,25 +241,39 @@ EOF
       code="$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
         "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/$enc_key" \
         -H "Authorization: Bearer $CF_API_TOKEN")"
-      [ "$code" = "200" ] || echo "  ⚠️  delete of $k returned HTTP $code"
+      if [ "$code" != "200" ]; then
+        echo "  ⚠️  delete of $k returned HTTP $code"
+        delete_failed=1
+      fi
     done
-    echo "  🧹 pruned $(printf '%s' "$doomed" | tr ',' '\n' | wc -l | tr -d ' ') old archive key(s) (kept newest $KEEP_ARCHIVES generation(s))"
+    if [ "$delete_failed" -eq 1 ]; then
+      return 1
+    fi
+    echo "  🧹 pruned $(printf '%s' "$doomed" | tr ',' '\n' | wc -l | tr -d ' ') old archive key(s) (kept newest $KEEP_ARCHIVES complete generation(s))"
   fi
 }
 
 put_value() {  # put_value <key> <file>
   local key="$1" file="$2" code
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  code="$(curl -sS --max-time 120 -o /dev/null -w '%{http_code}' -X PUT \
     "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/$(urlenc "$key")" \
-    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/octet-stream" --data-binary "@$file")"
-  [ "$code" = "200" ]
+    -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/octet-stream" --data-binary "@$file" || true)"
+  [ "$code" = "200" ] && return 0
+  [ "$code" = "401" ] && return 2
+  echo "  ERROR: Cloudflare KV upload of $key returned HTTP ${code:-000}" >&2
+  return 1
 }
 
 get_value() {  # get_value <key> <outfile>  (curl exit code 0 = found)
-  local key="$1" dest="$2"
-  curl -s -o "$dest" -f \
+  local key="$1" dest="$2" code
+  code="$(curl -sS --max-time 120 -o "$dest" -w '%{http_code}' \
     "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces/$CF_KV_NAMESPACE_ID/values/$(urlenc "$key")" \
-    -H "Authorization: Bearer $CF_API_TOKEN"
+    -H "Authorization: Bearer $CF_API_TOKEN" || true)"
+  [ "$code" = "200" ] && return 0
+  rm -f "$dest"
+  [ "$code" = "404" ] && return 2
+  echo "  ERROR: Cloudflare KV download of $key returned HTTP ${code:-000}" >&2
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -219,85 +290,189 @@ cmd_push() {
   [ -n "$file" ] || { echo "  ⚠️  usage: cloudflare-backup.sh push <file>"; return 1; }
   [ -s "$file" ] || { echo "  ☁️  nothing to push ($file missing/empty)"; return 0; }
 
-  local size base ts tmp sha manifest parts nn code
+  local size base ts generation tmp sha manifest parts nn code attempt
+  if ! tar -tzf "$file" >/dev/null 2>&1; then
+    echo "  ERROR: refusing to upload an invalid state archive: $file" >&2
+    return 1
+  fi
   size="$(stat -c%s "$file")"
   base="$(basename "$file")"
   ts="$(date +%s)"
+  generation="$(date +%s%N)"
   tmp="$(mktemp -d)"
   sha="$(sha256sum "$file" | cut -d' ' -f1)"
 
-  split -b "$CHUNK_BYTES" -d -a 2 "$file" "$tmp/chunk."
+  if ! split -b "$CHUNK_BYTES" -d -a 8 "$file" "$tmp/chunk."; then
+    echo "  ERROR: could not split state archive for Cloudflare KV" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
   parts=0
   for f in "$tmp"/chunk.*; do
     nn="${f##*.}"
-    if put_with_retry "latest/$base.$nn" "$f" && put_with_retry "archive/$ts/$base.$nn" "$f"; then
-      parts=$((parts + 1))
-    else
-      echo "  ::warning::Cloudflare backup: chunk $nn upload failed — previous latest left intact"
+    if ! put_with_retry "archive/$generation/$base.$nn" "$f"; then
+      echo "  ::warning::Cloudflare backup: chunk $nn upload failed — previous latest preserved"
       rm -rf "$tmp"
       return 1
     fi
+    attempt=0
+    while [ "$attempt" -lt 5 ]; do
+      attempt=$((attempt + 1))
+      if get_value "archive/$generation/$base.$nn" "$tmp/readback.$nn" \
+         && cmp -s "$f" "$tmp/readback.$nn"; then
+        break
+      fi
+      [ "$attempt" -eq 5 ] || sleep 2
+    done
+    if [ "$attempt" -eq 5 ] && ! cmp -s "$f" "$tmp/readback.$nn"; then
+      echo "  ::warning::Cloudflare backup: chunk $nn failed read-back verification — previous latest preserved"
+      rm -rf "$tmp"
+      return 1
+    fi
+    parts=$((parts + 1))
   done
 
-  manifest="{\"file\":\"$base\",\"ts\":$ts,\"parts\":$parts,\"size\":$size,\"sha256\":\"$sha\"}"
+  manifest="{\"version\":2,\"file\":\"$base\",\"ts\":$ts,\"generation\":\"$generation\",\"parts\":$parts,\"size\":$size,\"sha256\":\"$sha\"}"
   printf '%s' "$manifest" > "$tmp/manifest.json"
-  if put_with_retry "latest/manifest.json" "$tmp/manifest.json" && put_with_retry "archive/$ts/manifest.json" "$tmp/manifest.json"; then
-    echo "  ☁️  backup pushed: $base (${parts}+1 keys, $(du -h "$file" | cut -f1)) → latest/ + archive/$ts/"
-    prune_archives
-  else
-    echo "  ⚠️  manifest upload failed"
+  if ! put_with_retry "archive/$generation/manifest.json" "$tmp/manifest.json"; then
+    echo "  ::warning::Cloudflare archive manifest upload failed — previous latest preserved"
+    rm -rf "$tmp"
+    return 1
   fi
+  attempt=0
+  while [ "$attempt" -lt 5 ]; do
+    attempt=$((attempt + 1))
+    if get_value "archive/$generation/manifest.json" "$tmp/manifest.readback.json" \
+       && cmp -s "$tmp/manifest.json" "$tmp/manifest.readback.json"; then
+      break
+    fi
+    [ "$attempt" -eq 5 ] || sleep 2
+  done
+  if [ "$attempt" -eq 5 ] && ! cmp -s "$tmp/manifest.json" "$tmp/manifest.readback.json"; then
+    echo "  ::warning::Cloudflare archive manifest failed read-back verification — previous latest preserved"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  if ! put_with_retry "latest/manifest.json" "$tmp/manifest.json"; then
+    echo "  ⚠️  latest manifest upload failed — previous latest preserved"
+    rm -rf "$tmp"
+    return 1
+  fi
+  attempt=0
+  while [ "$attempt" -lt 5 ]; do
+    attempt=$((attempt + 1))
+    if get_value "latest/manifest.json" "$tmp/latest.readback.json" \
+       && cmp -s "$tmp/manifest.json" "$tmp/latest.readback.json"; then
+      break
+    fi
+    [ "$attempt" -eq 5 ] || sleep 2
+  done
+  if [ "$attempt" -eq 5 ] && ! cmp -s "$tmp/manifest.json" "$tmp/latest.readback.json"; then
+    echo "  ⚠️  latest manifest was not visible after upload; skipping retention pruning"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  echo "  ☁️  backup pushed and verified: $base (${parts}+1 keys, $(du -h "$file" | cut -f1)) → archive/$generation/"
+  prune_archives || echo "  ⚠️  backup is safe; archive pruning will retry after the next upload"
   rm -rf "$tmp"
+  return 0
 }
 
-# One attempt at restoring $1. Returns 0 when the manifest and the parts it
-# describes read back consistently — or when there is no backup at all — and 1
-# when they do not, which is what a concurrent cmd_push looks like from here.
+# One attempt at restoring $1. Returns 2 when no backup exists, and 1 when the
+# manifest, its chunks, or the assembled archive are invalid.
 restore_once() {
   local outfile="$1"
-  local tmp manifest mf base parts size sha ok part
-  tmp="$(mktemp -d)"
-  ok=1
-  get_value "latest/manifest.json" "$tmp/manifest.json" || ok=0
-  if [ "$ok" != 1 ] || [ ! -s "$tmp/manifest.json" ]; then
+  local tmp manifest mf base parts size sha generation prefix suffix_width ok outdir
+  outdir="$(dirname "$outfile")"
+  [ -d "$outdir" ] || return 1
+  tmp="$(mktemp -d "$outdir/.cloudflare-restore.XXXXXX")"
+  local get_status
+  get_value "latest/manifest.json" "$tmp/manifest.json"
+  get_status=$?
+  if [ "$get_status" -ne 0 ]; then
+    rm -rf "$tmp"
+    if [ "$get_status" -eq 2 ]; then
+      echo "  ☁️  no backup found in Cloudflare (latest/manifest.json missing)"
+      return 2
+    fi
+    return 1
+  fi
+  if [ ! -s "$tmp/manifest.json" ]; then
     echo "  ☁️  no backup found in Cloudflare (latest/manifest.json missing)"
     rm -rf "$tmp"
-    return 0
+    return 2
   fi
   mf="$(cat "$tmp/manifest.json")"
   base="$(printf '%s' "$mf" | sed -n 's/.*"file":"\([^"]*\)".*/\1/p')"
   parts="$(printf '%s' "$mf" | sed -n 's/.*"parts":\([0-9]*\).*/\1/p')"
   size="$(printf '%s' "$mf" | sed -n 's/.*"size":\([0-9]*\).*/\1/p')"
   sha="$(printf '%s' "$mf" | sed -n 's/.*"sha256":"\([0-9a-f]*\)".*/\1/p')"
-  [ -n "$parts" ] && [ "$parts" -ge 1 ] || { echo "  ⚠️  manifest unreadable"; rm -rf "$tmp"; return 1; }
+  generation="$(printf '%s' "$mf" | sed -n 's/.*"generation":"\([0-9]*\)".*/\1/p')"
+  if ! [[ "$base" =~ ^[A-Za-z0-9._-]{1,128}$ ]] \
+     || ! [[ "$parts" =~ ^[0-9]{1,8}$ ]] \
+     || ! [[ "$size" =~ ^[0-9]{1,18}$ ]] \
+     || ! [[ "$sha" =~ ^[0-9a-f]{64}$ ]] \
+     || [ "$parts" -lt 1 ] || [ "$size" -lt 1 ]; then
+    echo "  ⚠️  manifest unreadable"
+    rm -rf "$tmp"
+    return 1
+  fi
+  if [ -n "$generation" ]; then
+    if ! [[ "$generation" =~ ^[0-9]{1,24}$ ]]; then
+      echo "  ⚠️  manifest generation is invalid"
+      rm -rf "$tmp"
+      return 1
+    fi
+    prefix="archive/$generation"
+    suffix_width=8
+  else
+    prefix="latest"
+    suffix_width=2
+  fi
+  local expected_parts=$(( (size + CHUNK_BYTES - 1) / CHUNK_BYTES ))
+  if [ "$parts" -ne "$expected_parts" ]; then
+    echo "  ⚠️  manifest chunk count does not match the archive size"
+    rm -rf "$tmp"
+    return 1
+  fi
 
   for ((i = 0; i < parts; i++)); do
-    nn="$(printf '%02d' "$i")"
-    if ! get_value "latest/$base.$nn" "$tmp/part.$nn"; then
-      echo "  ⚠️  chunk latest/$base.$nn missing — aborting (archive may be mid-upload)"
+    nn="$(printf "%0${suffix_width}d" "$i")"
+    if ! get_value "$prefix/$base.$nn" "$tmp/part.$nn"; then
+      echo "  ⚠️  chunk $prefix/$base.$nn missing or unreadable"
       rm -rf "$tmp"
       return 1
     fi
   done
-  : > "$outfile"
+  : > "$tmp/archive"
   for ((i = 0; i < parts; i++)); do
-    nn="$(printf '%02d' "$i")"
-    cat "$tmp/part.$nn" >> "$outfile"
+    nn="$(printf "%0${suffix_width}d" "$i")"
+    cat "$tmp/part.$nn" >> "$tmp/archive"
   done
 
   local got
-  got="$(stat -c%s "$outfile")"
+  got="$(stat -c%s "$tmp/archive")"
   if [ "$got" != "$size" ]; then
     echo "  ⚠️  size mismatch (got ${got}B, expected ${size}B) — discarding"
-    rm -f "$outfile"
     rm -rf "$tmp"
     return 1
   fi
   local gotsha
-  gotsha="$(sha256sum "$outfile" | cut -d' ' -f1)"
+  gotsha="$(sha256sum "$tmp/archive" | cut -d' ' -f1)"
   if [ "$gotsha" != "$sha" ]; then
     echo "  ⚠️  sha256 mismatch — discarding"
-    rm -f "$outfile"
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! tar -tzf "$tmp/archive" >/dev/null 2>&1; then
+    echo "  ⚠️  downloaded state archive is not a valid tar.gz"
+    rm -rf "$tmp"
+    return 1
+  fi
+  if ! mv -f "$tmp/archive" "$outfile"; then
+    echo "  ERROR: could not install the verified Cloudflare backup at $outfile" >&2
     rm -rf "$tmp"
     return 1
   fi
@@ -306,14 +481,8 @@ restore_once() {
   return 0
 }
 
-# cmd_push OVERWRITES latest/<parts> in place and only afterwards republishes
-# latest/manifest.json, so a push landing between our manifest read and our
-# part reads hands us an old sha256 with new bytes: same size, different
-# digest. Reading archive/<ts>/ instead does not help — KEEP_ARCHIVES=1 prunes
-# the previous generation the moment the new one lands, so that read fails as a
-# missing chunk rather than a bad digest. Both windows are transient and the
-# pair is consistent again as soon as the in-flight push finishes, so re-read
-# it rather than switch to a different key set.
+# Versioned chunk keys keep readers on a complete immutable generation even
+# while a later snapshot is uploading.
 cmd_restore() {
   # argv is ARGUMENTS ONLY (dispatcher shifts the subcommand). cmd_verify calls this
   # with a single path, so "$2" was empty and restore always printed its usage line.
@@ -325,19 +494,22 @@ cmd_restore() {
   fi
   [ -n "$outfile" ] || { echo "  ⚠️  usage: cloudflare-backup.sh restore <outfile>"; return 1; }
 
-  local attempt
+  local attempt restore_status
   for ((attempt = 1; attempt <= RESTORE_ATTEMPTS; attempt++)); do
-    if restore_once "$outfile"; then
+    restore_once "$outfile"
+    restore_status=$?
+    if [ "$restore_status" -eq 0 ]; then
       return 0
     fi
-    echo "  ⏳  restore read a half-written backup (attempt ${attempt}/${RESTORE_ATTEMPTS}) — retrying in 2s"
-    rm -f "$outfile"
+    if [ "$restore_status" -eq 2 ]; then
+      return 2
+    fi
+    echo "  ⏳  backup read failed validation (attempt ${attempt}/${RESTORE_ATTEMPTS}) — retrying in 2s"
     if [ "$attempt" -lt "$RESTORE_ATTEMPTS" ]; then
       sleep 2
     fi
   done
   echo "  ⚠️  restore failed after ${RESTORE_ATTEMPTS} attempts — the backup is inconsistent"
-  rm -f "$outfile"
   return 1
 }
 
@@ -347,13 +519,36 @@ cmd_restore() {
 # reaches the end-of-run cache save, so the KV mirror can be the only recent
 # copy of the state.
 cmd_manifest() {
-  local ts=""
   load_cfg
   cfg_ok || return 0
-  local tmp
+  local tmp status
   tmp="$(mktemp)"
-  if get_value "latest/manifest.json" "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    ts="$(sed -n 's/.*"ts":\([0-9][0-9]*\).*/\1/p' "$tmp" | head -1)"
+  get_value "latest/manifest.json" "$tmp"
+  status=$?
+  if [ "$status" -eq 2 ]; then
+    rm -f "$tmp"
+    return 0
+  fi
+  if [ "$status" -ne 0 ]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  local ts
+  if ! ts="$(python3 - "$tmp" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as manifest_file:
+    manifest = json.load(manifest_file)
+ts = manifest.get("ts")
+if isinstance(ts, bool) or not isinstance(ts, int) or ts < 0:
+    raise SystemExit(1)
+print(ts)
+PY
+)"; then
+    echo "  ERROR: latest Cloudflare backup manifest is invalid" >&2
+    rm -f "$tmp"
+    return 1
   fi
   rm -f "$tmp"
   printf '%s' "$ts"
@@ -399,7 +594,10 @@ cmd_list() {
     echo "  ☁️  Cloudflare KV not configured"; return 0
   fi
   local all n
-  all="$(list_keys '')"
+  if ! all="$(list_keys '')"; then
+    echo "  ERROR: could not list Cloudflare KV backup keys" >&2
+    return 1
+  fi
   n="$(printf '%s\n' "$all" | grep -c '^latest\|^archive' || true)"
   if [ -z "$all" ]; then
     echo "  ☁️  namespace empty"

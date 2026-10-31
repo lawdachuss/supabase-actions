@@ -84,6 +84,7 @@ CREATE OR REPLACE FUNCTION claim_premium_reward(
   p_target     integer
 ) RETURNS jsonb
 LANGUAGE plpgsql
+SET search_path = public, pg_catalog
 AS $$
 DECLARE
   v_row         user_premium;

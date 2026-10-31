@@ -22,18 +22,26 @@ save_settings() {
     return 0
   fi
 
-  local tmp line key
+  local tmp keys_tmp line key
   tmp="$(mktemp "$BASE_DIR/.state-settings.env.XXXXXX")"
+  keys_tmp="$(mktemp "$BASE_DIR/.state-setting-keys.XXXXXX")"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       *=*)
         key="${line%%=*}"
         if is_persistable_setting "$key"; then
+          if grep -Fxq "$key" "$keys_tmp"; then
+            echo "  ERROR: duplicate runtime setting cannot be snapshotted: $key" >&2
+            rm -f "$tmp" "$keys_tmp"
+            return 1
+          fi
+          printf '%s\n' "$key" >> "$keys_tmp"
           printf '%s\n' "$line" >> "$tmp"
         fi
         ;;
     esac
   done < "$ENV_FILE"
+  rm -f "$keys_tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$SETTINGS_FILE"
   echo "  Runtime settings saved (secret values excluded)"
@@ -48,23 +56,44 @@ restore_settings() {
     return 1
   fi
 
-  local tmp line key
+  local tmp keys_tmp line key
+  tmp="$(mktemp "$BASE_DIR/.env.XXXXXX")"
+  keys_tmp="$(mktemp "$BASE_DIR/.state-setting-keys.XXXXXX")"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       *=*)
         key="${line%%=*}"
-        if ! is_persistable_setting "$key"; then
+        if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+           || ! is_persistable_setting "$key"; then
           echo "  ERROR: refusing unsupported runtime setting: $key" >&2
+          rm -f "$tmp" "$keys_tmp"
           return 1
         fi
-        tmp="$(mktemp "$BASE_DIR/.env.XXXXXX")"
-        awk -v prefix="$key=" 'index($0, prefix) != 1' "$ENV_FILE" > "$tmp"
-        printf '%s\n' "$line" >> "$tmp"
-        chmod 600 "$tmp"
-        mv -f "$tmp" "$ENV_FILE"
+        if grep -Fxq "$key" "$keys_tmp"; then
+          echo "  ERROR: duplicate persisted runtime setting: $key" >&2
+          rm -f "$tmp" "$keys_tmp"
+          return 1
+        fi
+        printf '%s\n' "$key" >> "$keys_tmp"
+        ;;
+      ""|\#*) ;;
+      *)
+        echo "  ERROR: malformed persisted runtime setting" >&2
+        rm -f "$tmp" "$keys_tmp"
+        return 1
         ;;
     esac
   done < "$SETTINGS_FILE"
+  if [ -s "$keys_tmp" ]; then
+    awk -F= 'NR == FNR { keys[$0] = 1; next } !($1 in keys)' \
+      "$keys_tmp" "$ENV_FILE" > "$tmp"
+  else
+    cp "$ENV_FILE" "$tmp"
+  fi
+  cat "$SETTINGS_FILE" >> "$tmp"
+  rm -f "$keys_tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$ENV_FILE"
   echo "  Persisted non-secret runtime settings restored"
 }
 

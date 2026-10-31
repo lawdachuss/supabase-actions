@@ -38,7 +38,9 @@ CREATE OR REPLACE FUNCTION _supabase.register_access_token(
     token_name TEXT,
     token_description TEXT DEFAULT ''
 ) RETURNS JSON
-LANGUAGE plpgsql SECURITY DEFINER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, extensions
 AS $$
 DECLARE
     token_jti UUID;
@@ -65,7 +67,9 @@ $$;
 CREATE OR REPLACE FUNCTION _supabase.check_token_jti(
     token_jti UUID
 ) RETURNS TABLE(valid BOOLEAN, token_name TEXT, token_description TEXT)
-LANGUAGE plpgsql SECURITY DEFINER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, extensions
 AS $$
 DECLARE
     tok RECORD;
@@ -86,7 +90,9 @@ $$;
 CREATE OR REPLACE FUNCTION _supabase.revoke_token_by_id(
     token_id UUID
 ) RETURNS BOOLEAN
-LANGUAGE plpgsql SECURITY DEFINER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, extensions
 AS $$
 BEGIN
     UPDATE _supabase.access_tokens SET revoked = true WHERE id = token_id;
@@ -103,7 +109,9 @@ CREATE OR REPLACE FUNCTION _supabase.list_access_tokens(
     expires_at TIMESTAMPTZ, last_used_at TIMESTAMPTZ,
     is_revoked BOOLEAN
 )
-LANGUAGE plpgsql SECURITY DEFINER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, extensions
 AS $$
 BEGIN
     IF include_revoked THEN
