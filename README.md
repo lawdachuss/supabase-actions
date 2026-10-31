@@ -350,11 +350,13 @@ A lightweight Redis 7 instance (`redis:7-alpine`) runs alongside the Supabase st
 
 ### 🔗 Permanent public Redis URL
 
-The workflow publishes the same HTTPS endpoint on every run, using your required
-`CF_TUNNEL_DOMAIN`:
+The workflow publishes the Supabase hostname and a Redis HTTPS endpoint on every
+run. Set `CF_TUNNEL_DOMAIN` to the Supabase hostname; the Redis hostname uses the
+same parent domain:
 
 ```text
-https://supabase.yourdomain.com/functions/v1/redis-http
+Supabase: https://supabase.yourdomain.com
+Redis:    https://redis.yourdomain.com/functions/v1/redis-http
 ```
 
 The exact URL is printed in the Actions run summary. Send Redis commands with
