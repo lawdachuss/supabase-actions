@@ -1494,7 +1494,7 @@ jobs:
       # archive is never deleted before the new one is fully written.
       - name:  Final state backup before shutdown
         id: final-snapshot
-        if: "!cancelled() && (steps.keepalive.outcome == 'success' || steps.keepalive.outcome == 'failure')"
+        if: "steps.keepalive.outcome == 'success' || steps.keepalive.outcome == 'failure' || steps.keepalive.outcome == 'cancelled'"
         env:
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
         run: |
@@ -1523,7 +1523,7 @@ jobs:
       # persists the freshest one to the Actions cache at the end of the run.
       # Only runs if NOT cancelled and a valid state archive exists on disk.
       - name:  Save final state to GitHub Actions cache
-        if: "!cancelled() && steps.final-snapshot.outputs.cache_ready == 'true' && hashFiles('supabase/supabase-state.tar.gz') != ''"
+        if: "steps.final-snapshot.outputs.cache_ready == 'true' && hashFiles('supabase/supabase-state.tar.gz') != ''"
         uses: actions/cache/save@v6
         with:
           path: ${{ env.BACKUP_FILE }}
