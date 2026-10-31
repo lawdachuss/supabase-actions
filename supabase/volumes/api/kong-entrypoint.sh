@@ -28,7 +28,8 @@ fi
 # Substitute environment variables in the Kong declarative config.
 # Uses awk instead of eval/echo to preserve YAML quoting (eval strips double
 # quotes, breaking "Header: value" patterns that YAML parses as mappings).
-awk '{
+if ! awk '
+{
   result = ""
   rest = $0
   while (match(rest, /\$[A-Za-z_][A-Za-z_0-9]*/)) {
@@ -40,10 +41,33 @@ awk '{
     }
     rest = substr(rest, RSTART + RLENGTH)
   }
-  print result rest
-}' /home/kong/temp.yml > "$KONG_DECLARATIVE_CONFIG"
+  line = result rest
 
-# Remove empty key-auth credentials (unconfigured opaque keys)
-sed -i '/^[[:space:]]*- key:[[:space:]]*$/d' "$KONG_DECLARATIVE_CONFIG"
+  if (line ~ /^[[:space:]]*-[[:space:]]+username:[[:space:]]*/) {
+    consumer = line
+    sub(/^[[:space:]]*-[[:space:]]+username:[[:space:]]*/, "", consumer)
+  }
+
+  if (line ~ /^[[:space:]]*-[[:space:]]+key:[[:space:]]*/) {
+    key = line
+    sub(/^[[:space:]]*-[[:space:]]+key:[[:space:]]*/, "", key)
+    sub(/[[:space:]]+$/, "", key)
+    if (key == "") next
+    if (key in seen) {
+      if (seen[key] != consumer) {
+        printf "Duplicate Kong key-auth credential is assigned to both %s and %s\n", seen[key], consumer > "/dev/stderr"
+        exit 1
+      }
+      next
+    }
+    seen[key] = consumer
+  }
+
+  print line
+}' /home/kong/temp.yml > "$KONG_DECLARATIVE_CONFIG"
+then
+    echo "Kong configuration contains a credential collision; refusing to start with ambiguous access"
+    exit 1
+fi
 
 exec /entrypoint.sh kong docker-start
