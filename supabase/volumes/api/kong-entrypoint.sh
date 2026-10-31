@@ -39,10 +39,22 @@ if [ -n "$SUPABASE_API_KEY" ] || [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then
     export LUA_RT_WS_EXPR="\$((query_params.apikey == '$SUPABASE_SERVICE_ROLE_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_API_KEY' and '$ANON_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or query_params.apikey)"
 fi
 
-# Substitute environment variables in the Kong declarative config.
-# Uses awk instead of eval/echo to preserve YAML quoting (eval strips double
-# quotes, breaking "Header: value" patterns that YAML parses as mappings).
-awk '
+# Substitute environment variables in the Kong declarative config and remove
+# duplicate credentials within a consumer. Kong rejects duplicate key-auth
+# values, which can occur when compatibility keys equal generated keys.
+# Credentials shared by different consumers remain fatal: that is an unsafe
+# role collision, not a harmless alias.
+if ! awk '
+  function indent(line, copy) {
+    copy = line
+    sub(/[^ ].*$/, "", copy)
+    return length(copy)
+  }
+  function trim(value) {
+    sub(/^[[:space:]]+/, "", value)
+    sub(/[[:space:]]+$/, "", value)
+    return value
+  }
   index($0, "$SUPABASE_API_KEY") && !ENVIRON["SUPABASE_API_KEY"] { next }
   index($0, "$SUPABASE_SERVICE_ROLE_KEY") && !ENVIRON["SUPABASE_SERVICE_ROLE_KEY"] { next }
   {
@@ -57,8 +69,42 @@ awk '
     }
     rest = substr(rest, RSTART + RLENGTH)
   }
-  print result rest
-}' /home/kong/temp.yml > "$KONG_DECLARATIVE_CONFIG"
+  result = result rest
+
+  if (result ~ /^[[:space:]]*-[[:space:]]*username:/) {
+    consumer = result
+    sub(/^[[:space:]]*-[[:space:]]*username:[[:space:]]*/, "", consumer)
+    consumer = trim(consumer)
+    in_credentials = 0
+  } else if (result ~ /^[[:space:]]*keyauth_credentials:[[:space:]]*$/) {
+    in_credentials = 1
+    credentials_indent = indent(result)
+  } else if (in_credentials && result !~ /^[[:space:]]*(#.*)?$/ &&
+             indent(result) <= credentials_indent) {
+    in_credentials = 0
+  }
+
+  if (in_credentials && result ~ /^[[:space:]]*-[[:space:]]*key:[[:space:]]*/) {
+    credential = result
+    sub(/^[[:space:]]*-[[:space:]]*key:[[:space:]]*/, "", credential)
+    credential = trim(credential)
+    if (credential != "") {
+      if (credential in credential_owner &&
+          credential_owner[credential] != consumer) {
+        printf "Duplicate Kong API key is assigned to both %s and %s\n", \
+          credential_owner[credential], consumer > "/dev/stderr"
+        exit 1
+      }
+      if ((consumer SUBSEP credential) in consumer_credentials) next
+      consumer_credentials[consumer SUBSEP credential] = 1
+      credential_owner[credential] = consumer
+    }
+  }
+
+  print result
+}' /home/kong/temp.yml > "$KONG_DECLARATIVE_CONFIG"; then
+    exit 1
+fi
 
 # Remove empty key-auth credentials (unconfigured opaque keys)
 sed -i '/^[[:space:]]*- key:[[:space:]]*$/d' "$KONG_DECLARATIVE_CONFIG"
