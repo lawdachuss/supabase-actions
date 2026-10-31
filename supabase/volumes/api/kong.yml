@@ -10,12 +10,12 @@ consumers:
     keyauth_credentials:
       - key: $SUPABASE_ANON_KEY
       - key: $SUPABASE_PUBLISHABLE_KEY
-      - key: $SUPABASE_COMPAT_ANON_KEY
+      - key: $SUPABASE_API_KEY
   - username: service_role
     keyauth_credentials:
       - key: $SUPABASE_SERVICE_KEY
       - key: $SUPABASE_SECRET_KEY
-      - key: $SUPABASE_COMPAT_SERVICE_ROLE_KEY
+      - key: $SUPABASE_SERVICE_ROLE_KEY
 
 ###
 ### Access Control List

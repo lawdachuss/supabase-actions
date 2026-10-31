@@ -234,7 +234,7 @@ The workflow automatically generates all these keys from `JWT_SECRET` — no man
 >
 > Only `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_PUBLISHABLE_KEY` are published — the `service_role` / secret keys are root on the database and are never written to a summary or log. For those, use `remote.env` with `./remote.sh`.
 >
-> ⚠️ A key copied from an old `.env`, an old run, or a tutorial will not work as a legacy JWT if its signing secret differs from the current `JWT_SECRET`. To keep existing legacy HS256 keys working after `JWT_SECRET` changes, set the repository secrets `SUPABASE_COMPAT_ANON_KEY` and `SUPABASE_COMPAT_SERVICE_ROLE_KEY` to those exact keys. Kong accepts them as API keys and translates them to the current runtime JWTs. The service-role key grants administrator access; never put it in browser or public-client code.
+> To keep your existing keys working, configure the GitHub Actions secrets `SUPABASE_API_KEY` (anon) and `SUPABASE_SERVICE_ROLE_KEY` (admin) with the same values as in your local `.env`. Kong accepts these keys and translates them to the current runtime JWTs. The service-role key grants administrator access; never put it in browser or public-client code.
 
 #### 📧 Real auth emails (optional)
 

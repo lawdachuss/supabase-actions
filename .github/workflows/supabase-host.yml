@@ -126,8 +126,8 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           DASHBOARD_PASSWORD: ${{ secrets.DASHBOARD_PASSWORD }}
-          SUPABASE_COMPAT_ANON_KEY: ${{ secrets.SUPABASE_COMPAT_ANON_KEY }}
-          SUPABASE_COMPAT_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_COMPAT_SERVICE_ROLE_KEY }}
+          SUPABASE_API_KEY: ${{ secrets.SUPABASE_API_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           # Optional real SMTP for auth emails (falls back to inbucket if unset)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -195,7 +195,7 @@ jobs:
           def derive_b64(name, length):
               return base64.urlsafe_b64encode(
                   hmac.new(secret.encode(), name.encode(), hashlib.sha512).digest()).decode()[:length]
-          def validate_compat_key(name, value, expected_role):
+          def validate_api_key(name, value, expected_role):
               if not value:
                   return
               try:
@@ -230,10 +230,10 @@ jobs:
           exp = iat + 315360000
           anon_key = sign_hs256({'role': 'anon', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret)
           service_key = sign_hs256({'role': 'service_role', 'iss': 'supabase', 'iat': iat, 'exp': exp}, secret)
-          compat_anon_key = os.environ.get('SUPABASE_COMPAT_ANON_KEY', '')
-          compat_service_key = os.environ.get('SUPABASE_COMPAT_SERVICE_ROLE_KEY', '')
-          validate_compat_key('SUPABASE_COMPAT_ANON_KEY', compat_anon_key, 'anon')
-          validate_compat_key('SUPABASE_COMPAT_SERVICE_ROLE_KEY', compat_service_key, 'service_role')
+          api_key = os.environ.get('SUPABASE_API_KEY', '')
+          service_role_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
+          validate_api_key('SUPABASE_API_KEY', api_key, 'anon')
+          validate_api_key('SUPABASE_SERVICE_ROLE_KEY', service_role_key, 'service_role')
 
           skb = derive_b64('secret_key_base', 64)
           rek = derive_hex('realtime_enc_key', 8)
@@ -331,10 +331,10 @@ jobs:
               print(f"All {len(reps)} replacements applied")
           with open('.env','w') as f: f.write(env_content)
           with open('.env','a') as f:
-              if compat_anon_key:
-                  f.write(f'SUPABASE_COMPAT_ANON_KEY={compat_anon_key}\n')
-              if compat_service_key:
-                  f.write(f'SUPABASE_COMPAT_SERVICE_ROLE_KEY={compat_service_key}\n')
+              if api_key:
+                  f.write(f'SUPABASE_API_KEY={api_key}\n')
+              if service_role_key:
+                  f.write(f'SUPABASE_SERVICE_ROLE_KEY={service_role_key}\n')
           print(".env configured")
           PYEOF
 
