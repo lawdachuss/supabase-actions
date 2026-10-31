@@ -1017,9 +1017,10 @@ jobs:
                 if [ "$RESTORE_FAILED" -ne 0 ]; then
                   break
                 fi
-                if ! docker compose exec -T db psql -U "$DB_OWNER" -d template1 \
-                     -v ON_ERROR_STOP=1 -v "db_name=$DB_NAME" -v "db_owner=$DB_OWNER" \
-                     -c 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' >/dev/null; then
+                if ! printf '%s\n' 'ALTER DATABASE :"db_name" OWNER TO :"db_owner";' \
+                     | docker compose exec -T db psql -U "$DB_OWNER" -d template1 \
+                       -v ON_ERROR_STOP=1 -v "db_name=$DB_NAME" -v "db_owner=$DB_OWNER" \
+                       >/dev/null; then
                   echo "::error::failed to restore database owner for $DB_NAME"
                   RESTORE_FAILED=1
                   break
