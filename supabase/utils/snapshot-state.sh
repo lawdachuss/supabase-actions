@@ -155,18 +155,25 @@ if RUNNING_SERVICES="$(docker compose ps --services --filter "status=running" 2>
     fi
   }
   validate_aof_dir() {
-    local dir="$1" line file count=0
+    local dir="$1" line file kind count=0
     [ -s "$dir/appendonly.aof.manifest" ] || return 1
     while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
       [ -n "$line" ] || continue
       set -- $line
       [ "$#" -eq 6 ] && [ "$1" = "file" ] && [ "$3" = "seq" ] \
         && [[ "$4" =~ ^[0-9]+$ ]] && [ "$5" = "type" ] \
         && { [ "$6" = "b" ] || [ "$6" = "i" ]; } || return 1
       file="$2"
+      kind="$6"
       [[ "$file" =~ ^appendonly\.aof\.[0-9]+\.(base\.rdb|incr\.aof)$ ]] \
         || return 1
-      [ -s "$dir/$file" ] || return 1
+      [ -f "$dir/$file" ] || return 1
+      if [ "$kind" = "b" ]; then
+        [[ "$file" == *.base.rdb ]] && [ -s "$dir/$file" ] || return 1
+      else
+        [[ "$file" == *.incr.aof ]] || return 1
+      fi
       count=$((count + 1))
     done < "$dir/appendonly.aof.manifest"
     [ "$count" -gt 0 ]
